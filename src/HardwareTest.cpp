@@ -58,11 +58,15 @@ void HardwareTest::start(){
 		canvas->printf("%s: ", test.name);
 		display->commit();
 
+		Serial.printf("TEST:startTest:%s\n", currentTest);
+
 		bool result = test.test();
 
 		canvas->setTextColor(result ? TFT_SILVER : TFT_ORANGE);
 		canvas->printf("%s\n", result ? "PASS" : "FAIL");
 		display->commit();
+
+		Serial.printf("TEST:endTest:%s\n", result ? "pass" : "fail");
 
 		if(!(pass &= result)) break;
 	}
@@ -73,7 +77,7 @@ void HardwareTest::start(){
 	display->commit();
 
 	if(pass){
-		Serial.println("TEST:pass");
+		Serial.println("TEST:passall");
 		postTestPass();
 	}else{
 		Serial.printf("TEST:fail:%s\n", currentTest);
@@ -257,7 +261,7 @@ bool HardwareTest::sdTest(){
 	}
 
 	/* Compare read-write */
-	if(strcmp(writeBuff, readBuff) != 0){
+	if(strncmp(writeBuff, readBuff, writeBuffLen) != 0){
 		char logBuffer[100];
 		sprintf(logBuffer, "Expected %s, got %s",writeBuff,readBuff);
 		test->log("Compare Error", logBuffer);

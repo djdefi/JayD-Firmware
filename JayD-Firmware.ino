@@ -32,7 +32,12 @@ bool checkJig(){
 				match += buf[(i + j) % 7] == target[j];
 			}
 
-			if(match == 7) return true;
+			if(match == 7){
+				// This is important, desktop app freezes otherwise if the UART/JTAG buffer isn't emptied when it tries to write something again
+				while(int c2 = getchar() != EOF) {}
+
+				return true;
+			}
 		}
 	}
 
@@ -49,6 +54,8 @@ void setup(){
 	Serial.begin(115200);
 
 	if(checkJig()){
+		printf("Jig\n");
+
 		JayD.initVer(2);
 		JayD.begin();
 
@@ -64,6 +71,8 @@ void setup(){
 		test.start();
 
 		for(;;);
+	}else{
+		printf("Hello\n");
 	}
 
 	pinMode(PIN_BL, OUTPUT);
