@@ -115,13 +115,37 @@ void MixScreen::MixScreen::returned(void* data){
 		return;
 	}
 
-	if(!f1){
-		f1 = SD.open(*((String*) data));
-	}else if(!f2){
-		f2 = SD.open(*((String*) data));
-	}
+	fs::File file = SD.open(*((String*) data));
+	loadChannel(loadingChannel, file);
 
 	delete filename;
+}
+
+void MixScreen::MixScreen::loadChannel(uint8_t channel, const fs::File& file){
+	fs::File& slot = channel == 0 ? f1 : f2;
+	slot = file;
+
+	if(system){
+		// System already running (the other deck may be mid-playback):
+		// hot-swap just this channel without touching the other one.
+		system->openChannel(channel, file);
+
+		SongSeekBar* bar = channel == 0 ? leftSeekBar : rightSeekBar;
+		SongName* nameLabel = channel == 0 ? leftSongName : rightSongName;
+
+		String name = file.name();
+		nameLabel->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
+		bar->setTotalDuration(system->getDuration(channel));
+		bar->setCurrentDuration(0);
+		bar->setPlaying(true);
+		nameLabel->checkScrollUpdate();
+
+		drawQueued = true;
+	}else{
+		// No system yet: start() will construct it once at least one file
+		// is loaded, playing that single deck immediately.
+		start();
+	}
 }
 
 void MixScreen::MixScreen::setBigVuStarted(bool bigVuStarted){
@@ -137,23 +161,27 @@ void MixScreen::MixScreen::start(){
 	}
 
 
-	if(!f1 || !f2){
+	if(!f1 && !f2){
+		loadingChannel = 0;
 		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
 		return;
 	}
 
-	Serial.printf("F1: %s\n", f1.name());
-	Serial.printf("F2: %s\n", f2.name());
+	if(f1) f1.seek(0);
+	if(f2) f2.seek(0);
 
-	f1.seek(0);
-	f2.seek(0);
+	if(f1){
+		String name = f1.name();
+		leftSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
+	}
+	if(f2){
+		String name = f2.name();
+		rightSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
+	}
 
-	String name = f1.name();
-	leftSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
-	name = f2.name();
-	rightSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
-
-	system = new MixSystem(f1, f2);
+	system = new MixSystem();
+	if(f1) system->openChannel(0, f1);
+	if(f2) system->openChannel(1, f2);
 
 	system->setVolume(0, InputJayD::getInstance()->getPotValue(POT_L));
 	system->setVolume(1, InputJayD::getInstance()->getPotValue(POT_R));
@@ -538,8 +566,13 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 
 void MixScreen::MixScreen::encBtnHold(uint8_t i){
 	if(i == 6){
-		// system->stop();
-		stop();
+		// Previously this called stop(), tearing down the whole MixSystem
+		// (both decks) just to replace one file. Now we only close/clear
+		// the selected deck; the system (and the other deck's playback)
+		// keeps running, and returned()/loadChannel() hot-swaps just this
+		// channel once a new file is picked -- this is the actual
+		// "load one deck at a time without stopping everything" fix.
+		loadingChannel = selectedChannel;
 
 		if(selectedChannel == 0){
 			f1.close();

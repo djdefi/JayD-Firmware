@@ -43,6 +43,13 @@ namespace MixScreen {
 		Color *selectedBackgroundBuffer = nullptr;
 		MixSystem* system = nullptr;
 
+		// Which deck (0/1) SongList::returned() should fill next. Lets the
+		// user load/replace one deck at a time instead of requiring both
+		// f1 and f2 to be chosen before anything plays.
+		uint8_t loadingChannel = 0;
+
+		void loadChannel(uint8_t channel, const fs::File& file);
+
 		LinearLayout* screenLayout;
 		LinearLayout* leftLayout;
 		LinearLayout* rightLayout;
