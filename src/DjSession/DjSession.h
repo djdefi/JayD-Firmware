@@ -43,7 +43,7 @@ private:
 	char paths[DJ_DECK_COUNT][DJ_PATH_CAPACITY] = {};
 	uint8_t gains[DJ_DECK_COUNT] = { 255, 255 };
 	uint8_t mix = 127;
-	DjEffectSnapshot effects[DJ_DECK_COUNT][DJ_EFFECT_SLOT_COUNT] = {};
+	DjEffectState effectState;
 	bool ending = false;
 	bool viewAttached = false;
 	InfoGenerator* viewInfo[3] = {};

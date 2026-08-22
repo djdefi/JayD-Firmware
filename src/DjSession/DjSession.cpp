@@ -162,7 +162,7 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 	if((command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
 	   command.slot >= DJ_EFFECT_SLOT_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
-	if(command.type == DJ_COMMAND_SET_EFFECT_TYPE && command.value >= EffectType::COUNT){
+	if(command.type == DJ_COMMAND_SET_EFFECT_TYPE && command.value >= DJ_EFFECT_COUNT){
 		return DJ_COMMAND_ERROR_INVALID_VALUE;
 	}
 	if((command.type == DJ_COMMAND_SET_PLAYING || command.type == DJ_COMMAND_SET_RECORDING) &&
@@ -260,43 +260,34 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 			system->setMix(mix);
 			return true;
 		case DJ_COMMAND_SET_EFFECT_TYPE: {
-			DjEffectSnapshot& effect = effects[command.deck][command.slot];
-			bool hadSpeed = false;
-			for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
-				if(effects[command.deck][slot].type != EffectType::SPEED) continue;
-				hadSpeed = true;
-				if(command.value != EffectType::SPEED || slot == command.slot) continue;
-				effects[command.deck][slot].type = EffectType::NONE;
-				effects[command.deck][slot].intensity = 0;
+			DjEffectTransition transition;
+			if(!effectState.setType(command.deck, command.slot, command.value,
+									system->hasChannel(command.deck), transition)){
+				error = DJ_COMMAND_ERROR_INVALID_VALUE;
+				return false;
 			}
-			const bool deckLoaded = system->hasChannel(command.deck);
-			if(deckLoaded && effect.type == EffectType::SPEED && command.value != EffectType::SPEED){
-				system->removeSpeed(command.deck);
-			}
-			effect.type = command.value;
-			effect.intensity = command.value == EffectType::SPEED ? 127 : 0;
-			if(command.value == EffectType::SPEED){
-				if(deckLoaded){
-					if(!hadSpeed) system->addSpeed(command.deck);
-					system->setSpeed(command.deck, effect.intensity);
-				}
+			if(transition.removeSpeed) system->removeSpeed(command.deck);
+			if(transition.clearEffect){
+				system->setEffect(command.deck, command.slot, EffectType::NONE);
 			}else{
 				system->setEffect(command.deck, command.slot, static_cast<EffectType>(command.value));
+			}
+			if(transition.addSpeed) system->addSpeed(command.deck);
+			if(transition.setSpeed){
+				system->setSpeed(command.deck, effectState.get(command.deck, command.slot).intensity);
 			}
 			return true;
 		}
 		case DJ_COMMAND_SET_EFFECT_INTENSITY: {
-			DjEffectSnapshot& effect = effects[command.deck][command.slot];
-			if(effect.type == EffectType::NONE){
+			DjEffectTransition transition;
+			if(!effectState.setIntensity(command.deck, command.slot, command.value, transition)){
 				error = DJ_COMMAND_ERROR_NO_EFFECT;
 				return false;
 			}
-			effect.intensity = command.value;
-			if(effect.type == EffectType::SPEED){
-				if(system->hasChannel(command.deck)){
-					system->setSpeed(command.deck, effect.intensity);
-				}
-			}else if(effect.type != EffectType::NONE){
+			const DjEffectSnapshot& effect = effectState.get(command.deck, command.slot);
+			if(transition.setSpeed){
+				system->setSpeed(command.deck, effect.intensity);
+			}else if(effect.type != DJ_EFFECT_SPEED){
 				system->setEffectIntensity(command.deck, command.slot, effect.intensity);
 			}
 			return true;
@@ -333,11 +324,16 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	files[command.deck] = file;
 	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
 	system->setVolume(command.deck, gains[command.deck]);
-	for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
-		if(effects[command.deck][slot].type != EffectType::SPEED) continue;
-		system->addSpeed(command.deck);
-		system->setSpeed(command.deck, effects[command.deck][slot].intensity);
-		break;
+	DjEffectTransition effectTransition;
+	effectState.deckLoaded(command.deck, effectTransition);
+	if(effectTransition.addSpeed) system->addSpeed(command.deck);
+	if(effectTransition.setSpeed){
+		for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
+			const DjEffectSnapshot& effect = effectState.get(command.deck, slot);
+			if(effect.type != DJ_EFFECT_SPEED) continue;
+			system->setSpeed(command.deck, effect.intensity);
+			break;
+		}
 	}
 
 	if(!system->isRunning()){
@@ -370,7 +366,7 @@ void DjSession::publishSnapshot(){
 		deckSnapshot.timingQuality = deckSnapshot.loaded ? DJ_TIMING_COARSE : DJ_TIMING_UNAVAILABLE;
 		deckSnapshot.gain = gains[deck];
 		memcpy(deckSnapshot.path, paths[deck], DJ_PATH_CAPACITY);
-		memcpy(deckSnapshot.effects, effects[deck], sizeof(effects[deck]));
+		effectState.copyDeck(deck, deckSnapshot.effects);
 	}
 
 	commandMutex.lock();

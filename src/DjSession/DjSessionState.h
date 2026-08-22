@@ -55,6 +55,16 @@ enum DjTimingQuality : uint8_t {
 	DJ_TIMING_COARSE
 };
 
+enum DjEffectType : uint8_t {
+	DJ_EFFECT_NONE,
+	DJ_EFFECT_SPEED,
+	DJ_EFFECT_LOWPASS,
+	DJ_EFFECT_HIGHPASS,
+	DJ_EFFECT_REVERB,
+	DJ_EFFECT_BITCRUSHER,
+	DJ_EFFECT_COUNT
+};
+
 struct DjCommand {
 	uint32_t id = 0;
 	DjCommandOrigin origin = DJ_ORIGIN_SYSTEM;
@@ -90,6 +100,84 @@ struct DjCommandResult {
 struct DjEffectSnapshot {
 	uint8_t type = 0;
 	uint8_t intensity = 0;
+};
+
+struct DjEffectTransition {
+	bool addSpeed = false;
+	bool removeSpeed = false;
+	bool setSpeed = false;
+	bool clearEffect = false;
+};
+
+class DjEffectState {
+public:
+	bool setType(uint8_t deck, uint8_t slot, uint8_t type, bool deckLoaded, DjEffectTransition& transition){
+		if(deck >= DJ_DECK_COUNT || slot >= DJ_EFFECT_SLOT_COUNT || type >= DJ_EFFECT_COUNT) return false;
+
+		DjEffectSnapshot& effect = effects[deck][slot];
+		if(type == DJ_EFFECT_SPEED){
+			for(uint8_t other = 0; other < DJ_EFFECT_SLOT_COUNT; other++){
+				if(other == slot || effects[deck][other].type != DJ_EFFECT_SPEED) continue;
+				effects[deck][other] = {};
+			}
+			effect.type = type;
+			effect.intensity = 127;
+			transition.clearEffect = true;
+			if(deckLoaded && !speedActive[deck]){
+				speedActive[deck] = true;
+				transition.addSpeed = true;
+			}
+			transition.setSpeed = speedActive[deck];
+			return true;
+		}
+
+		if(effect.type == DJ_EFFECT_SPEED && speedActive[deck]){
+			speedActive[deck] = false;
+			transition.removeSpeed = true;
+		}
+		effect.type = type;
+		effect.intensity = 0;
+		return true;
+	}
+
+	bool setIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjEffectTransition& transition){
+		if(deck >= DJ_DECK_COUNT || slot >= DJ_EFFECT_SLOT_COUNT ||
+		   effects[deck][slot].type == DJ_EFFECT_NONE) return false;
+		effects[deck][slot].intensity = intensity;
+		transition.setSpeed = effects[deck][slot].type == DJ_EFFECT_SPEED && speedActive[deck];
+		return true;
+	}
+
+	void deckLoaded(uint8_t deck, DjEffectTransition& transition){
+		if(deck >= DJ_DECK_COUNT || speedActive[deck]) return;
+		for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
+			if(effects[deck][slot].type != DJ_EFFECT_SPEED) continue;
+			speedActive[deck] = true;
+			transition.addSpeed = true;
+			transition.setSpeed = true;
+			return;
+		}
+	}
+
+	const DjEffectSnapshot& get(uint8_t deck, uint8_t slot) const{
+		return effects[deck][slot];
+	}
+
+	const DjEffectSnapshot* getDeck(uint8_t deck) const{
+		return effects[deck];
+	}
+
+	void copyDeck(uint8_t deck, DjEffectSnapshot* destination) const{
+		memcpy(destination, effects[deck], sizeof(effects[deck]));
+	}
+
+	bool isSpeedActive(uint8_t deck) const{
+		return deck < DJ_DECK_COUNT && speedActive[deck];
+	}
+
+private:
+	DjEffectSnapshot effects[DJ_DECK_COUNT][DJ_EFFECT_SLOT_COUNT] = {};
+	bool speedActive[DJ_DECK_COUNT] = {};
 };
 
 struct DjDeckSnapshot {
