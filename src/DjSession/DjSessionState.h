@@ -197,6 +197,10 @@ struct DjCommand {
 	uint64_t libraryKey = 0;
 	DjTrackIdentity trackIdentity = {};
 	char path[DJ_PATH_CAPACITY] = {};
+	// DJ_COMMAND_ASSIST_ARM_TRANSITION only: candidate-table index of the
+	// confirmed target track (paired with trackIdentity, which the engine
+	// re-checks against the loaded deck every tick to catch a swap).
+	uint32_t libraryIndex = 0;
 #if defined(JAYD_ENABLE_WIRELESS)
 	uint64_t requestBootId = 0;
 	uint32_t requestSessionId = 0;

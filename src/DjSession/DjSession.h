@@ -7,6 +7,7 @@
 #include <Loop/LoopListener.h>
 #include <Sync/Mutex.h>
 #include "../Metadata/JaydMetadata.h"
+#include "../DjAssist/DjAssistController.h"
 #include "DjSessionState.h"
 
 class DjSession : public LoopListener {
@@ -41,6 +42,39 @@ public:
 #if defined(JAYD_ENABLE_WIRELESS)
 	DjSubmitResult requestPairing(DjCommandOrigin origin);
 #endif
+
+	// Coach/one-shot-transition control surface. Always present (the
+	// physical Assist bank and browser/API use these too, not gated on
+	// wireless).
+	DjSubmitResult assistSetMode(bool coachEnabled, DjCommandOrigin origin);
+	DjSubmitResult assistArmTransition(
+		uint8_t fromDeck,
+		uint8_t toDeck,
+		uint32_t libraryIndex,
+		const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats,
+		bool startAtBoundary,
+		bool tempoLock,
+		DjCommandOrigin origin
+	);
+	DjSubmitResult assistCancelTransition(DjCommandOrigin origin);
+	// Bounded, POD copy of current Coach/transition state - safe for a
+	// browser/API payload or physical-bank UI cache.
+	bool copyAssistSnapshot(DjAssistSnapshot& snapshot) const;
+
+	// Bounded candidate-table data source for DjAssistController, backed by
+	// the same already-indexed metadata reader used by resolveMetadata() -
+	// never a fresh file read outside these bounded, mutex-guarded calls.
+	uint32_t assistLibraryGeneration();
+	uint32_t assistTrackCount();
+	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry);
+	// Cheap, in-memory downbeat hint from the already-built beat grid,
+	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
+	// are expected to throttle the latter (see DjAssistController).
+	bool mediaPresent() const;
+	uint64_t deckElapsedFrames(uint8_t deck) const;
+	bool nextDownbeatFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) const;
+	bool nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame);
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -115,6 +149,9 @@ private:
 #if defined(JAYD_ENABLE_WIRELESS)
 	uint32_t pairingGeneration = 0;
 #endif
+
+	DjAssistController assistController;
+	void tickAssist();
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;

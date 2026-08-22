@@ -1,5 +1,6 @@
 #include "DjSession.h"
 #include "DjRecordingStorage.h"
+#include "../DjAssist/DjAssistSessionBridge.h"
 #include <Arduino.h>
 #include <AudioLib/EffectType.hpp>
 #include <AudioLib/SpeedModifier.h>
@@ -67,6 +68,7 @@ DjSession::DjSession(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix) :
 		recordingSnapshot.orphansRepaired = recovery.repaired;
 		recordingSnapshot.orphansFailed = recovery.failed;
 	}
+	assistController.begin(this);
 	publishSnapshot();
 }
 
@@ -273,6 +275,46 @@ DjSubmitResult DjSession::clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin or
 	return submit(command);
 }
 
+DjSubmitResult DjSession::assistSetMode(bool coachEnabled, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_ASSIST_SET_MODE;
+	command.value = coachEnabled ? 1 : 0;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::assistArmTransition(
+	uint8_t fromDeck,
+	uint8_t toDeck,
+	uint32_t libraryIndex,
+	const DjTrackIdentity& targetIdentity,
+	uint8_t crossfadeBeats,
+	bool startAtBoundary,
+	bool tempoLock,
+	DjCommandOrigin origin
+){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_ASSIST_ARM_TRANSITION;
+	command.deck = fromDeck;
+	command.slot = toDeck;
+	command.libraryIndex = libraryIndex;
+	command.trackIdentity = targetIdentity;
+	command.value = uint16_t(
+		crossfadeBeats |
+		(startAtBoundary ? (1 << 8) : 0) |
+		(tempoLock ? (1 << 9) : 0)
+	);
+	return submit(command);
+}
+
+DjSubmitResult DjSession::assistCancelTransition(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_ASSIST_CANCEL_TRANSITION;
+	return submit(command);
+}
+
 #if defined(JAYD_ENABLE_WIRELESS)
 DjSubmitResult DjSession::requestPairing(DjCommandOrigin origin){
 	DjCommand command = {};
@@ -297,7 +339,7 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		return DJ_COMMAND_ERROR_STALE_IDENTITY;
 	}
 #else
-	if(command.type > DJ_COMMAND_CLEAR_CUE) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_ASSIST_CANCEL_TRANSITION) return DJ_COMMAND_ERROR_INVALID_VALUE;
 #endif
 
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
@@ -351,6 +393,18 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		const DjRecordingState mapped = mapRecordingState(system->getRecordingStatus().state);
 		if(djRecordingStartBusy(command.value != 0, mapped)){
 			return DJ_COMMAND_ERROR_RECORDING_BUSY;
+		}
+	}
+	if(command.type == DJ_COMMAND_ASSIST_SET_MODE && command.value > 1){
+		return DJ_COMMAND_ERROR_INVALID_VALUE;
+	}
+	if(command.type == DJ_COMMAND_ASSIST_ARM_TRANSITION){
+		if(command.deck >= DJ_DECK_COUNT || command.slot >= DJ_DECK_COUNT || command.deck == command.slot){
+			return DJ_COMMAND_ERROR_INVALID_DECK;
+		}
+		const uint8_t crossfadeBeats = uint8_t(command.value & 0xFF);
+		if(crossfadeBeats != 4 && crossfadeBeats != 8 && crossfadeBeats != 16 && crossfadeBeats != 32){
+			return DJ_COMMAND_ERROR_INVALID_VALUE;
 		}
 	}
 	return DJ_COMMAND_ERROR_NONE;
@@ -583,6 +637,79 @@ bool DjSession::copyPhrase(uint8_t deck, uint16_t index, JaydMetadata::Phrase& p
 	return copied;
 }
 
+bool DjSession::mediaPresent() const{
+	return SD.cardType() != CARD_NONE;
+}
+
+uint64_t DjSession::deckElapsedFrames(uint8_t deck) const{
+	if(deck >= DJ_DECK_COUNT || !system || !hasDeck(deck)) return 0;
+	return system->getElapsedSourceFrames(deck);
+}
+
+bool DjSession::nextDownbeatFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) const{
+	if(deck >= DJ_DECK_COUNT || !grids[deck].valid()) return false;
+	return grids[deck].nextBoundary(currentFrame, DJ_BEAT_QUARTER_BEATS, outFrame);
+}
+
+bool DjSession::nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame){
+	if(deck >= DJ_DECK_COUNT) return false;
+	metadataMutex.lock();
+	bool found = false;
+	if(deckMetadata[deck].attached() && deckMetadata[deck].snapshot().libraryGeneration == libraryGeneration){
+		const uint32_t phraseCount = metadataTracks[deck].phraseCount;
+		const uint32_t bound = phraseCount > JaydMetadata::Reader::MaxPhrasesPerTrack
+			? JaydMetadata::Reader::MaxPhrasesPerTrack : phraseCount;
+		uint64_t best = 0;
+		for(uint32_t index = 0; index < bound; ++index){
+			JaydMetadata::Phrase phrase;
+			if(!metadataReader.readPhrase(metadataTracks[deck], index, phrase)) continue;
+			if(phrase.positionFrames > currentFrame && (!found || phrase.positionFrames < best)){
+				best = phrase.positionFrames;
+				found = true;
+			}
+		}
+		if(found) outFrame = best;
+	}
+	metadataMutex.unlock();
+	return found;
+}
+
+uint32_t DjSession::assistLibraryGeneration(){
+	metadataMutex.lock();
+	const uint32_t generation = libraryGeneration;
+	metadataMutex.unlock();
+	return generation;
+}
+
+uint32_t DjSession::assistTrackCount(){
+	metadataMutex.lock();
+	const uint32_t count = (metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready)
+		? metadataReader.trackCount() : 0;
+	metadataMutex.unlock();
+	return count;
+}
+
+bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry){
+	metadataMutex.lock();
+	JaydMetadata::Track track;
+	const bool ok = metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready &&
+		metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
+	if(ok){
+		const DjTrackIdentity identity = DjAssistBridge::buildTrackIdentity(track.fingerprint, track.sourceId);
+		outEntry = DjAssistBridge::buildLibraryEntry(
+			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
+			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
+		);
+	}
+	metadataMutex.unlock();
+	return ok;
+}
+
+bool DjSession::copyAssistSnapshot(DjAssistSnapshot& snapshot) const{
+	assistController.copySnapshot(snapshot);
+	return true;
+}
+
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
 	if(!system || !left || !right || !output) return;
 	if(viewAttached && viewInfo[0] == left && viewInfo[1] == right && viewInfo[2] == output) return;
@@ -622,7 +749,12 @@ void DjSession::loop(uint micros){
 	tickLoops();
 	tickSync();
 	pollRecording();
+	tickAssist();
 	publishSnapshot();
+}
+
+void DjSession::tickAssist(){
+	assistController.tick();
 }
 
 bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics){
@@ -835,6 +967,25 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		}
 		case DJ_COMMAND_CLEAR_CUE:
 			return cues.clear(command.deck, command.slot);
+		case DJ_COMMAND_ASSIST_SET_MODE:
+			assistController.setCoachEnabled(command.value != 0);
+			return true;
+		case DJ_COMMAND_ASSIST_ARM_TRANSITION: {
+			const uint8_t crossfadeBeats = uint8_t(command.value & 0xFF);
+			const bool startAtBoundary = (command.value & (1 << 8)) != 0;
+			const bool tempoLock = (command.value & (1 << 9)) != 0;
+			if(!assistController.armTransition(
+				command.deck, command.slot, command.libraryIndex, command.trackIdentity,
+				crossfadeBeats, startAtBoundary, tempoLock
+			)){
+				error = DJ_COMMAND_ERROR_ASSIST_REJECTED;
+				return false;
+			}
+			return true;
+		}
+		case DJ_COMMAND_ASSIST_CANCEL_TRANSITION:
+			assistController.cancelTransition();
+			return true;
 #if defined(JAYD_ENABLE_WIRELESS)
 		case DJ_COMMAND_OPEN_PAIRING:
 			pairingGeneration++;
@@ -1204,6 +1355,9 @@ void DjSession::publishSnapshot(){
 	metadataMutex.lock();
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		snapshot.decks[deck].metadata = deckMetadata[deck].snapshot();
+		snapshot.decks[deck].identity = deckMetadata[deck].attached()
+			? DjAssistBridge::buildTrackIdentity(metadataTracks[deck].fingerprint, metadataTracks[deck].sourceId)
+			: DjTrackIdentity();
 	}
 	metadataMutex.unlock();
 
