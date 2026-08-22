@@ -239,8 +239,10 @@ int main(){
 
 	// LOOP/SYNC bank is reachable via the palette alongside MIX/CUES/BROWSE,
 	// preserving the ordinal alignment confirmPalette() relies on.
+	// openPalette() seeds paletteSelection from the *current* bank (CUES,
+	// from above), so only +2 is needed to land on LOOPSYNC, not +3.
 	controls.openPalette();
-	controls.movePalette(3);
+	controls.movePalette(2);
 	assert(controls.confirmPalette() == MIX_PALETTE_LOOPSYNC);
 	assert(controls.bank == MIX_BANK_LOOPSYNC);
 

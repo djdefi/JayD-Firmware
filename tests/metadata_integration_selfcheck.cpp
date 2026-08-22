@@ -57,7 +57,11 @@ int main(){
 	playback.decks[1].playing = true;
 	assert(!djAllowsLibraryWork(playback));
 	playback.decks[1].playing = false;
-	playback.recording = true;
+	// Recording status moved from a flat DjSnapshot::recording bool to the
+	// richer DjRecordingSnapshot (see DjSessionState.h); djAllowsLibraryWork()
+	// now gates on the same STARTING/ACTIVE/STOPPING busy span that
+	// djRecordingStartBusy() uses for new start commands.
+	playback.recordingInfo.state = DJ_RECORDING_ACTIVE;
 	assert(!djAllowsLibraryWork(playback));
 
 	LibraryIndex::VerifiedIdentity identity = {};

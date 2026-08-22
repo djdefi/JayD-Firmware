@@ -43,6 +43,14 @@ include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/LovyanGFX/src)
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/CircuitOS/src)
 
+# Override to point host-only self-checks (DjRecordingSelfCheck) at a
+# specific JayD-Library checkout's src/ directory, e.g. a pinned SHA under
+# review, instead of whatever core version happens to be installed:
+#   cmake -DJAYD_LIBRARY_SRC=/path/to/JayD-Library/src ..
+if (NOT DEFINED JAYD_LIBRARY_SRC)
+    set(JAYD_LIBRARY_SRC ${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD-Library/src)
+endif ()
+
 
 # Source directories
 file(GLOB_RECURSE SOURCES "src/**.cpp" "src/**.c" "src/**.hpp" "src/**.h")
@@ -118,3 +126,36 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_link_options(DjAssistSelfCheck PRIVATE -fsanitize=address,undefined)
 endif ()
 add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
+
+# Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
+# DjRecordingSnapshot/State shape). Pure logic compiled directly against the
+# pinned JayD-Library headers (WavHeader.h, AudioSetup.hpp) via
+# JAYD_LIBRARY_SRC, never vendored copies.
+add_executable(DjRecordingSelfCheck tests/dj_recording_self_test.cpp)
+target_include_directories(DjRecordingSelfCheck PRIVATE ${JAYD_LIBRARY_SRC})
+set_target_properties(DjRecordingSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjRecordingSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjRecordingSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjRecordingSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME DjRecordingSelfCheck COMMAND DjRecordingSelfCheck)
+
+# Wireless semantic API v2 host logic (client-id/session identity matching,
+# duplicate command detection, pairing token store). Built with
+# JAYD_ENABLE_WIRELESS so the wireless-only DjCommand/DjCommandResult fields
+# and djCommandIdentityMatches() are compiled in, matching a wireless-enabled
+# firmware build; the default (non-wireless) build never compiles this code.
+add_executable(WirelessApiSelfCheck
+        tests/wireless_api_self_test.cpp
+        src/Wireless/WirelessApiCore.cpp)
+set_target_properties(WirelessApiSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_definitions(WirelessApiSelfCheck PRIVATE JAYD_ENABLE_WIRELESS)
+target_compile_options(WirelessApiSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(WirelessApiSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(WirelessApiSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME WirelessApiSelfCheck COMMAND WirelessApiSelfCheck)
