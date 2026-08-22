@@ -7,6 +7,7 @@
 
 static constexpr uint8_t DJ_DECK_COUNT = 2;
 static constexpr uint8_t DJ_EFFECT_SLOT_COUNT = 3;
+static constexpr uint8_t DJ_CUE_COUNT = 8;
 static constexpr uint8_t DJ_COMMAND_CAPACITY = 16;
 static constexpr uint8_t DJ_RECENT_RESULT_COUNT = 8;
 static constexpr size_t DJ_PATH_CAPACITY = 128;
@@ -26,7 +27,10 @@ enum DjCommandType : uint8_t {
 	DJ_COMMAND_SET_MIX,
 	DJ_COMMAND_SET_EFFECT_TYPE,
 	DJ_COMMAND_SET_EFFECT_INTENSITY,
-	DJ_COMMAND_SET_RECORDING
+	DJ_COMMAND_SET_RECORDING,
+	DJ_COMMAND_SET_CUE,
+	DJ_COMMAND_TRIGGER_CUE,
+	DJ_COMMAND_CLEAR_CUE
 };
 
 enum DjCommandStatus : uint8_t {
@@ -47,7 +51,9 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_NO_DECK,
 	DJ_COMMAND_ERROR_NO_EFFECT,
 	DJ_COMMAND_ERROR_OPEN_FAILED,
-	DJ_COMMAND_ERROR_SESSION_ENDING
+	DJ_COMMAND_ERROR_SESSION_ENDING,
+	DJ_COMMAND_ERROR_EMPTY_CUE,
+	DJ_COMMAND_ERROR_RECORDING_ACTIVE
 };
 
 enum DjTimingQuality : uint8_t {
@@ -180,6 +186,11 @@ private:
 	bool speedActive[DJ_DECK_COUNT] = {};
 };
 
+struct DjCueSnapshot {
+	bool occupied = false;
+	uint16_t position = 0;
+};
+
 struct DjDeckSnapshot {
 	bool loaded = false;
 	bool playing = false;
@@ -189,6 +200,7 @@ struct DjDeckSnapshot {
 	uint8_t gain = 255;
 	char path[DJ_PATH_CAPACITY] = {};
 	DjEffectSnapshot effects[DJ_EFFECT_SLOT_COUNT] = {};
+	DjCueSnapshot cues[DJ_CUE_COUNT] = {};
 };
 
 struct DjSnapshot {
@@ -203,6 +215,41 @@ struct DjSnapshot {
 	uint8_t queueDepth = 0;
 	uint32_t queueDrops = 0;
 	DjCommandResult recentResults[DJ_RECENT_RESULT_COUNT] = {};
+};
+
+class DjCueState {
+public:
+	bool set(uint8_t deck, uint8_t cue, uint16_t position){
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT) return false;
+		cues[deck][cue].occupied = true;
+		cues[deck][cue].position = position;
+		return true;
+	}
+
+	bool trigger(uint8_t deck, uint8_t cue, uint16_t& position) const{
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT || !cues[deck][cue].occupied) return false;
+		position = cues[deck][cue].position;
+		return true;
+	}
+
+	bool clear(uint8_t deck, uint8_t cue){
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT) return false;
+		cues[deck][cue] = {};
+		return true;
+	}
+
+	void clearDeck(uint8_t deck){
+		if(deck >= DJ_DECK_COUNT) return;
+		memset(cues[deck], 0, sizeof(cues[deck]));
+	}
+
+	void copyDeck(uint8_t deck, DjCueSnapshot* destination) const{
+		if(deck >= DJ_DECK_COUNT || !destination) return;
+		memcpy(destination, cues[deck], sizeof(cues[deck]));
+	}
+
+private:
+	DjCueSnapshot cues[DJ_DECK_COUNT][DJ_CUE_COUNT] = {};
 };
 
 class DjCommandQueue {
@@ -254,7 +301,9 @@ private:
 		return type == DJ_COMMAND_SET_GAIN ||
 			   type == DJ_COMMAND_SET_MIX ||
 			   type == DJ_COMMAND_SET_EFFECT_TYPE ||
-			   type == DJ_COMMAND_SET_EFFECT_INTENSITY;
+			   type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+			   type == DJ_COMMAND_SET_CUE ||
+			   type == DJ_COMMAND_CLEAR_CUE;
 	}
 
 	static bool sameTarget(const DjCommand& first, const DjCommand& second){
@@ -262,7 +311,9 @@ private:
 		if(first.type == DJ_COMMAND_SET_MIX) return true;
 		if(first.deck != second.deck) return false;
 		if(first.type == DJ_COMMAND_SET_EFFECT_TYPE ||
-		   first.type == DJ_COMMAND_SET_EFFECT_INTENSITY){
+		   first.type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+		   first.type == DJ_COMMAND_SET_CUE ||
+		   first.type == DJ_COMMAND_CLEAR_CUE){
 			return first.slot == second.slot;
 		}
 		return true;

@@ -150,18 +150,52 @@ DjSubmitResult DjSession::setRecording(bool recording, DjCommandOrigin origin){
 	return submit(command);
 }
 
+DjSubmitResult DjSession::setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_SET_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_TRIGGER_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_CLEAR_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
 DjCommandError DjSession::validate(const DjCommand& command) const{
-	if(command.type > DJ_COMMAND_SET_RECORDING) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_CLEAR_CUE) return DJ_COMMAND_ERROR_INVALID_VALUE;
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
 							 command.type == DJ_COMMAND_SET_PLAYING ||
 							 command.type == DJ_COMMAND_SEEK ||
 							 command.type == DJ_COMMAND_SET_GAIN ||
 							 command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
-							 command.type == DJ_COMMAND_SET_EFFECT_INTENSITY;
+							 command.type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+							 command.type == DJ_COMMAND_SET_CUE ||
+							 command.type == DJ_COMMAND_TRIGGER_CUE ||
+							 command.type == DJ_COMMAND_CLEAR_CUE;
 	if(deckCommand && command.deck >= DJ_DECK_COUNT) return DJ_COMMAND_ERROR_INVALID_DECK;
 	if((command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
 	   command.slot >= DJ_EFFECT_SLOT_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
+	if((command.type == DJ_COMMAND_SET_CUE ||
+		command.type == DJ_COMMAND_TRIGGER_CUE ||
+		command.type == DJ_COMMAND_CLEAR_CUE) &&
+	   command.slot >= DJ_CUE_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
 	if(command.type == DJ_COMMAND_SET_EFFECT_TYPE && command.value >= DJ_EFFECT_COUNT){
 		return DJ_COMMAND_ERROR_INVALID_VALUE;
 	}
@@ -177,6 +211,10 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		}
 	}
 	return DJ_COMMAND_ERROR_NONE;
+}
+
+bool DjSession::hasDeck(uint8_t deck) const{
+	return system && system->hasChannel(deck);
 }
 
 bool DjSession::copySnapshot(DjSnapshot& snapshot){
@@ -237,8 +275,10 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 	if(command.type == DJ_COMMAND_LOAD_DECK) return applyLoad(command, error);
 
 	if((command.type == DJ_COMMAND_SET_PLAYING ||
-		command.type == DJ_COMMAND_SEEK) &&
-	   !system->hasChannel(command.deck)){
+		command.type == DJ_COMMAND_SEEK ||
+		command.type == DJ_COMMAND_SET_CUE ||
+		command.type == DJ_COMMAND_TRIGGER_CUE) &&
+	   !hasDeck(command.deck)){
 		error = DJ_COMMAND_ERROR_NO_DECK;
 		return false;
 	}
@@ -293,13 +333,26 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 			return true;
 		}
 		case DJ_COMMAND_SET_RECORDING:
-			if(!system->hasChannel(0) && !system->hasChannel(1)){
+			if(!hasDeck(0) && !hasDeck(1)){
 				error = DJ_COMMAND_ERROR_NO_DECK;
 				return false;
 			}
 			if(command.value) system->startRecording();
 			else system->stopRecording();
 			return true;
+		case DJ_COMMAND_SET_CUE:
+			return cues.set(command.deck, command.slot, system->getElapsed(command.deck));
+		case DJ_COMMAND_TRIGGER_CUE: {
+			uint16_t position = 0;
+			if(!cues.trigger(command.deck, command.slot, position)){
+				error = DJ_COMMAND_ERROR_EMPTY_CUE;
+				return false;
+			}
+			system->seekChannel(command.deck, position);
+			return true;
+		}
+		case DJ_COMMAND_CLEAR_CUE:
+			return cues.clear(command.deck, command.slot);
 		default:
 			error = DJ_COMMAND_ERROR_INVALID_VALUE;
 			return false;
@@ -307,20 +360,23 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 }
 
 bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
+	if(system->isRecording()){
+		error = DJ_COMMAND_ERROR_RECORDING_ACTIVE;
+		return false;
+	}
 	fs::File file = SD.open(command.path);
 	if(!file){
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
 		return false;
 	}
 
-	const bool hadLeft = system->hasChannel(0);
-	const bool hadRight = system->hasChannel(1);
+	const bool hadLeft = hasDeck(0);
+	const bool hadRight = hasDeck(1);
 	if(!system->openChannel(command.deck, file)){
 		file.close();
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
 		return false;
 	}
-
 	files[command.deck] = file;
 	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
 	system->setVolume(command.deck, gains[command.deck]);
@@ -335,6 +391,7 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 			break;
 		}
 	}
+	cues.clearDeck(command.deck);
 
 	if(!system->isRunning()){
 		mix = command.deck == 0 ? 0 : 255;
@@ -359,7 +416,7 @@ void DjSession::publishSnapshot(){
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
 		DjDeckSnapshot& deckSnapshot = snapshot.decks[deck];
-		deckSnapshot.loaded = system && system->hasChannel(deck);
+		deckSnapshot.loaded = system && hasDeck(deck);
 		deckSnapshot.playing = deckSnapshot.loaded && !system->isChannelPaused(deck);
 		deckSnapshot.elapsed = deckSnapshot.loaded ? system->getElapsed(deck) : 0;
 		deckSnapshot.duration = deckSnapshot.loaded ? system->getDuration(deck) : 0;
@@ -367,6 +424,7 @@ void DjSession::publishSnapshot(){
 		deckSnapshot.gain = gains[deck];
 		memcpy(deckSnapshot.path, paths[deck], DJ_PATH_CAPACITY);
 		effectState.copyDeck(deck, deckSnapshot.effects);
+		cues.copyDeck(deck, deckSnapshot.cues);
 	}
 
 	commandMutex.lock();
