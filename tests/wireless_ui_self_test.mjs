@@ -356,6 +356,81 @@ test('formatClock renders mm:ss and a placeholder for unavailable timing', () =>
 	assert.equal(helpers.formatClock(-1), '--:--');
 });
 
+/* ---------------- Assist (Coach / one-shot transition) ---------------- */
+
+test('buildCommandBody shapes the three assist actions to exactly what the device expects', () => {
+	const identity = { bootId: 11, sessionId: 12 };
+	const modeBody = helpers.buildCommandBody(identity, 'assist_set_mode', { value: true }, 'cmd1');
+	assert.deepEqual(Object.keys(modeBody).sort(), ['action', 'boot_id', 'client_command_id', 'session_id', 'value']);
+	assert.equal(modeBody.value, true);
+
+	const cancelBody = helpers.buildCommandBody(identity, 'assist_cancel_transition', {}, 'cmd2');
+	assert.deepEqual(Object.keys(cancelBody).sort(), ['action', 'boot_id', 'client_command_id', 'session_id']);
+
+	const armBody = helpers.buildCommandBody(identity, 'assist_arm_transition',
+		{ deck: 0, toDeck: 1, crossfadeBeats: 16, startAtBoundary: true, tempoLock: false }, 'cmd3');
+	assert.deepEqual(Object.keys(armBody).sort(),
+		['action', 'boot_id', 'client_command_id', 'crossfade_beats', 'deck', 'session_id', 'start_at_boundary',
+			'tempo_lock', 'to_deck']);
+	assert.equal(armBody.to_deck, 1);
+	assert.equal(armBody.crossfade_beats, 16);
+	assert.equal(armBody.start_at_boundary, true);
+	assert.equal(armBody.tempo_lock, false);
+});
+
+test('deckLabel / describeCrossfadeDirection give accessible text for every device-emitted value', () => {
+	assert.equal(helpers.deckLabel(0), 'Deck A');
+	assert.equal(helpers.deckLabel(1), 'Deck B');
+	assert.equal(helpers.describeCrossfadeDirection(-1), 'Toward Deck A');
+	assert.equal(helpers.describeCrossfadeDirection(0), 'Centered');
+	assert.equal(helpers.describeCrossfadeDirection(1), 'Toward Deck B');
+});
+
+test('formatBpmDelta/formatRatePercent decode the device\'s milli-fixed-point units', () => {
+	// tempoDeltaMilli is candidateBpmMilli - deckBpmMilli (milli-BPM), not a rate.
+	assert.equal(helpers.formatBpmDelta(-2300), '-2.3 BPM');
+	assert.equal(helpers.formatBpmDelta(500), '+0.5 BPM');
+	assert.equal(helpers.formatBpmDelta(undefined), '\u2014');
+	// target_rate/armed rates are deck-rate multipliers, 1000 == 1.0x.
+	assert.equal(helpers.formatRatePercent(1000), '100.0%');
+	assert.equal(helpers.formatRatePercent(1050), '105.0%');
+	assert.equal(helpers.formatRatePercent(null), '\u2014');
+});
+
+test('describeReasonFlags decodes DjAssistReasonFlag bits exactly (mirrors DjAssistTypes.h)', () => {
+	// TEMPO_IN_RANGE(1<<1) | KEY_SAME(1<<3) | GRID_AVAILABLE(1<<7)
+	const flags = (1 << 1) | (1 << 3) | (1 << 7);
+	assert.deepEqual(helpers.describeReasonFlags(flags), ['tempo in range', 'key same', 'grid available']);
+	assert.deepEqual(helpers.describeReasonFlags(0), []);
+	assert.deepEqual(helpers.describeReasonFlags(undefined), []);
+});
+
+test('every assist mode/key/exclude/action/failure token the device can emit has display text', () => {
+	// These lists must stay in lockstep with assist*Name()/appendAssistWarnings()
+	// in src/Wireless/WirelessBringup.cpp - this test fails loudly if either
+	// side adds a token the other doesn't know about.
+	['off', 'coach', 'armed', 'running', 'complete', 'failed'].forEach((token) => {
+		assert.ok(helpers.ASSIST_MODE_TEXT[token], 'missing mode text for ' + token);
+	});
+	['unknown', 'incompatible', 'relative', 'adjacent', 'same'].forEach((token) => {
+		assert.ok(helpers.ASSIST_KEY_TEXT[token], 'missing key text for ' + token);
+	});
+	['loaded', 'recent', 'unsupported_metadata'].forEach((token) => {
+		assert.ok(helpers.ASSIST_EXCLUDE_TEXT[token], 'missing exclude text for ' + token);
+	});
+	['wait_boundary', 'start_deck', 'lock_tempo', 'enable_sync', 'crossfade', 'stop_deck', 'release_sync', 'done']
+		.forEach((token) => {
+			assert.ok(helpers.ASSIST_ACTION_TEXT[token], 'missing action text for ' + token);
+		});
+	['metadata_lost', 'command_rejected', 'media_removed', 'end_of_track', 'manual_override', 'conflict',
+		'target_not_loaded', 'target_changed', 'cancelled'].forEach((token) => {
+		assert.ok(helpers.ASSIST_FAILURE_TEXT[token], 'missing failure text for ' + token);
+	});
+	['out_of_range', 'no_grid', 'ending_soon', 'recording_active', 'loop_active', 'no_metadata'].forEach((token) => {
+		assert.ok(helpers.ASSIST_WARNING_TEXT[token], 'missing warning text for ' + token);
+	});
+});
+
 /* ---------------- static DOM-safety invariant ---------------- */
 
 test('app.js never assigns innerHTML/outerHTML or uses document.write (no unescaped DOM injection)', () => {

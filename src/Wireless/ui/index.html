@@ -175,6 +175,73 @@
 			</section>
 		</div>
 
+		<section id="assist-section" aria-labelledby="assist-heading">
+			<h2 id="assist-heading">Assist</h2>
+			<p id="assist-mode" role="status">Assist: Off</p>
+			<button id="assist-coach-toggle" type="button" class="requires-control" aria-pressed="false">Enable Coach</button>
+
+			<div id="assist-advice" hidden>
+				<h3>Coach advice</h3>
+				<dl>
+					<dt>Suggested deck</dt><dd id="assist-advice-deck">&mdash;</dd>
+					<dt>Next boundary</dt><dd id="assist-advice-boundary">&mdash;</dd>
+					<dt>Target tempo</dt><dd id="assist-advice-rate">&mdash;</dd>
+					<dt>Crossfader direction</dt><dd id="assist-advice-direction">&mdash;</dd>
+				</dl>
+				<ul id="assist-advice-warnings" aria-label="Warnings"></ul>
+			</div>
+
+			<div id="assist-suggestions">
+				<h3>Suggested next tracks</h3>
+				<p class="follow-up">Ranked from the device&rsquo;s own indexed library metadata only &mdash; nothing
+					is invented. Load a track onto a deck using the device&rsquo;s own screen, then arm a transition
+					below once it&rsquo;s loaded.</p>
+				<ol id="assist-suggestion-list"></ol>
+			</div>
+
+			<form id="assist-arm-form">
+				<h3>One-shot transition</h3>
+				<div class="field">
+					<label for="assist-from-deck">From deck (currently playing)</label>
+					<select id="assist-from-deck" class="requires-control">
+						<option value="0">Deck A</option>
+						<option value="1">Deck B</option>
+					</select>
+				</div>
+				<div class="field">
+					<label for="assist-to-deck">To deck (target already loaded)</label>
+					<select id="assist-to-deck" class="requires-control">
+						<option value="0">Deck A</option>
+						<option value="1" selected>Deck B</option>
+					</select>
+				</div>
+				<div class="field">
+					<label for="assist-crossfade-beats">Crossfade length</label>
+					<select id="assist-crossfade-beats" class="requires-control">
+						<option value="4">4 beats</option>
+						<option value="8">8 beats</option>
+						<option value="16" selected>16 beats</option>
+						<option value="32">32 beats</option>
+					</select>
+				</div>
+				<div class="field checkbox">
+					<label><input id="assist-start-at-boundary" type="checkbox" class="requires-control" checked>
+						Start target deck at its next phrase/downbeat</label>
+				</div>
+				<div class="field checkbox">
+					<label><input id="assist-tempo-lock" type="checkbox" class="requires-control" checked>
+						Lock tempo/phase (enables Sync for this transition)</label>
+				</div>
+				<button id="assist-arm" type="submit" class="requires-control">Arm transition</button>
+				<button id="assist-cancel" type="button" class="requires-control" hidden>Cancel transition</button>
+			</form>
+
+			<div id="assist-transition" hidden>
+				<h3>Transition status</h3>
+				<p id="assist-transition-progress" role="status">&mdash;</p>
+			</div>
+		</section>
+
 		<section id="cues-section" aria-labelledby="cues-heading">
 			<h2 id="cues-heading">Cues</h2>
 			<p>Cue points aren&rsquo;t available from the browser yet &mdash; the wireless API doesn&rsquo;t expose cue
@@ -208,6 +275,11 @@
 				<dt>Take control</dt><dd>Requests exclusive control. Only one browser may control the device at a time.</dd>
 				<dt>Control lost / expired</dt><dd>Another browser took over, or this tab was inactive too long. Take control again to continue.</dd>
 				<dt>Device restarted</dt><dd>State resets and any prior control is dropped; commands are never resent automatically.</dd>
+				<dt>Coach</dt><dd>Advice only &mdash; it never changes playback by itself. Enable it to see suggested
+					next tracks and mixing advice for the currently playing deck.</dd>
+				<dt>Arm transition</dt><dd>Starts a bounded, cancellable one-shot transition between two decks you
+					choose. The target deck must already have a track loaded on the device; this page never loads a
+					track by itself.</dd>
 				<dt>Keyboard</dt><dd>All controls are standard buttons, sliders and menus &mdash; Tab/Shift+Tab to move
 					between them, Space/Enter to activate buttons, and arrow keys to adjust sliders and menus.</dd>
 			</dl>

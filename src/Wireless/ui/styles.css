@@ -144,6 +144,23 @@ fieldset.effects legend{ color: var(--muted); padding: 0 6px; }
 .follow-up{ color: var(--muted); font-size: 0.85rem; }
 .follow-up code{ background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 
+#assist-section h3{ font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 16px 0 8px; }
+#assist-mode{ font-weight: 600; margin: 0 0 10px; }
+#assist-coach-toggle[aria-pressed="true"]{ border-color: var(--ok); color: var(--ok); }
+#assist-advice dl{ display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 8px 0; }
+#assist-advice dt{ color: var(--muted); }
+#assist-advice dd{ margin: 0; }
+#assist-advice-warnings{ list-style: none; margin: 8px 0 0; padding: 0; }
+#assist-advice-warnings li{ padding: 4px 8px; margin-bottom: 4px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem; }
+#assist-advice-warnings li::before{ content: "\26A0 "; }
+#assist-suggestion-list{ margin: 8px 0; padding-left: 20px; }
+#assist-suggestion-list li{ margin-bottom: 8px; }
+#assist-suggestion-list .suggestion-excluded{ color: var(--muted); text-decoration: line-through; }
+#assist-arm-form .checkbox label{ display: flex; flex-direction: row; align-items: center; gap: 8px; }
+#assist-arm-form .checkbox input{ min-height: auto; width: auto; }
+#assist-cancel{ margin-left: 8px; border-color: var(--accent); color: var(--accent); }
+#assist-transition-progress{ color: var(--muted); }
+
 details#help summary{ cursor: pointer; color: var(--muted); }
 details#help dl{ margin: 10px 0 0; }
 details#help dt{ font-weight: 600; margin-top: 8px; }

@@ -134,7 +134,16 @@ const COMMAND_SHAPE = {
 	set_mix: (f) => ({ value: f.value }),
 	set_effect_type: (f) => ({ deck: f.deck, slot: f.slot, value: f.value }),
 	set_effect_intensity: (f) => ({ deck: f.deck, slot: f.slot, value: f.value }),
-	set_recording: (f) => ({ value: !!f.value })
+	set_recording: (f) => ({ value: !!f.value }),
+	assist_set_mode: (f) => ({ value: !!f.value }),
+	assist_cancel_transition: () => ({}),
+	assist_arm_transition: (f) => ({
+		deck: f.deck,
+		to_deck: f.toDeck,
+		crossfade_beats: f.crossfadeBeats,
+		start_at_boundary: !!f.startAtBoundary,
+		tempo_lock: !!f.tempoLock
+	})
 };
 
 // Pure snapshot-acceptance state machine, factored out of applySnapshot()
@@ -239,6 +248,87 @@ function formatClock(seconds){
 	return m + ':' + (s < 10 ? '0' : '') + s;
 }
 
+/* ---------------------------------------------------------------------- *
+ * Assist (Coach / one-shot transition) text mapping - pure and testable.
+ * These decode the short snake_case tokens the device emits in
+ * `/api/v2/state`'s "assist" block (see WirelessBringup.cpp's
+ * assist*Name()/appendAssistWarnings() for the authoritative token set)
+ * into accessible, human-readable text. Unknown tokens fall back to the
+ * raw token itself rather than throwing, since the device is always the
+ * source of truth and a forward-compatible client shouldn't hard-fail on
+ * an unrecognized-but-harmless new token.
+ * ---------------------------------------------------------------------- */
+const ASSIST_MODE_TEXT = {
+	off: 'Off', coach: 'Coach', armed: 'Transition armed', running: 'Transition running',
+	complete: 'Transition complete', failed: 'Transition failed'
+};
+const ASSIST_BOUNDARY_TEXT = { phrase: 'Next phrase', beat: 'Next downbeat', none: 'No grid available' };
+const ASSIST_WARNING_TEXT = {
+	out_of_range: 'Target tempo is outside the safe deck-rate range.',
+	no_grid: 'No beat grid available for a safe boundary.',
+	ending_soon: 'The current track is ending too soon for this transition.',
+	recording_active: 'Recording is active; some actions are blocked.',
+	loop_active: 'A loop is active on a deck involved in this transition.',
+	no_metadata: 'Track metadata is missing or unreliable.'
+};
+const ASSIST_KEY_TEXT = {
+	unknown: 'Unknown', incompatible: 'Incompatible', relative: 'Relative key',
+	adjacent: 'Adjacent key', same: 'Same key'
+};
+const ASSIST_EXCLUDE_TEXT = { loaded: 'Already loaded', recent: 'Recently played', unsupported_metadata: 'Metadata unsupported' };
+const ASSIST_ACTION_TEXT = {
+	wait_boundary: 'Waiting for boundary', start_deck: 'Starting target deck', lock_tempo: 'Locking tempo',
+	enable_sync: 'Enabling Sync', crossfade: 'Crossfading', stop_deck: 'Stopping old deck',
+	release_sync: 'Releasing Sync', done: 'Done'
+};
+const ASSIST_FAILURE_TEXT = {
+	metadata_lost: 'Metadata was lost mid-transition.', command_rejected: 'A command was rejected.',
+	media_removed: 'Media was removed.', end_of_track: 'A deck reached end of track.',
+	manual_override: 'Manual control overrode the transition.', conflict: 'A loop/recording conflict occurred.',
+	target_not_loaded: 'The target track is no longer loaded.', target_changed: 'The target track changed.',
+	cancelled: 'Cancelled.'
+};
+// Mirrors DjAssistReasonFlag's bit layout exactly (DjAssistTypes.h). Kept in
+// sync manually since this is a small, stable, already-shipped bit layout.
+const ASSIST_REASON_FLAGS = [
+	[1 << 0, 'tempo narrow'], [1 << 1, 'tempo in range'], [1 << 2, 'tempo out of range'],
+	[1 << 3, 'key same'], [1 << 4, 'key adjacent'], [1 << 5, 'key relative'], [1 << 6, 'key unknown'],
+	[1 << 7, 'grid available'], [1 << 8, 'phrase available'], [1 << 9, 'rating known'],
+	[1 << 10, 'duration short'], [1 << 11, 'low confidence']
+];
+
+function deckLabel(index){
+	if(index === 0) return 'Deck A';
+	if(index === 1) return 'Deck B';
+	return 'Deck ' + index;
+}
+
+function describeCrossfadeDirection(dir){
+	if(dir === -1) return 'Toward Deck A';
+	if(dir === 1) return 'Toward Deck B';
+	if(dir === 0) return 'Centered';
+	return '\u2014';
+}
+
+// tempoDeltaMilli is candidateBpmMilli - deckBpmMilli (see DjAssistScoring.cpp),
+// i.e. milli-BPM, not a rate ratio.
+function formatBpmDelta(milli){
+	if(typeof milli !== 'number' || !isFinite(milli)) return '\u2014';
+	const bpm = milli / 1000;
+	return (bpm > 0 ? '+' : '') + bpm.toFixed(1) + ' BPM';
+}
+
+// target_rate/armed rates are deck-rate multipliers where 1000 == 1.0x (unity).
+function formatRatePercent(milli){
+	if(typeof milli !== 'number' || !isFinite(milli)) return '\u2014';
+	return (milli / 1000 * 100).toFixed(1) + '%';
+}
+
+function describeReasonFlags(flags){
+	if(typeof flags !== 'number') return [];
+	return ASSIST_REASON_FLAGS.filter(([bit]) => (flags & bit) !== 0).map(([, text]) => text);
+}
+
 const helpers = {
 	validId,
 	makeCommandIdFactory,
@@ -253,7 +343,19 @@ const helpers = {
 	buildCommandBody,
 	COMMAND_SHAPE,
 	EFFECT_NAMES,
-	formatClock
+	formatClock,
+	ASSIST_MODE_TEXT,
+	ASSIST_BOUNDARY_TEXT,
+	ASSIST_WARNING_TEXT,
+	ASSIST_KEY_TEXT,
+	ASSIST_EXCLUDE_TEXT,
+	ASSIST_ACTION_TEXT,
+	ASSIST_FAILURE_TEXT,
+	deckLabel,
+	describeCrossfadeDirection,
+	formatBpmDelta,
+	formatRatePercent,
+	describeReasonFlags
 };
 
 if(typeof module !== 'undefined' && module.exports){
@@ -433,6 +535,7 @@ if(typeof document !== 'undefined'){
 				case 'control_unavailable_in_setup_mode': return 'The device is in Wi-Fi setup mode; DJ control is unavailable until setup finishes.';
 				case 'queue_full': return 'The device is busy. Try again in a moment.';
 				case 'stale_identity': return 'Your control session is out of date \u2014 the device restarted or another browser took over. Take control again to continue.';
+				case 'assist_rejected': return 'The device rejected that Assist request \u2014 check the current mode and that the target deck has a track loaded.';
 				default: return code ? ('Device error: ' + code) : null;
 			}
 		}
@@ -514,6 +617,9 @@ if(typeof document !== 'undefined'){
 			}
 			$('mix-fader').addEventListener('input', (e) => onMix(e.target.value));
 			$('recording-toggle').addEventListener('click', onToggleRecording);
+			$('assist-coach-toggle').addEventListener('click', onToggleCoach);
+			$('assist-arm-form').addEventListener('submit', onArmTransition);
+			$('assist-cancel').addEventListener('click', onCancelTransition);
 			$('lease-take').addEventListener('click', onTakeControl);
 			$('lease-release').addEventListener('click', onReleaseControl);
 			$('forget-device').addEventListener('click', onForgetDevice);
@@ -695,6 +801,26 @@ if(typeof document !== 'undefined'){
 			sendCommand('set_recording', { value: !recording });
 		}
 
+		function onToggleCoach(){
+			const coachOn = $('assist-coach-toggle').getAttribute('aria-pressed') === 'true';
+			sendCommand('assist_set_mode', { value: !coachOn });
+		}
+
+		function onArmTransition(event){
+			event.preventDefault();
+			sendCommand('assist_arm_transition', {
+				deck: Number($('assist-from-deck').value),
+				toDeck: Number($('assist-to-deck').value),
+				crossfadeBeats: Number($('assist-crossfade-beats').value),
+				startAtBoundary: $('assist-start-at-boundary').checked,
+				tempoLock: $('assist-tempo-lock').checked
+			});
+		}
+
+		function onCancelTransition(){
+			sendCommand('assist_cancel_transition', {});
+		}
+
 		/* ---- polling ---- */
 
 		function schedulePoll(delayOverride){
@@ -781,6 +907,7 @@ if(typeof document !== 'undefined'){
 			recordButton.setAttribute('aria-pressed', snapshot.recording ? 'true' : 'false');
 			recordButton.textContent = snapshot.recording ? 'Stop recording' : 'Start recording';
 			$('recording-indicator').textContent = snapshot.recording ? 'Recording' : 'Not recording';
+			renderAssist(snapshot.assist);
 		}
 
 		function renderDeck(deck, state){
@@ -811,6 +938,98 @@ if(typeof document !== 'undefined'){
 				if(document.activeElement !== intensity) intensity.value = effect.intensity;
 				intensity.disabled = effect.type === 0;
 			});
+		}
+
+		/* ---- Assist (Coach / one-shot transition) rendering ---- */
+
+		function renderAssist(assist){
+			const state = assist || { mode: 'off' };
+			const mode = state.mode || 'off';
+			$('assist-mode').textContent = 'Assist: ' + (ASSIST_MODE_TEXT[mode] || mode);
+			const toggle = $('assist-coach-toggle');
+			const coachOn = mode !== 'off';
+			toggle.setAttribute('aria-pressed', coachOn ? 'true' : 'false');
+			toggle.textContent = coachOn ? 'Disable Coach' : 'Enable Coach';
+
+			const showAdvice = mode === 'coach';
+			$('assist-advice').hidden = !showAdvice;
+			if(showAdvice) renderAssistAdvice(state.advice || {});
+
+			renderAssistSuggestions(mode === 'coach' ? (state.suggestions || []) : []);
+
+			const inTransition = mode === 'armed' || mode === 'running' || mode === 'complete' || mode === 'failed';
+			$('assist-transition').hidden = !inTransition;
+			if(inTransition) renderAssistPlan(state.plan || {});
+
+			$('assist-cancel').hidden = !(mode === 'armed' || mode === 'running');
+			$('assist-arm-form').hidden = mode === 'armed' || mode === 'running';
+		}
+
+		function clearChildren(el){
+			while(el.firstChild) el.removeChild(el.firstChild);
+		}
+
+		function renderAssistAdvice(advice){
+			$('assist-advice-deck').textContent = typeof advice.suggested_deck === 'number' ?
+				deckLabel(advice.suggested_deck) : '\u2014';
+			$('assist-advice-boundary').textContent = ASSIST_BOUNDARY_TEXT[advice.boundary] || '\u2014';
+			$('assist-advice-rate').textContent = formatRatePercent(advice.target_rate);
+			$('assist-advice-direction').textContent = describeCrossfadeDirection(advice.crossfade_dir);
+			const list = $('assist-advice-warnings');
+			clearChildren(list);
+			if(advice.valid === false){
+				const li = document.createElement('li');
+				li.textContent = 'No advice available yet \u2014 waiting on a playing deck with usable metadata.';
+				list.appendChild(li);
+				return;
+			}
+			(advice.warnings || []).forEach((code) => {
+				const li = document.createElement('li');
+				li.textContent = ASSIST_WARNING_TEXT[code] || code;
+				list.appendChild(li);
+			});
+		}
+
+		function renderAssistSuggestions(suggestions){
+			const list = $('assist-suggestion-list');
+			clearChildren(list);
+			if(!suggestions.length){
+				const li = document.createElement('li');
+				li.textContent = 'No suggestions right now.';
+				list.appendChild(li);
+				return;
+			}
+			suggestions.forEach((suggestion) => {
+				const li = document.createElement('li');
+				const excluded = suggestion.exclude && suggestion.exclude !== 'none';
+				if(excluded) li.classList.add('suggestion-excluded');
+				const parts = [
+					formatBpmDelta(suggestion.tempo_delta),
+					ASSIST_KEY_TEXT[suggestion.key] || suggestion.key,
+					suggestion.rating < 255 ? ('rating ' + suggestion.rating + '/5') : 'unrated',
+					'confidence ' + Math.round((suggestion.confidence || 0) / 10) + '%'
+				];
+				if(excluded) parts.push('excluded: ' + (ASSIST_EXCLUDE_TEXT[suggestion.exclude] || suggestion.exclude));
+				const summary = document.createElement('div');
+				summary.textContent = parts.join(' \u2022 ');
+				li.appendChild(summary);
+				const reasons = describeReasonFlags(suggestion.reason_flags);
+				if(reasons.length){
+					const detail = document.createElement('div');
+					detail.className = 'suggestion-reasons follow-up';
+					detail.textContent = 'Reasons: ' + reasons.join(', ');
+					li.appendChild(detail);
+				}
+				list.appendChild(li);
+			});
+		}
+
+		function renderAssistPlan(plan){
+			const failureText = plan.failure && plan.failure !== 'none' ? ASSIST_FAILURE_TEXT[plan.failure] || plan.failure : null;
+			const stepText = 'From ' + deckLabel(plan.from_deck) + ' to ' + deckLabel(plan.to_deck) + ', ' +
+				(plan.crossfade_beats || 0) + '-beat crossfade \u2014 step ' + ((plan.step || 0) + 1) + ' of ' +
+				(plan.steps || 0) + ': ' + (ASSIST_ACTION_TEXT[plan.action] || plan.action);
+			$('assist-transition-progress').textContent = failureText ? (stepText + '. Failed: ' + failureText) : stepText;
 		}
 
 		/* ---- lifecycle wiring ---- */
