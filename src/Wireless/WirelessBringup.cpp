@@ -22,7 +22,48 @@ static constexpr uint32_t REQUEST_TIMEOUT_MS = 75;
 static constexpr uint32_t HANDLER_BUDGET_MS = 50;
 static constexpr size_t MAX_REQUEST_LINE = 192;
 static constexpr size_t MAX_HEADER_LINE = 256;
-static constexpr size_t MAX_RESPONSE = 3072;
+static constexpr size_t MAX_RESPONSE = 4096;
+
+// Conservative static worst-case bound for handleState()'s /api/v2/state
+// JSON body (2 decks + escaped paths + effects, up to
+// STATE_MAX_EMITTED_RESULTS recent results, and the assist block's up to
+// DJ_ASSIST_MAX_SUGGESTIONS suggestions + plan) - checked against
+// MAX_RESPONSE at compile time so a future capacity bump doesn't silently
+// start returning response_too_large.
+// Deliberately generous per-field padding rather than a byte-exact replica
+// of the format strings in appendAssistState()/handleState().
+constexpr size_t escapedBytes(size_t capacity){
+	// escaped() worst case: every content byte becomes a 2-byte escape
+	// sequence; capacity - 1 leaves room for the null terminator, which is
+	// never itself emitted.
+	return (capacity - 1) * 2;
+}
+constexpr size_t STATE_HEADER_BUDGET = 210;
+constexpr size_t STATE_DECK_BUDGET = 140 + escapedBytes(DJ_PATH_CAPACITY) + DJ_EFFECT_SLOT_COUNT * 32;
+constexpr size_t STATE_RESULT_BUDGET = 120 + sizeof(DjCommandResult::clientCommandId);
+constexpr size_t STATE_ASSIST_HEADER_BUDGET = 260;
+constexpr size_t STATE_SUGGESTION_BUDGET = 190;
+constexpr size_t STATE_PLAN_BUDGET = 165;
+// handleState() only ever emits this many recent_results entries - it
+// filters snapshot.recentResults[] (sized DJ_RECENT_RESULT_COUNT, which
+// is larger under JAYD_ENABLE_WIRELESS to hold in-flight command
+// bookkeeping) down to this client's own results and stops early. The
+// worst-case formula MUST use this emission cap, not the backing array
+// size, or it silently overestimates/underestimates versus the real
+// wire format; handleState() below reuses this same constant so the two
+// can never drift apart again.
+constexpr uint8_t STATE_MAX_EMITTED_RESULTS = 8;
+constexpr size_t STATE_WORST_CASE =
+	STATE_HEADER_BUDGET +
+	STATE_DECK_BUDGET * DJ_DECK_COUNT +
+	STATE_RESULT_BUDGET * STATE_MAX_EMITTED_RESULTS +
+	STATE_ASSIST_HEADER_BUDGET +
+	STATE_SUGGESTION_BUDGET * DJ_ASSIST_MAX_SUGGESTIONS +
+	STATE_PLAN_BUDGET;
+static_assert(
+	STATE_WORST_CASE < MAX_RESPONSE,
+	"MAX_RESPONSE is smaller than the conservative worst-case /api/v2/state body - bump MAX_RESPONSE"
+);
 
 class BoundedWebServer : public WebServer {
 public:
@@ -665,17 +706,21 @@ void handlePair(){
 void handleCapabilities(){
 	char clientId[WirelessApi::CLIENT_ID_CAPACITY] = {};
 	if(!authorize(false, clientId)) return;
-	sendJson(200,
+	snprintf(
+		responseBuffer,
+		sizeof(responseBuffer),
 		"{\"api\":\"v2\",\"transport\":\"http_serial\","
 		"\"actions\":[\"set_playing\",\"seek\",\"set_gain\",\"set_mix\","
 		"\"set_effect_type\",\"set_effect_intensity\",\"set_recording\","
 		"\"assist_set_mode\",\"assist_arm_transition\",\"assist_cancel_transition\"],"
 		"\"load_by_path\":false,\"writer_lease_ms\":15000,\"pairing_window_ms\":60000,"
-		"\"request_body_max\":512,\"response_max\":3072,\"handler_budget_ms\":50,"
+		"\"request_body_max\":512,\"response_max\":%zu,\"handler_budget_ms\":50,"
 		"\"poll\":{\"active_ms\":1000,\"idle_ms\":3000,\"hidden_ms\":5000},"
 		"\"reconnect\":\"fetch_state_and_results_never_replay\","
-		"\"ota\":\"requires_recovery_partition\"}"
+		"\"ota\":\"requires_recovery_partition\"}",
+		MAX_RESPONSE
 	);
+	sendJson(200, responseBuffer);
 }
 
 void handleHealth(){
@@ -832,7 +877,7 @@ void handleState(){
 			commandErrorName(result.error)
 		);
 		first = false;
-		if(++resultCount == 8) break;
+		if(++resultCount == STATE_MAX_EMITTED_RESULTS) break;
 	}
 	writer.append("],");
 	appendAssistState(writer);
