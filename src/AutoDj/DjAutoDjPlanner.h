@@ -149,13 +149,21 @@ private:
 	// the queue front; while pendingAttempts > 0 (waiting on an outcome, or
 	// retrying after a failure) it is reused as-is rather than re-derived
 	// from the queue front, which can change if a different track gets
-	// pinned while this load is in flight or awaiting retry.
+	// pinned while this load is in flight or awaiting retry. Before any
+	// retry, though, the captured entry's presence is re-checked: if it was
+	// dropped out from under us (e.g. invalidateLibraryGeneration() removed
+	// it because the library re-indexed), it is never resubmitted - that
+	// attempt is abandoned cleanly instead, so a stale/foreign identity is
+	// never sent to the load port.
 	void beginNextLoad(){
 		if(pendingAttempts == 0){
 			if(!queue.peekNext(pendingEntry)){
 				machine.complete();
 				return;
 			}
+		} else if(!queue.containsSequence(pendingEntry.sequence)){
+			cancelPending();
+			return;
 		}
 		if(!port.submitLoad(pendingEntry.identity)){
 			pendingAttempts++;

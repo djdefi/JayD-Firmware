@@ -70,6 +70,17 @@ public:
 		return false;
 	}
 
+	// Non-mutating presence check for a specific insertion sequence. Used
+	// before retrying a previously-submitted entry, to detect whether it
+	// was dropped out from under the planner (e.g. by invalidateGeneration())
+	// while a retry was pending - without removing anything itself.
+	bool containsSequence(uint32_t sequence) const{
+		for(uint8_t index = 0; index < count; index++){
+			if(entries[index].sequence == sequence) return true;
+		}
+		return false;
+	}
+
 	// Removes the entry with the given monotonic sequence number, wherever
 	// it currently sits in the array. `sequence` is assigned once at push
 	// time and never reused, so this always targets exactly the entry that

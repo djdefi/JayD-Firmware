@@ -625,6 +625,80 @@ void testPlanNextNeverQueuesSameIdentityTwice(){
 	assert(planner.queueDepth() == 3); // unchanged - no duplicate pushed
 }
 
+// Regression for a review finding: a retry must never resubmit an entry
+// that was dropped out from under it. If the library re-indexes (a new
+// generation) between a failed attempt and its retry, the stale entry is
+// invalidated out of the queue; beginNextLoad() must notice this before
+// resubmitting and abandon the attempt cleanly instead of sending a
+// foreign/stale identity to the load port.
+void testInvalidatedGenerationDuringRetryNeverResubmitsStaleEntry(){
+	AutoDjCandidate candidateX = makeCandidate(50); // generation 1, via makeIdentity()'s default
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1)); // X queued, generation 1
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.submitShouldSucceed = false; // first attempt fails immediately, retry scheduled
+
+	planner.tick(); // attempt 1: submitLoad(X) fails -> pendingAttempts == 1, retry pending
+	assert(port.submitCount == 1);
+	assert(port.lastSubmitted.sameTrack(candidateX.identity));
+
+	// The library re-indexes to generation 2 while X is still the planner's
+	// captured retry target - this drops X out of the queue outright.
+	planner.invalidateLibraryGeneration(2);
+	assert(!planner.isQueued(candidateX.identity));
+
+	const int maxTicksAllowed = 8; // generous bound; must converge well before this
+	for(int i = 0; i < maxTicksAllowed; i++){
+		planner.tick();
+	}
+	// The stale entry must never be resubmitted - the one failed attempt
+	// above is the only submission that ever happens. With nothing left to
+	// queue, the planner converges to Complete rather than spinning.
+	assert(port.submitCount == 1);
+	assert(planner.historySize() == 0);
+	assert(planner.queueDepth() == 0);
+	assert(planner.state() == AutoDjState::Complete);
+}
+
+// Same invalidation-during-flight scenario, but for the Stopping path: if
+// the queue entry is invalidated while its load is in flight during
+// shutdown, resolving that outcome (even a belated Applied) must not
+// fabricate a history record for an entry that's already gone.
+void testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry(){
+	AutoDjCandidate candidateX = makeCandidate(51);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending; // stays in flight
+	planner.tick(); // submits X successfully, now WaitingOutcome
+	assert(port.submitCount == 1);
+
+	assert(planner.stop());
+	assert(planner.state() == AutoDjState::Stopping);
+
+	// The library re-indexes while X's load is still in flight during
+	// shutdown; invalidation drops the now-stale queue entry outright.
+	planner.invalidateLibraryGeneration(2);
+	assert(!planner.isQueued(candidateX.identity));
+
+	port.nextOutcome = AutoDjLoadOutcome::Applied; // hardware reports success for the invalidated load
+	planner.tick(); // resolvePendingWhileStopping(): must not record a stale entry
+	assert(planner.historySize() == 0);
+
+	planner.tick(); // no pending left: finish stopping
+	assert(planner.state() == AutoDjState::Off);
+}
+
 } // namespace
 
 int main(){
@@ -651,5 +725,7 @@ int main(){
 	testPinDuringPendingLoadTimeoutRetriesSubmittedEntryNotFront();
 	testPinDuringStopResolvesSubmittedEntryNotFront();
 	testPlanNextNeverQueuesSameIdentityTwice();
+	testInvalidatedGenerationDuringRetryNeverResubmitsStaleEntry();
+	testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry();
 	return 0;
 }
