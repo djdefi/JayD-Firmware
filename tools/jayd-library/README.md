@@ -27,6 +27,8 @@ All integers are unsigned little-endian unless noted. Readers must reject files
 over 32 MiB, verify CRC before consuming sections, validate every range, and skip
 unknown section types using the directory's byte size. Known sections may grow:
 readers use each directory entry's `entry_size` and ignore trailing record bytes.
+Known required sections with a version other than `1` are rejected; unknown
+section types are optional and skipped by their declared byte range.
 
 The CRC32 is IEEE/zlib CRC32 over the entire file with the header CRC field
 (byte offset 44) set to zero.
@@ -92,8 +94,22 @@ number (`1` is a downbeat; zero unknown), confidence `0..10000`, and flags.
 Phrase records contain a kind string and confidence.
 
 Version 1 bounds: 4,096 tracks; 64 cues, 256 grid segments, and 128 phrase
-markers per track; 256 playlists; 65,535 playlist entries; 1,024-byte paths;
-4,096-byte strings; 768 kHz sample rate; and signed-63-bit duration frames.
+markers per track; 8,192 metadata entries; 256 playlists; 65,535 playlist
+entries; 1,024-byte paths; 4,096-byte strings; 768 kHz sample rate; and
+signed-63-bit duration frames.
+
+The firmware reader is `src/Metadata/JaydMetadata.{h,cpp}`. It validates the
+sidecar with bounded streaming reads, retains only the open file and eight
+section descriptors, and exposes lookup by normalized path, fingerprint,
+source ID, or track index. `Missing`, `Stale`, `Corrupt`, and `Unsupported`
+remain distinct so callers can ignore rejected metadata and continue ordinary
+AAC playback.
+
+Run the converter-backed firmware parser fixtures on a host with:
+
+```sh
+python3 tools/jayd-library/firmware_reader_self_check.py
+```
 
 ## Adapter provenance and limits
 

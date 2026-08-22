@@ -24,6 +24,7 @@ from typing import Iterable
 
 MAGIC = b"JAYDMETA"
 VERSION = 1
+SECTION_VERSION = 1
 ENDIAN_TAG = 0x4C45
 HEADER = struct.Struct("<8sHHHHIIIQQI16s")
 SECTION = struct.Struct("<4sHHIIQ")
@@ -42,6 +43,7 @@ MAX_TRACKS = 4096
 MAX_CUES_PER_TRACK = 64
 MAX_GRID_PER_TRACK = 256
 MAX_PHRASES_PER_TRACK = 128
+MAX_METADATA_ENTRIES = 8192
 MAX_PLAYLISTS = 256
 MAX_PLAYLIST_ENTRIES = 65535
 MAX_PATH_BYTES = 1024
@@ -851,6 +853,8 @@ def encode(library: LibraryData) -> bytes:
 
     metadata = dict(library.metadata)
     metadata.update({f"warning.{index}": warning for index, warning in enumerate(library.warnings)})
+    if len(metadata) > MAX_METADATA_ENTRIES:
+        raise FormatError(f"metadata entry count exceeds {MAX_METADATA_ENTRIES}")
     meta_payload = b"".join(
         META.pack(string_table.offset(key), string_table.offset(value))
         for key, value in sorted(metadata.items())
@@ -940,7 +944,7 @@ def encode(library: LibraryData) -> bytes:
         offset += padding
         payload = payloads[section_type]
         directory.extend(SECTION.pack(
-            section_type, 1, SECTION_ENTRY_SIZES[section_type], counts[section_type],
+            section_type, SECTION_VERSION, SECTION_ENTRY_SIZES[section_type], counts[section_type],
             len(payload), offset,
         ))
         body.extend(payload)
@@ -997,6 +1001,10 @@ def _decode_layout(data: bytes) -> dict[str, object]:
             "count": count, "size": size, "offset": offset,
         }
         expected = SECTION_ENTRY_SIZES.get(kind)
+        if expected and section_version != SECTION_VERSION:
+            raise FormatError(f"unsupported {name} section version {section_version}")
+        if kind == b"META" and count > MAX_METADATA_ENTRIES:
+            raise FormatError("META section count exceeds bounds")
         if expected and (entry_size < expected or count * entry_size > size):
             raise FormatError(f"{name} section shape is invalid")
         if kind == b"STRS" and (entry_size != 1 or count != size):
