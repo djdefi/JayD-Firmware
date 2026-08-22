@@ -6,10 +6,13 @@
 #include <SPIFFS.h>
 #include <FS/CompressedFile.h>
 #include "../../Fonts.h"
+#include "../../DjSession/DjSession.h"
+#include "../MixScreen/MixControlState.h"
 
 SongList::SongList* SongList::SongList::instance = nullptr;
 
-SongList::SongList::SongList(Display& display) : Context(display){
+SongList::SongList::SongList(Display& display, DjSession* browseSession) :
+		Context(display), browseSession(browseSession), browseMode(browseSession != nullptr){
 	instance = this;
 
 	scrollLayout = new ScrollLayout(&getScreen());
@@ -96,6 +99,7 @@ void SongList::SongList::searchDirectories(File dir){
 }
 
 void SongList::SongList::loop(uint t){
+	updateBrowseResult();
 	if(!insertedSD || empty) return;
 	if(songs[selectedElement]->checkScrollUpdate()) {
 		draw();
@@ -104,53 +108,6 @@ void SongList::SongList::loop(uint t){
 }
 
 void SongList::SongList::start(){
-
-	InputJayD::getInstance()->setEncoderMovedCallback(ENC_MID, [](int8_t value){
-		if(instance == nullptr) return;
-
-		if(instance->empty || !instance->insertedSD) return;
-
-		instance->songs[instance->selectedElement]->setSelected(false);
-		instance->selectedElement += value;
-		if(instance->selectedElement < 0){
-			instance->selectedElement = 0;
-		}else if(instance->selectedElement >= instance->songs.size()){
-			instance->selectedElement = instance->songs.size() - 1;
-		}
-
-		instance->songs[instance->selectedElement]->setSelected(true);
-
-		instance->scrollLayout->scrollIntoView(instance->selectedElement, 6);
-		instance->draw();
-		instance->screen.commit();
-
-
-	});
-
-	InputJayD::getInstance()->setBtnPressCallback(BTN_MID, [](){
-		if(instance == nullptr) return;
-
-		if(!instance->insertedSD){
-			instance->checkSD();
-			return;
-		}
-
-		if(instance->empty || !instance->insertedSD || instance->songs.size() <= instance->selectedElement) return;
-
-		String path = instance->songs[instance->selectedElement]->getPath();
-		fs::File file = SD.open(path);
-		if(!file){
-			file.close();
-			SD.end();
-			instance->insertedSD = false;
-			instance->checkSD();
-			return;
-		}
-		file.close();
-
-		instance->pop(new String(path));
-	});
-
 	Input.addListener(this);
 	waiting = false;
 	checkSD();
@@ -162,8 +119,6 @@ void SongList::SongList::start(){
 }
 
 void SongList::SongList::stop(){
-	InputJayD::getInstance()->removeEncoderMovedCallback(ENC_MID);
-	InputJayD::getInstance()->removeBtnPressCallback(BTN_MID);
 	Input.removeListener(this);
 	LoopManager::removeListener(this);
 }
@@ -182,7 +137,7 @@ void SongList::SongList::draw(){
 	canvas->drawIcon(backgroundBuffer, 0, 0, 160, 19, 1);
 
 	canvas->setTextDatum(BC_DATUM);
-	canvas->drawString("SD card", screen.getWidth()/2, 15);
+	canvas->drawString(browseMode ? "BROWSE  CENTER: RESCAN" : "SD card", screen.getWidth()/2, 15);
 
 	if(waiting){
 		canvas->drawString("Loading...", screen.getWidth()/2, 65);
@@ -197,11 +152,20 @@ void SongList::SongList::draw(){
 		canvas->drawString("Empty!", screen.getWidth()/2, 65);
 		canvas->setTextDatum(TL_DATUM);
 	}
+
+	if(browseMode){
+		canvas->fillRect(0, 111, 160, 17, TFT_BLACK);
+		canvas->setTextColor(TFT_WHITE);
+		canvas->setTextDatum(BC_DATUM);
+		const String footer = browseStatus.length() ? browseStatus : "A: LOAD A       B: LOAD B";
+		canvas->drawString(footer.substring(0, 26), 80, 124);
+		canvas->setTextDatum(TL_DATUM);
+	}
 }
 
 void SongList::SongList::buildUI(){
 	scrollLayout->setWHType(PARENT, FIXED);
-	scrollLayout->setHeight(110);
+	scrollLayout->setHeight(browseMode ? 92 : 110);
 	scrollLayout->addChild(list);
 
 	list->setWHType(PARENT, CHILDREN);
@@ -243,4 +207,109 @@ void SongList::SongList::encTwoTop(){
 	delete this;
 	MainMenu::MainMenu::getInstance()->unpack();
 	MainMenu::MainMenu::getInstance()->start();
+}
+
+void SongList::SongList::btn(uint8_t i){
+	const int8_t deck = MixControlState::browseDeckForButton(i);
+	if(!browseMode || deck < 0) return;
+	loadSelected(deck);
+}
+
+void SongList::SongList::btnEnc(uint8_t i){
+	if(i != 6) return;
+	if(browseMode){
+		browseStatus = "RESCANNING SD...";
+		checkSD();
+		browseStatus = insertedSD ? "SD RESCANNED" : "SD NOT AVAILABLE";
+		draw();
+		screen.commit();
+		return;
+	}
+
+	if(!insertedSD){
+		checkSD();
+		return;
+	}
+
+	String path;
+	if(selectedPath(path)) pop(new String(path));
+}
+
+void SongList::SongList::enc(uint8_t i, int8_t value){
+	if(i == 6) moveSelection(value);
+}
+
+void SongList::SongList::encBtnHold(uint8_t i){
+	if(i == 6 && browseMode) pop();
+}
+
+bool SongList::SongList::allowsEncoderChords() const{
+	return !browseMode;
+}
+
+void SongList::SongList::moveSelection(int8_t value){
+	if(empty || !insertedSD || value == 0) return;
+	songs[selectedElement]->setSelected(false);
+	selectedElement += value;
+	if(selectedElement < 0){
+		selectedElement = 0;
+	}else if(selectedElement >= songs.size()){
+		selectedElement = songs.size() - 1;
+	}
+	songs[selectedElement]->setSelected(true);
+	scrollLayout->scrollIntoView(selectedElement, 6);
+	draw();
+	screen.commit();
+}
+
+bool SongList::SongList::selectedPath(String& path){
+	if(empty || !insertedSD || songs.size() <= selectedElement) return false;
+	path = songs[selectedElement]->getPath();
+	fs::File file = SD.open(path);
+	if(file) {
+		file.close();
+		return true;
+	}
+	file.close();
+	SD.end();
+	insertedSD = false;
+	checkSD();
+	return false;
+}
+
+void SongList::SongList::loadSelected(uint8_t deck){
+	if(!browseSession || deck >= DJ_DECK_COUNT) return;
+	String path;
+	if(!selectedPath(path)) return;
+	const DjSubmitResult result = browseSession->loadDeck(deck, path.c_str(), DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()){
+		browseStatus = "LOAD REJECTED";
+		draw();
+		screen.commit();
+		return;
+	}
+	pendingLoad[deck] = result.id;
+	browseStatus = deck == 0 ? "LOADING DECK A..." : "LOADING DECK B...";
+	draw();
+	screen.commit();
+}
+
+void SongList::SongList::updateBrowseResult(){
+	if(!browseMode || (!pendingLoad[0] && !pendingLoad[1])) return;
+	DjSnapshot snapshot;
+	if(!browseSession->copySnapshot(snapshot)) return;
+	for(const auto& result : snapshot.recentResults){
+		for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+			if(!pendingLoad[deck] || result.id != pendingLoad[deck] ||
+			   result.status == DJ_COMMAND_ACCEPTED) continue;
+			pendingLoad[deck] = 0;
+			if(result.status == DJ_COMMAND_APPLIED){
+				browseStatus = deck == 0 ? "LOADED DECK A" : "LOADED DECK B";
+			}else{
+				browseStatus = "LOAD FAILED";
+			}
+			draw();
+			screen.commit();
+		}
+	}
 }

@@ -7,6 +7,7 @@
 #include "SongName.h"
 #include "EffectElement.h"
 #include "MatrixPopUpPicker.h"
+#include "MixControlState.h"
 #include <Matrix/VuVisualizer.h>
 #include <Matrix/RoundVuVisualiser.h>
 #include <Input/InputJayD.h>
@@ -42,10 +43,24 @@ namespace MixScreen {
 		DjSession* session = nullptr;
 		uint8_t loadingChannel = 0;
 		bool songListOpen = false;
+		bool browseWasOpened = false;
 		char displayedPaths[DJ_DECK_COUNT][DJ_PATH_CAPACITY] = {};
+		MixControlState controls;
 
 		bool loadChannel(uint8_t channel, const String& path);
 		bool syncFromSnapshot(const DjSnapshot& snapshot, bool force = false);
+		bool processCommandResults(const DjSnapshot& snapshot);
+		bool resultHandled(uint32_t id) const;
+		void markResultHandled(uint32_t id);
+		void openBrowse();
+		void applyPaletteSelection(MixPaletteItem item);
+		void drawMixLabels();
+		void drawCueBank();
+		void drawBrowseBank();
+		void drawPalette();
+		void drawStatus();
+		void showCommandError(DjCommandError error);
+		const char* commandErrorText(DjCommandError error) const;
 
 		LinearLayout* screenLayout;
 		LinearLayout* leftLayout;
@@ -64,6 +79,11 @@ namespace MixScreen {
 		uint8_t selectedChannel = 0;
 		bool isRecording = false;
 		bool doneRecording = false;
+		uint32_t pendingRecordingStop = 0;
+		uint32_t handledResults[DJ_RECENT_RESULT_COUNT] = {};
+		uint8_t handledResultNext = 0;
+		uint32_t statusUntil = 0;
+		String statusText;
 		String saveFilename;
 		void saveRecording();
 		void drawSaveStatus();
@@ -87,13 +107,12 @@ namespace MixScreen {
 
 		void potMove(uint8_t id, uint8_t value) override;
 
-		void encTwoBot() override;
-		void encTwoTop() override;
 		void btnCombination() override;
 		void btn(uint8_t i) override;
 		void btnEnc(uint8_t i) override;
 		void enc(uint8_t id, int8_t value) override;
 		void encBtnHold(uint8_t i) override;
+		bool allowsEncoderChords() const override;
 
 	};
 }

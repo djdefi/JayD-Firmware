@@ -23,6 +23,9 @@ public:
 	DjSubmitResult setEffectType(uint8_t deck, uint8_t slot, uint8_t type, DjCommandOrigin origin);
 	DjSubmitResult setEffectIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjCommandOrigin origin);
 	DjSubmitResult setRecording(bool recording, DjCommandOrigin origin);
+	DjSubmitResult setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
+	DjSubmitResult triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
+	DjSubmitResult clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -44,6 +47,7 @@ private:
 	uint8_t gains[DJ_DECK_COUNT] = { 255, 255 };
 	uint8_t mix = 127;
 	DjEffectState effectState;
+	DjCueState cues;
 	bool ending = false;
 	bool viewAttached = false;
 	InfoGenerator* viewInfo[3] = {};
@@ -59,6 +63,7 @@ private:
 	uint32_t sessionId = 0;
 
 	DjCommandError validate(const DjCommand& command) const;
+	bool hasDeck(uint8_t deck) const;
 	bool apply(const DjCommand& command, DjCommandError& error);
 	bool applyLoad(const DjCommand& command, DjCommandError& error);
 	void publishSnapshot();

@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <string.h>
 #include "../src/DjSession/DjSessionState.h"
+#include "../src/Screens/MixScreen/MixControlState.h"
 
 static DjCommand command(uint32_t id, DjCommandType type, uint8_t deck = 0, uint8_t slot = 0){
 	DjCommand result = {};
@@ -133,5 +134,33 @@ int main(){
 	snapshots.publish(source);
 	assert(copy.seq == 1);
 	assert(strcmp(copy.decks[0].path, "/track.aac") == 0);
+
+	DjCueState cues;
+	uint16_t cuePosition = 0;
+	assert(!cues.trigger(0, 0, cuePosition));
+	assert(cues.set(0, 0, 42));
+	assert(cues.trigger(0, 0, cuePosition) && cuePosition == 42);
+	assert(cues.clear(0, 0));
+	assert(!cues.trigger(0, 0, cuePosition));
+	assert(!cues.set(DJ_DECK_COUNT, 0, 1));
+	assert(!cues.set(0, DJ_CUE_COUNT, 1));
+
+	MixControlState controls;
+	assert(controls.bank == MIX_BANK_MIX);
+	controls.openPalette();
+	controls.movePalette(1);
+	assert(controls.confirmPalette() == MIX_PALETTE_CUES);
+	assert(controls.bank == MIX_BANK_CUES);
+	controls.moveCuePage(1);
+	assert(controls.cueForEncoder(0) == 3);
+	assert(controls.cueForEncoder(5) == 5);
+	controls.moveCuePage(2);
+	assert(controls.cueForEncoder(0) == 6);
+	assert(controls.cueForEncoder(2) == -1);
+	assert(MixControlState::browseDeckForButton(0) == 0);
+	assert(MixControlState::browseDeckForButton(1) == 1);
+	assert(MixControlState::browseDeckForButton(2) == -1);
+	assert(!MixControlState::encoderChordsEnabled());
+	assert(MixControlState::suppressDeckReleaseAfterChord());
 	return 0;
 }
