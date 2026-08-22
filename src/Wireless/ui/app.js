@@ -181,6 +181,42 @@ function reconcileSnapshot(prev, snapshot){
 	};
 }
 
+// The actual, DOM-independent half of applySnapshot(): decides via
+// reconcileSnapshot() whether to accept the snapshot, and if so mutates the
+// given app-like object's identity/tracker/lease bookkeeping exactly as the
+// real runtime does. Split out purely so this mutation - not just the pure
+// decision above it - has a direct unit test; the runtime's applySnapshot()
+// calls this same function rather than re-implementing it, so deleting or
+// reordering the identity-change resets fails a test even though they touch
+// no DOM. Only the visible rendering (deck/mixer/status text, lease-state
+// DOM update) stays in the DOM-only applySnapshot() below, since that part
+// can't run without a document and isn't itself a correctness invariant here.
+//
+// `app` must have `bootId`, `sessionId`, `lastSeq`, `tracker`, `pollFailures`
+// and `leaseState`; all but `tracker`/`leaseState` are read, and all are
+// (re)written in place when the snapshot is accepted. Returns
+// `{ accept, identityChanged }`.
+function applySnapshotCore(app, snapshot){
+	const decision = reconcileSnapshot(
+		{ bootId: app.bootId, sessionId: app.sessionId, lastSeq: app.lastSeq },
+		snapshot
+	);
+	if(!decision.accept) return { accept: false, identityChanged: false };
+	app.lastSeq = decision.lastSeq;
+	app.bootId = decision.bootId;
+	app.sessionId = decision.sessionId;
+	if(decision.identityChanged){
+		// New boot/session identity: any in-flight or tracked command belongs
+		// to a session the device no longer recognizes. Reset local
+		// bookkeeping and drop to read-only rather than ever re-sending
+		// anything against the new identity.
+		app.tracker = createCommandTracker();
+		app.pollFailures = 0;
+		app.leaseState = leaseReducer(app.leaseState, { type: 'RECONNECT' });
+	}
+	return { accept: true, identityChanged: decision.identityChanged };
+}
+
 function buildCommandBody(identity, action, fields, commandId){
 	const shape = COMMAND_SHAPE[action];
 	if(!shape) throw new Error('unsupported_action: ' + action);
@@ -213,6 +249,7 @@ const helpers = {
 	LEASE_STATES,
 	createThrottler,
 	reconcileSnapshot,
+	applySnapshotCore,
 	buildCommandBody,
 	COMMAND_SHAPE,
 	EFFECT_NAMES,
@@ -723,22 +760,13 @@ if(typeof document !== 'undefined'){
 		}
 
 		function applySnapshot(snapshot){
-			const decision = reconcileSnapshot(
-				{ bootId: app.bootId, sessionId: app.sessionId, lastSeq: app.lastSeq },
-				snapshot
-			);
-			if(!decision.accept) return; // stale/out-of-order within the same identity, ignore
-			app.lastSeq = decision.lastSeq;
-			app.bootId = decision.bootId;
-			app.sessionId = decision.sessionId;
-			if(decision.identityChanged){
-				// New boot/session identity: any in-flight or tracked command
-				// belongs to a session the device no longer recognizes. Reset
-				// local bookkeeping and drop to read-only rather than ever
-				// re-sending anything against the new identity.
-				app.tracker = createCommandTracker();
-				app.pollFailures = 0;
-				app.leaseState = leaseReducer(app.leaseState, { type: 'RECONNECT' });
+			// All identity/tracker/lease bookkeeping lives in the shared,
+			// DOM-independent applySnapshotCore() so it has a direct unit
+			// test (tests/wireless_ui_self_test.mjs) exercising this exact
+			// code path; only DOM rendering stays here.
+			const result = applySnapshotCore(app, snapshot);
+			if(!result.accept) return; // stale/out-of-order within the same identity, ignore
+			if(result.identityChanged){
 				setLeaseState('read_only', 'The device restarted. Take control again if needed.');
 			}
 			$('session-status').textContent = snapshot.active ?

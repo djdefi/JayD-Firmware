@@ -171,17 +171,70 @@ test('reconcileSnapshot compares boot_id as an opaque string, never via Number c
 	assert.equal(decision.identityChanged, true, 'distinct opaque boot_id strings must be seen as a new identity');
 });
 
-test('reconcileSnapshot: identity change yields a state a fresh command tracker can back safely (no replay)', () => {
-	// Architectural check: after an identity change, the tracker the
-	// runtime installs is brand new and has no memory of any
-	// pre-reboot command id, so nothing from the old identity can ever
-	// be (mis)recognized as already-sent/still-pending against the new one.
-	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 9999 };
-	const decision = helpers.reconcileSnapshot(prev, { boot_id: 'boot-B', session_id: 7, seq: 0 });
-	assert.equal(decision.identityChanged, true);
-	const freshTracker = helpers.createCommandTracker();
-	assert.equal(freshTracker.markSent('cmd-from-old-boot'), true,
-		'a fresh tracker must not already consider any old id as sent');
+/* ---------------- applySnapshotCore (actual runtime mutation, no DOM) ---------------- */
+//
+// The tests above only exercise the *pure decision* (reconcileSnapshot).
+// applySnapshot() in the runtime is DOM-bound and can't run under Node, so
+// without the tests below, deleting the tracker/pollFailures/lease resets
+// from the runtime (app.js) would still leave every prior test green. These
+// call applySnapshotCore() directly - the exact function the DOM runtime
+// calls, not a reimplementation of it - against a plain app-like object, so
+// the actual mutation is what's under test.
+
+test('applySnapshotCore: identity change replaces the tracker (no replay) and resets pollFailures/lease', () => {
+	const staleTracker = helpers.createCommandTracker();
+	assert.equal(staleTracker.markSent('cmd-from-old-boot'), true);
+	const app = {
+		bootId: 'boot-A', sessionId: 7, lastSeq: 9999,
+		tracker: staleTracker, pollFailures: 5, leaseState: 'controlling'
+	};
+
+	const result = helpers.applySnapshotCore(app, { boot_id: 'boot-B', session_id: 7, seq: 0 });
+
+	assert.equal(result.accept, true);
+	assert.equal(result.identityChanged, true);
+	assert.equal(app.bootId, 'boot-B');
+	assert.equal(app.sessionId, 7);
+	assert.equal(app.lastSeq, 0);
+	assert.notEqual(app.tracker, staleTracker, 'a new boot/session must install a brand-new tracker instance');
+	assert.equal(app.tracker.has('cmd-from-old-boot'), false,
+		'the new tracker must have no memory of any pre-reboot command id (no replay)');
+	assert.equal(app.tracker.markSent('cmd-from-old-boot'), true,
+		'the old id must be sendable fresh, proving it was not carried over as already-sent');
+	assert.equal(app.pollFailures, 0, 'poll failure count must reset on a new identity');
+	assert.equal(app.leaseState, 'read_only',
+		'control must never be assumed to survive a reboot/identity change');
+});
+
+test('applySnapshotCore: same-identity fresh snapshot updates seq but never touches tracker/lease/pollFailures', () => {
+	const tracker = helpers.createCommandTracker();
+	tracker.markSent('cmd-in-flight');
+	const app = {
+		bootId: 'boot-A', sessionId: 7, lastSeq: 50,
+		tracker, pollFailures: 3, leaseState: 'controlling'
+	};
+
+	const result = helpers.applySnapshotCore(app, { boot_id: 'boot-A', session_id: 7, seq: 51 });
+
+	assert.equal(result.accept, true);
+	assert.equal(result.identityChanged, false);
+	assert.equal(app.lastSeq, 51);
+	assert.equal(app.tracker, tracker, 'same identity must not replace the tracker');
+	assert.equal(app.tracker.has('cmd-in-flight'), true, 'an in-flight command must not be forgotten');
+	assert.equal(app.pollFailures, 3, 'same identity must not reset unrelated poll-failure bookkeeping');
+	assert.equal(app.leaseState, 'controlling', 'same identity must never drop existing control');
+});
+
+test('applySnapshotCore: stale/duplicate snapshot within the same identity is rejected without mutating app', () => {
+	const tracker = helpers.createCommandTracker();
+	const app = { bootId: 'boot-A', sessionId: 7, lastSeq: 50, tracker, pollFailures: 0, leaseState: 'controlling' };
+
+	const result = helpers.applySnapshotCore(app, { boot_id: 'boot-A', session_id: 7, seq: 50 });
+
+	assert.equal(result.accept, false);
+	assert.equal(app.lastSeq, 50, 'rejected snapshot must not change lastSeq');
+	assert.equal(app.tracker, tracker, 'rejected snapshot must not touch the tracker');
+	assert.equal(app.leaseState, 'controlling', 'rejected snapshot must not touch lease state');
 });
 
 /* ---------------- backoff / polling ---------------- */
