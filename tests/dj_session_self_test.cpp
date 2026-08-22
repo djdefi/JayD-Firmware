@@ -64,6 +64,58 @@ int main(){
 	results.copyTo(recent);
 	assert(recent[0].status == DJ_COMMAND_SUPERSEDED);
 
+	DjEffectState effects;
+	DjEffectTransition transition;
+	assert(effects.setType(0, 0, DJ_EFFECT_LOWPASS, false, transition));
+	assert(!transition.addSpeed && !transition.setSpeed);
+	assert(effects.setIntensity(0, 0, 80, transition));
+	assert(effects.get(0, 0).type == DJ_EFFECT_LOWPASS);
+	assert(effects.get(0, 0).intensity == 80);
+	DjEffectSnapshot visibleEffects[DJ_EFFECT_SLOT_COUNT] = {};
+	effects.copyDeck(0, visibleEffects);
+	assert(visibleEffects[0].type == DJ_EFFECT_LOWPASS);
+	assert(visibleEffects[0].intensity == 80);
+	effects.deckLoaded(0, transition);
+	assert(!transition.addSpeed);
+
+	transition = {};
+	assert(effects.setType(1, 1, DJ_EFFECT_SPEED, false, transition));
+	assert(transition.clearEffect);
+	assert(!effects.isSpeedActive(1));
+	assert(effects.setIntensity(1, 1, 200, transition));
+	assert(!transition.setSpeed);
+	transition = {};
+	effects.deckLoaded(1, transition);
+	assert(transition.addSpeed && transition.setSpeed);
+	assert(effects.isSpeedActive(1));
+	assert(effects.get(1, 1).intensity == 200);
+
+	DjEffectState removedBeforeLoad;
+	transition = {};
+	assert(removedBeforeLoad.setType(0, 0, DJ_EFFECT_SPEED, false, transition));
+	assert(removedBeforeLoad.setType(0, 0, DJ_EFFECT_HIGHPASS, false, transition));
+	assert(removedBeforeLoad.setIntensity(0, 0, 64, transition));
+	transition = {};
+	removedBeforeLoad.deckLoaded(0, transition);
+	assert(!transition.addSpeed && !removedBeforeLoad.isSpeedActive(0));
+	assert(removedBeforeLoad.get(0, 0).type == DJ_EFFECT_HIGHPASS);
+	assert(removedBeforeLoad.get(0, 0).intensity == 64);
+
+	DjEffectState disabledBeforeLoad;
+	transition = {};
+	assert(disabledBeforeLoad.setType(0, 2, DJ_EFFECT_SPEED, false, transition));
+	assert(disabledBeforeLoad.setType(0, 2, DJ_EFFECT_NONE, false, transition));
+	transition = {};
+	disabledBeforeLoad.deckLoaded(0, transition);
+	assert(!transition.addSpeed && !disabledBeforeLoad.isSpeedActive(0));
+
+	DjCommand effectCommand = command(33, DJ_COMMAND_SET_EFFECT_TYPE, 0, 0);
+	results.record(effectCommand, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	results.finish(effectCommand.id, DJ_COMMAND_APPLIED, DJ_COMMAND_ERROR_NONE);
+	results.copyTo(recent);
+	assert(recent[0].id == effectCommand.id);
+	assert(recent[0].status == DJ_COMMAND_APPLIED);
+
 	DjSnapshotBuffers snapshots;
 	DjSnapshot source = {};
 	source.seq = 1;
