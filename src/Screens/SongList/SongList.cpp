@@ -7,17 +7,62 @@
 #include "../../Fonts.h"
 
 namespace {
-bool isVisibleAAC(const char* path){
+const char* indexPathA = "/.jayd-library.a";
+const char* indexPathB = "/.jayd-library.b";
+
+struct IndexProbe {
+	bool valid = false;
+	bool matchesCard = false;
+	LibraryIndex::ValidationResult validation{};
+};
+
+bool readFileAt(void* context, uint32_t offset, uint8_t* data, size_t size){
+	File* file = static_cast<File*>(context);
+	return file->seek(offset) && file->read(data, size) == size;
+}
+
+IndexProbe probeIndex(
+	const char* path,
+	const LibraryIndex::Limits& limits,
+	const LibraryIndex::CardIdentity& identity
+){
+	IndexProbe probe;
+	File file = SD.open(path);
+	if(!file) return probe;
+
+	const size_t size = file.size();
+	if(size <= UINT32_MAX){
+		probe.validation = LibraryIndex::validate(
+			readFileAt,
+			&file,
+			static_cast<uint32_t>(size),
+			limits
+		);
+		probe.valid = probe.validation.error == LibraryIndex::ValidationError::None;
+		probe.matchesCard = probe.valid &&
+			LibraryIndex::matchesCard(probe.validation.header, identity);
+	}
+	file.close();
+	return probe;
+}
+
+bool normalizePath(const char* path, char* normalized, size_t capacity){
+	if(path == nullptr || capacity < 2) return false;
+	const size_t length = strnlen(path, LibraryIndex::maxPathLength + 1);
+	if(length == 0 || length > LibraryIndex::maxPathLength) return false;
+
+	const bool needsSlash = path[0] != '/';
+	if(length + (needsSlash ? 1 : 0) >= capacity) return false;
+	size_t offset = 0;
+	if(needsSlash) normalized[offset++] = '/';
+	memcpy(normalized + offset, path, length + 1);
+	return true;
+}
+
+bool isHiddenEntry(const char* path){
 	const char* name = strrchr(path, '/');
 	name = name == nullptr ? path : name + 1;
-	if(name[0] == '.') return false;
-
-	const size_t length = strlen(name);
-	if(length < 4 || name[length - 4] != '.') return false;
-
-	return (name[length - 3] == 'a' || name[length - 3] == 'A') &&
-		   (name[length - 2] == 'a' || name[length - 2] == 'A') &&
-		   (name[length - 1] == 'c' || name[length - 1] == 'C');
+	return name[0] == '.';
 }
 }
 
@@ -37,8 +82,10 @@ SongList::SongList::~SongList(){
 void SongList::SongList::clearSongs(){
 	free(pathBuffer);
 	free(songOffsets);
+	free(songMetadata);
 	pathBuffer = nullptr;
 	songOffsets = nullptr;
+	songMetadata = nullptr;
 	pathBytes = 0;
 	pathCapacity = 0;
 	songCount = 0;
@@ -75,13 +122,60 @@ bool SongList::SongList::reserveSongs(size_t required){
 	);
 	if(resized == nullptr) return false;
 	songOffsets = resized;
+
+	LibraryIndex::FileEvidence* resizedMetadata = static_cast<LibraryIndex::FileEvidence*>(
+		ps_realloc(songMetadata, capacity * sizeof(LibraryIndex::FileEvidence))
+	);
+	if(resizedMetadata == nullptr) return false;
+	songMetadata = resizedMetadata;
 	songCapacity = capacity;
 	return true;
 }
 
-bool SongList::SongList::addSong(const char* path){
+bool SongList::SongList::fingerprintFile(
+	File& file,
+	LibraryIndex::FileEvidence& evidence
+){
+	memset(&evidence, 0, sizeof(evidence));
+	evidence.fileSize = file.size();
+	const uint16_t sampleSize = static_cast<uint16_t>(
+		evidence.fileSize < LibraryIndex::fingerprintBlockSize ?
+			evidence.fileSize : LibraryIndex::fingerprintBlockSize
+	);
+	evidence.firstBytes = sampleSize;
+	evidence.lastBytes = sampleSize;
+
+	const time_t modified = file.getLastWrite();
+	if(modified > 0 && static_cast<uint64_t>(modified) <= UINT32_MAX){
+		evidence.flags |= LibraryIndex::RecordHasFatMtime;
+		evidence.fatMtime = static_cast<uint32_t>(modified);
+	}
+
+	uint8_t sample[LibraryIndex::fingerprintBlockSize];
+	if(sampleSize == 0){
+		evidence.firstCrc32 = LibraryIndex::crc32Finish(LibraryIndex::crc32Start());
+		evidence.lastCrc32 = evidence.firstCrc32;
+		return true;
+	}
+	if(!file.seek(0) || file.read(sample, sampleSize) != sampleSize) return false;
+	evidence.firstCrc32 = LibraryIndex::crc32Finish(
+		LibraryIndex::crc32Update(LibraryIndex::crc32Start(), sample, sampleSize)
+	);
+	const uint64_t lastOffset = evidence.fileSize - sampleSize;
+	if(lastOffset > UINT32_MAX || !file.seek(static_cast<uint32_t>(lastOffset)) ||
+	   file.read(sample, sampleSize) != sampleSize){
+		return false;
+	}
+	evidence.lastCrc32 = LibraryIndex::crc32Finish(
+		LibraryIndex::crc32Update(LibraryIndex::crc32Start(), sample, sampleSize)
+	);
+	return true;
+}
+
+bool SongList::SongList::addSong(const char* path, File& file){
 	const size_t length = strnlen(path, maxPathLength + 1);
-	if(length == 0 || length > maxPathLength){
+	if(length == 0 || length > maxPathLength ||
+	   !LibraryIndex::isSupportedPath(path, length)){
 		scanLimited = true;
 		return true;
 	}
@@ -89,6 +183,7 @@ bool SongList::SongList::addSong(const char* path){
 	const size_t storedLength = length + 1;
 	if(songCount >= maxTrackCount || storedLength > maxPathPayload - pathBytes){
 		scanLimited = true;
+		scanStoppedAtLimit = true;
 		return false;
 	}
 
@@ -97,9 +192,14 @@ bool SongList::SongList::addSong(const char* path){
 		return false;
 	}
 
+	LibraryIndex::FileEvidence evidence{};
+	if(!fingerprintFile(file, evidence)) return false;
+
 	songOffsets[songCount++] = pathBytes;
+	songMetadata[songCount - 1] = evidence;
 	memcpy(pathBuffer + pathBytes, path, storedLength);
 	pathBytes += storedLength;
+	indexProgress = songCount;
 	return true;
 }
 
@@ -108,13 +208,327 @@ const char* SongList::SongList::songPath(size_t index) const{
 	return pathBuffer + songOffsets[index];
 }
 
-void SongList::SongList::checkSD(){
+LibraryIndex::CardIdentity SongList::SongList::currentCardIdentity() const{
+	LibraryIndex::CardIdentity identity{};
+	identity.strength = LibraryIndex::IdentityStrength::Weak;
+	identity.cardType = static_cast<uint32_t>(SD.cardType());
+	identity.cardSize = SD.cardSize();
+	identity.volumeSize = SD.totalBytes();
+	return identity;
+}
+
+bool SongList::SongList::loadIndex(const char* path){
+	const LibraryIndex::Limits limits{
+		maxTrackCount,
+		maxIndexPayload,
+		maxPathPayload
+	};
+	File file = SD.open(path);
+	if(!file || file.size() > UINT32_MAX){
+		file.close();
+		return false;
+	}
+	const LibraryIndex::ValidationResult validation = LibraryIndex::validate(
+		readFileAt,
+		&file,
+		static_cast<uint32_t>(file.size()),
+		limits
+	);
+	if(validation.error != LibraryIndex::ValidationError::None ||
+	   !LibraryIndex::matchesCard(validation.header, currentCardIdentity())){
+		file.close();
+		return false;
+	}
+
+	clearSongs();
+	if(validation.pathBytes > 0){
+		pathBuffer = static_cast<char*>(ps_malloc(validation.pathBytes));
+		if(pathBuffer == nullptr){
+			allocationFailed = true;
+			file.close();
+			return false;
+		}
+	}
+	if(validation.header.recordCount > 0){
+		songOffsets = static_cast<uint32_t*>(
+			ps_malloc(validation.header.recordCount * sizeof(uint32_t))
+		);
+		songMetadata = static_cast<LibraryIndex::FileEvidence*>(
+			ps_malloc(validation.header.recordCount * sizeof(LibraryIndex::FileEvidence))
+		);
+		if(songOffsets == nullptr || songMetadata == nullptr){
+			allocationFailed = true;
+			file.close();
+			clearSongs();
+			return false;
+		}
+	}
+
+	uint32_t offset = sizeof(LibraryIndex::Header);
+	uint32_t remaining = validation.header.payloadLength;
+	uint32_t payloadCrc = LibraryIndex::crc32Start();
+	bool loaded = true;
+	for(uint32_t i = 0; i < validation.header.recordCount; i++){
+		if(remaining < sizeof(LibraryIndex::Record)){
+			loaded = false;
+			break;
+		}
+		LibraryIndex::Record record{};
+		if(!file.seek(offset) ||
+		   file.read(reinterpret_cast<uint8_t*>(&record), sizeof(record)) != sizeof(record)){
+			loaded = false;
+			break;
+		}
+		const uint32_t storedLength = static_cast<uint32_t>(record.pathLength) + 1;
+		const uint16_t expectedBytes = static_cast<uint16_t>(
+			record.fileSize < LibraryIndex::fingerprintBlockSize ?
+				record.fileSize : LibraryIndex::fingerprintBlockSize
+		);
+		if(record.pathLength == 0 || record.pathLength > maxPathLength ||
+		   record.recordSize != sizeof(record) + storedLength ||
+		   record.recordSize > remaining ||
+		   pathBytes > validation.pathBytes ||
+		   storedLength > validation.pathBytes - pathBytes ||
+		   (record.flags & ~LibraryIndex::RecordHasFatMtime) != 0 ||
+		   record.reserved != 0 ||
+		   ((record.flags & LibraryIndex::RecordHasFatMtime) == 0 && record.fatMtime != 0) ||
+		   record.firstBytes != expectedBytes || record.lastBytes != expectedBytes){
+			loaded = false;
+			break;
+		}
+
+		char pathValue[maxPathLength + 1];
+		if(file.read(reinterpret_cast<uint8_t*>(pathValue), storedLength) != storedLength ||
+		   pathValue[record.pathLength] != '\0' ||
+		   memchr(pathValue, '\0', record.pathLength) != nullptr ||
+		   !LibraryIndex::isSupportedPath(pathValue, record.pathLength)){
+			loaded = false;
+			break;
+		}
+		payloadCrc = LibraryIndex::crc32Update(
+			payloadCrc,
+			reinterpret_cast<const uint8_t*>(&record),
+			sizeof(record)
+		);
+		payloadCrc = LibraryIndex::crc32Update(
+			payloadCrc,
+			reinterpret_cast<const uint8_t*>(pathValue),
+			storedLength
+		);
+
+		songOffsets[i] = pathBytes;
+		memcpy(pathBuffer + pathBytes, pathValue, storedLength);
+		LibraryIndex::FileEvidence& metadata = songMetadata[i];
+		metadata.fileSize = record.fileSize;
+		metadata.fatMtime = record.fatMtime;
+		metadata.flags = record.flags;
+		metadata.firstBytes = record.firstBytes;
+		metadata.lastBytes = record.lastBytes;
+		metadata.firstCrc32 = record.firstCrc32;
+		metadata.lastCrc32 = record.lastCrc32;
+		pathBytes += storedLength;
+		offset += record.recordSize;
+		remaining -= record.recordSize;
+	}
+	file.close();
+	if(!loaded || remaining != 0 || pathBytes != validation.pathBytes ||
+	   LibraryIndex::crc32Finish(payloadCrc) != validation.header.payloadCrc32){
+		clearSongs();
+		return false;
+	}
+
+	pathCapacity = pathBytes;
+	songCount = validation.header.recordCount;
+	songCapacity = songCount;
+	indexGeneration = validation.header.generation;
+	scanLimited = (validation.header.flags & LibraryIndex::HeaderScanLimited) != 0;
+	indexState = IndexState::Verifying;
+	indexProgress = 0;
+	indexProgressTotal = songCount;
+	return true;
+}
+
+bool SongList::SongList::loadBestIndex(){
+	const LibraryIndex::Limits limits{
+		maxTrackCount,
+		maxIndexPayload,
+		maxPathPayload
+	};
+	const LibraryIndex::CardIdentity identity = currentCardIdentity();
+	const IndexProbe a = probeIndex(indexPathA, limits, identity);
+	const IndexProbe b = probeIndex(indexPathB, limits, identity);
+
+	if(SD.exists(indexPathA) && !a.valid){
+		Serial.printf(
+			"SongList: index A rejected: %s\n",
+			LibraryIndex::validationErrorName(a.validation.error)
+		);
+	}
+	if(SD.exists(indexPathB) && !b.valid){
+		Serial.printf(
+			"SongList: index B rejected: %s\n",
+			LibraryIndex::validationErrorName(b.validation.error)
+		);
+	}
+
+	const char* chosen = nullptr;
+	if(a.matchesCard && b.matchesCard){
+		chosen = a.validation.header.generation >= b.validation.header.generation ?
+			indexPathA : indexPathB;
+	}else if(a.matchesCard){
+		chosen = indexPathA;
+	}else if(b.matchesCard){
+		chosen = indexPathB;
+	}else if(a.valid || b.valid){
+		indexState = IndexState::Stale;
+	}
+	return chosen != nullptr && loadIndex(chosen);
+}
+
+bool SongList::SongList::writeGeneration(const char* path, uint32_t generation){
+	LibraryIndex::Header header{};
+	LibraryIndex::initializeHeader(header);
+	header.generation = generation;
+	header.buildState = static_cast<uint8_t>(LibraryIndex::BuildState::Building);
+	const LibraryIndex::CardIdentity identity = currentCardIdentity();
+	header.identityStrength = static_cast<uint8_t>(identity.strength);
+	header.cardType = identity.cardType;
+	header.cardSize = identity.cardSize;
+	header.volumeSize = identity.volumeSize;
+	header.recordCount = songCount;
+	header.payloadLength = songCount * sizeof(LibraryIndex::Record) + pathBytes;
+	if(scanLimited) header.flags |= LibraryIndex::HeaderScanLimited;
+	header.headerCrc32 = LibraryIndex::headerCrc(header);
+
+	File index = SD.open(path, "w");
+	if(!index ||
+	   index.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) != sizeof(header)){
+		index.close();
+		return false;
+	}
+
+	uint32_t payloadCrc = LibraryIndex::crc32Start();
+	for(size_t i = 0; i < songCount; i++){
+		const char* pathValue = songPath(i);
+		const size_t pathLength = strlen(pathValue);
+		const LibraryIndex::FileEvidence& evidence = songMetadata[i];
+		LibraryIndex::Record record{};
+		record.recordSize = sizeof(record) + pathLength + 1;
+		record.pathLength = pathLength;
+		record.flags = evidence.flags;
+		record.firstBytes = evidence.firstBytes;
+		record.lastBytes = evidence.lastBytes;
+		record.fileSize = evidence.fileSize;
+		record.fatMtime = evidence.fatMtime;
+		record.firstCrc32 = evidence.firstCrc32;
+		record.lastCrc32 = evidence.lastCrc32;
+		if(index.write(reinterpret_cast<const uint8_t*>(&record), sizeof(record)) != sizeof(record) ||
+		   index.write(reinterpret_cast<const uint8_t*>(pathValue), pathLength + 1) != pathLength + 1){
+			index.close();
+			return false;
+		}
+		payloadCrc = LibraryIndex::crc32Update(
+			payloadCrc,
+			reinterpret_cast<const uint8_t*>(&record),
+			sizeof(record)
+		);
+		payloadCrc = LibraryIndex::crc32Update(
+			payloadCrc,
+			reinterpret_cast<const uint8_t*>(pathValue),
+			pathLength + 1
+		);
+	}
+
+	header.payloadCrc32 = LibraryIndex::crc32Finish(payloadCrc);
+	header.buildState = static_cast<uint8_t>(LibraryIndex::BuildState::Complete);
+	header.headerCrc32 = LibraryIndex::headerCrc(header);
+	if(!index.seek(0) ||
+	   index.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) != sizeof(header)){
+		index.close();
+		return false;
+	}
+	index.flush();
+	index.close();
+
+	const LibraryIndex::Limits limits{
+		maxTrackCount,
+		maxIndexPayload,
+		maxPathPayload
+	};
+	const IndexProbe written = probeIndex(path, limits, identity);
+	return written.matchesCard && written.validation.header.generation == generation;
+}
+
+bool SongList::SongList::buildIndex(){
+	indexState = IndexState::Building;
+	indexProgress = 0;
+	indexProgressTotal = 0;
+	waiting = false;
+	draw();
+	screen.commit();
+
+	clearSongs();
+	File root = SD.open("/");
+	if(!root) return false;
+	const bool scanned = searchDirectories(root, 0);
+	root.close();
+	if((!scanned && !scanStoppedAtLimit) || allocationFailed) return false;
+
+	const LibraryIndex::Limits limits{
+		maxTrackCount,
+		maxIndexPayload,
+		maxPathPayload
+	};
+	const LibraryIndex::CardIdentity identity = currentCardIdentity();
+	const IndexProbe a = probeIndex(indexPathA, limits, identity);
+	const IndexProbe b = probeIndex(indexPathB, limits, identity);
+	uint32_t latestGeneration = 0;
+	if(a.matchesCard) latestGeneration = a.validation.header.generation;
+	if(b.matchesCard) latestGeneration = max(latestGeneration, b.validation.header.generation);
+	if(latestGeneration == UINT32_MAX) return false;
+
+	const char* inactive = indexPathA;
+	if(a.matchesCard && b.matchesCard){
+		inactive = a.validation.header.generation <= b.validation.header.generation ?
+			indexPathA : indexPathB;
+	}else if(a.matchesCard){
+		inactive = indexPathB;
+	}else if(b.matchesCard){
+		inactive = indexPathA;
+	}else if(a.valid && !b.valid){
+		inactive = indexPathB;
+	}else if(b.valid && !a.valid){
+		inactive = indexPathA;
+	}else if(a.valid && b.valid){
+		inactive = a.validation.header.generation <= b.validation.header.generation ?
+			indexPathA : indexPathB;
+	}
+
+	indexState = IndexState::Verifying;
+	draw();
+	screen.commit();
+	if(!writeGeneration(inactive, latestGeneration + 1)) return false;
+
+	indexGeneration = latestGeneration + 1;
+	indexState = IndexState::Ready;
+	indexProgress = songCount;
+	indexProgressTotal = songCount;
+	return true;
+}
+
+void SongList::SongList::checkSD(bool forceRebuild){
 	clearSongs();
 	selectedElement = 0;
 	firstVisible = 0;
 	empty = true;
 	scanLimited = false;
+	scanStoppedAtLimit = false;
 	allocationFailed = false;
+	indexState = IndexState::Absent;
+	indexGeneration = 0;
+	indexProgress = 0;
+	indexProgressTotal = 0;
+	identityStrength = LibraryIndex::IdentityStrength::Unknown;
 	waiting = true;
 
 	if(!insertedSD){
@@ -128,6 +542,7 @@ void SongList::SongList::checkSD(){
 		return;
 	}
 
+	identityStrength = LibraryIndex::IdentityStrength::Weak;
 	draw();
 	screen.commit();
 
@@ -140,10 +555,17 @@ void SongList::SongList::checkSD(){
 		screen.commit();
 		return;
 	}
-
-	searchDirectories(root);
 	root.close();
 
+	const bool indexed = !forceRebuild && loadBestIndex();
+	if(!indexed && !buildIndex()){
+		const bool memoryFailure = allocationFailed;
+		clearSongs();
+		allocationFailed = false;
+		const bool recovered = loadBestIndex();
+		if(!recovered && memoryFailure) allocationFailed = true;
+		indexState = IndexState::Error;
+	}
 	if(allocationFailed){
 		Serial.printf(
 			"SongList: allocation failed after %u tracks (%u bytes)\n",
@@ -151,19 +573,6 @@ void SongList::SongList::checkSD(){
 			static_cast<unsigned int>(pathBytes)
 		);
 		clearSongs();
-	}else{
-		if(pathBytes < pathCapacity){
-			char* compacted = static_cast<char*>(ps_realloc(pathBuffer, pathBytes));
-			if(compacted != nullptr) pathBuffer = compacted;
-			pathCapacity = pathBytes;
-		}
-		if(songCount < songCapacity){
-			uint32_t* compacted = static_cast<uint32_t*>(
-				ps_realloc(songOffsets, songCount * sizeof(uint32_t))
-			);
-			if(compacted != nullptr) songOffsets = compacted;
-			songCapacity = songCount;
-		}
 	}
 
 	waiting = false;
@@ -178,29 +587,68 @@ void SongList::SongList::checkSD(){
 	screen.commit();
 }
 
-bool SongList::SongList::searchDirectories(File dir){
+bool SongList::SongList::searchDirectories(File dir, uint8_t depth){
 	if(!dir) return true;
 
 	File f;
 	while(f = dir.openNextFile()){
+		const char* rawPath = f.name();
+		if(rawPath == nullptr || isHiddenEntry(rawPath)){
+			f.close();
+			continue;
+		}
 		if(f.isDirectory()){
-			const bool keepScanning = searchDirectories(f);
+			if(depth >= maxDirectoryDepth){
+				scanLimited = true;
+				f.close();
+				continue;
+			}
+			const bool keepScanning = searchDirectories(f, depth + 1);
 			f.close();
 			if(!keepScanning) return false;
 			continue;
 		}
 
-		const char* path = f.name();
-		if(!isVisibleAAC(path)){
+		char path[maxPathLength + 1];
+		if(!normalizePath(rawPath, path, sizeof(path)) ||
+		   !LibraryIndex::isSupportedPath(path, strlen(path))){
 			f.close();
 			continue;
 		}
 
-		const bool keepScanning = addSong(path);
+		const bool keepScanning = addSong(path, f);
 		f.close();
 		if(!keepScanning) return false;
 	}
 	return true;
+}
+
+bool SongList::SongList::trackMatches(size_t index, File& file){
+	if(index >= songCount || songMetadata == nullptr) return false;
+	LibraryIndex::FileEvidence evidence{};
+	if(!fingerprintFile(file, evidence)) return false;
+
+	LibraryIndex::Record record{};
+	const LibraryIndex::FileEvidence& expected = songMetadata[index];
+	record.flags = expected.flags;
+	record.firstBytes = expected.firstBytes;
+	record.lastBytes = expected.lastBytes;
+	record.fileSize = expected.fileSize;
+	record.fatMtime = expected.fatMtime;
+	record.firstCrc32 = expected.firstCrc32;
+	record.lastCrc32 = expected.lastCrc32;
+	return LibraryIndex::matchesFile(record, evidence);
+}
+
+SongList::SongList::IndexInfo SongList::SongList::getIndexInfo() const{
+	return {
+		indexState,
+		indexGeneration,
+		songCount,
+		identityStrength,
+		indexProgress,
+		indexProgressTotal
+	};
 }
 
 void SongList::SongList::loop(uint t){}
@@ -246,9 +694,25 @@ void SongList::SongList::start(){
 		fs::File file = SD.open(path);
 		if(!file){
 			file.close();
-			SD.end();
-			instance->insertedSD = false;
-			instance->checkSD();
+			File root = SD.open("/");
+			if(!root){
+				root.close();
+				SD.end();
+				instance->insertedSD = false;
+				instance->checkSD();
+			}else{
+				root.close();
+				instance->indexState = IndexState::Stale;
+				instance->draw();
+				instance->screen.commit();
+			}
+			return;
+		}
+		if(!instance->trackMatches(instance->selectedElement, file)){
+			file.close();
+			instance->indexState = IndexState::Stale;
+			instance->draw();
+			instance->screen.commit();
 			return;
 		}
 		file.close();
@@ -288,7 +752,7 @@ void SongList::SongList::draw(){
 	}
 
 	canvas->setTextDatum(BC_DATUM);
-	canvas->drawString(scanLimited ? "SD card LIMIT" : "SD card", screen.getWidth()/2, 15);
+	canvas->drawString(stateLabel(), screen.getWidth()/2, 15);
 
 	if(waiting){
 		canvas->drawString("Loading...", screen.getWidth()/2, 65);
@@ -301,7 +765,13 @@ void SongList::SongList::draw(){
 		canvas->setTextDatum(TL_DATUM);
 		return;
 	}else if(empty){
-		canvas->drawString(allocationFailed ? "Memory error!" : "Empty!", screen.getWidth()/2, 65);
+		if(indexState == IndexState::Building){
+			canvas->drawString("Building...", screen.getWidth()/2, 65);
+		}else if(indexState == IndexState::Error){
+			canvas->drawString(allocationFailed ? "Memory error!" : "Index error!", screen.getWidth()/2, 65);
+		}else{
+			canvas->drawString("Empty!", screen.getWidth()/2, 65);
+		}
 		canvas->setTextDatum(TL_DATUM);
 		return;
 	}
@@ -375,4 +845,20 @@ void SongList::SongList::encTwoTop(){
 	delete this;
 	MainMenu::MainMenu::getInstance()->unpack();
 	MainMenu::MainMenu::getInstance()->start();
+}
+
+void SongList::SongList::encTwoBot(){
+	checkSD(true);
+}
+
+const char* SongList::SongList::stateLabel() const{
+	switch(indexState){
+		case IndexState::Absent: return "SD loading";
+		case IndexState::Building: return "SD building";
+		case IndexState::Verifying: return "SD verify";
+		case IndexState::Ready: return scanLimited ? "SD LIMIT" : "SD ready";
+		case IndexState::Stale: return "SD stale";
+		case IndexState::Error: return "SD error";
+	}
+	return "SD card";
 }
