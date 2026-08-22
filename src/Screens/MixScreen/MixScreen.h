@@ -7,11 +7,11 @@
 #include "SongName.h"
 #include "EffectElement.h"
 #include "MatrixPopUpPicker.h"
-#include <AudioLib/Systems/MixSystem.h>
 #include <Matrix/VuVisualizer.h>
 #include <Matrix/RoundVuVisualiser.h>
 #include <Input/InputJayD.h>
 #include "../../InputKeys.h"
+#include "../../DjSession/DjSession.h"
 
 namespace MixScreen {
 	class MixScreen : public Context, public LoopListener, public JayDInputListener, public InputListener {
@@ -38,14 +38,14 @@ namespace MixScreen {
 	private:
 		static MixScreen* instance;
 
-		fs::File f1;
-		fs::File f2;
 		Color *selectedBackgroundBuffer = nullptr;
-		MixSystem* system = nullptr;
-		bool keepSystemOnStop = false;
+		DjSession* session = nullptr;
 		uint8_t loadingChannel = 0;
+		bool songListOpen = false;
+		char displayedPaths[DJ_DECK_COUNT][DJ_PATH_CAPACITY] = {};
 
-		bool loadChannel(uint8_t channel, const fs::File& file);
+		bool loadChannel(uint8_t channel, const String& path);
+		bool syncFromSnapshot(const DjSnapshot& snapshot, bool force = false);
 
 		LinearLayout* screenLayout;
 		LinearLayout* leftLayout;
