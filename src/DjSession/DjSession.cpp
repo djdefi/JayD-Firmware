@@ -749,8 +749,19 @@ void DjSession::loop(uint micros){
 	tickLoops();
 	tickSync();
 	pollRecording();
-	tickAssist();
+	// Publish before tickAssist(): assistController.tick() only ever reads
+	// state via copySnapshot(), and a command applied above (e.g. a deck
+	// reload) must be visible to it in the SAME iteration it was applied
+	// in. Publishing here - after apply()/tickLoops()/tickSync()/
+	// pollRecording() but before tickAssist() - closes that same-iteration
+	// gap; a same-tick target-deck swap is now reflected in the guard
+	// tickAssist() builds instead of leaking through on the stale,
+	// previous-iteration snapshot. tickAssist() itself never mutates
+	// DjSession's own live state directly (it only submits DjCommands,
+	// applied on a later iteration), so nothing it does needs a second
+	// publish this tick.
 	publishSnapshot();
+	tickAssist();
 }
 
 void DjSession::tickAssist(){
