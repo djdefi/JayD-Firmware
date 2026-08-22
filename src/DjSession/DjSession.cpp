@@ -710,6 +710,31 @@ bool DjSession::copyAssistSnapshot(DjAssistSnapshot& snapshot) const{
 	return true;
 }
 
+void DjSession::assistTrackCommand(uint32_t commandId){
+	commandMutex.lock();
+	assistTracked.id = commandId;
+	assistTracked.tracked = true;
+	assistTracked.status = DJ_COMMAND_ACCEPTED;
+	commandMutex.unlock();
+}
+
+DjCommandStatus DjSession::assistTrackedStatus(uint32_t commandId){
+	commandMutex.lock();
+	DjCommandStatus status = DJ_COMMAND_PENDING;
+	if(assistTracked.tracked && assistTracked.id == commandId){
+		status = assistTracked.status;
+	}
+	commandMutex.unlock();
+	return status;
+}
+
+uint32_t DjSession::assistNonSystemMixGeneration(){
+	commandMutex.lock();
+	const uint32_t generation = nonSystemMixGeneration;
+	commandMutex.unlock();
+	return generation;
+}
+
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
 	if(!system || !left || !right || !output) return;
 	if(viewAttached && viewInfo[0] == left && viewInfo[1] == right && viewInfo[2] == output) return;
@@ -743,6 +768,9 @@ void DjSession::loop(uint micros){
 		commandMutex.lock();
 		commandResults.finishWithDiagnostics(command.id, status, error,
 			diagnostics.targetFrame, diagnostics.lateFrames, diagnostics.missed);
+		if(assistTracked.tracked && assistTracked.id == command.id){
+			assistTracked.status = status;
+		}
 		commandMutex.unlock();
 	}
 
@@ -827,6 +855,11 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		case DJ_COMMAND_SET_MIX:
 			mix = command.value;
 			system->setMix(mix);
+			if(command.origin != DJ_ORIGIN_SYSTEM){
+				commandMutex.lock();
+				++nonSystemMixGeneration;
+				commandMutex.unlock();
+			}
 			return true;
 		case DJ_COMMAND_SET_EFFECT_TYPE: {
 			if(command.value == DJ_EFFECT_SPEED && syncArmed[command.deck]){

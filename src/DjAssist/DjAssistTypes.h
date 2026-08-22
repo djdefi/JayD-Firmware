@@ -22,13 +22,6 @@ static const uint8_t DJ_ASSIST_MAX_RECENT_TRACKS = 16;
 // entries_[] table (no I/O), so a larger per-tick budget is cheap and
 // bounded.
 static const uint16_t DJ_ASSIST_DEFAULT_SCAN_BUDGET = 256;
-// Candidate-table FILL budget: this is a genuine, possibly-SD-backed
-// metadata read per record (DjSession::assistTrackEntry() ->
-// JaydMetadata::trackByIndex()). Must stay tiny and bounded so filling the
-// table is spread across many DjSession::loop() ticks instead of a
-// synchronous multi-hundred-record burst inside the audio/session loop
-// while decks are playing.
-static const uint16_t DJ_ASSIST_FILL_RECORDS_PER_TICK = 1;
 static const uint8_t DJ_ASSIST_MAX_TRANSITION_STEPS = 8;
 
 // Fixed-point rate, 1000 == 1.0x deck rate.
@@ -214,6 +207,13 @@ struct DjAssistTransitionPlan {
 	uint8_t armedMix = 127;
 	bool armedFromPlaying = false;
 	uint32_t armedFromRateMilli = DJ_ASSIST_RATE_UNITY_MILLI;
+	// toDeck's own baseline at arm() time - a rollback must only undo a
+	// mutation THIS plan actually introduced. If the target deck was
+	// already playing/sync-armed before the transition armed, the plan's
+	// START_DECK/ENABLE_SYNC steps are idempotent no-ops against
+	// pre-existing user state, and rollback must never stop/release it.
+	bool armedToPlaying = false;
+	bool armedToSynced = false;
 };
 
 // Bounded snapshot supplied every tick so the state machine can detect
@@ -228,17 +228,25 @@ struct DjAssistGuardSnapshot {
 	bool loopActive[DJ_DECK_COUNT] = {};
 	bool metadataValid[DJ_DECK_COUNT] = {};
 	uint32_t rateMilli[DJ_DECK_COUNT] = {};
+	// True when the deck's sync state is anything other than off (armed,
+	// locked, out-of-range, or error), used to capture whether a deck was
+	// already sync-active *before* a transition armed - see
+	// DjAssistTransitionPlan::armedToSynced.
+	bool syncActive[DJ_DECK_COUNT] = {};
 	// Identity currently loaded on each deck, so a running/armed transition
 	// can detect a target-deck swap (re-load or deck-swap) before acting on
 	// an unconfirmed track. Only meaningful when deckLoaded[deck] is true.
 	DjTrackIdentity deckIdentity[DJ_DECK_COUNT] = {};
-	// True when the caller's bounded scan of recent command results found a
-	// mix command from a non-system origin (physical/browser) submitted
-	// since the transition armed. Set only by the controller (see
-	// DjAssistBridge::detectManualMixOverride()); the engine never inspects
-	// command history itself. A programmatic crossfade must not silently
-	// overwrite this - guardOk() fails the transition immediately when
-	// this is true.
+	// True when a mix command from a non-system origin (physical/browser)
+	// has been authoritatively applied since the transition armed. Set only
+	// by the controller, by comparing DjSession's durable monotonic
+	// non-system-mix generation counter against the value captured at
+	// arm() time (see DjSession::assistNonSystemMixGeneration()) - never
+	// inferred from the bounded/evictable recent-results ring, which can
+	// silently drop the very event this flag exists to catch. The engine
+	// never inspects command history itself. A programmatic crossfade must
+	// not silently overwrite this - guardOk() fails the transition
+	// immediately when this is true.
 	bool manualMixOverride = false;
 };
 

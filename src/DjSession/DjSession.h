@@ -76,6 +76,27 @@ public:
 	bool nextDownbeatFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) const;
 	bool nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame);
 
+	// Durable (never evictable, unlike the bounded recentResults ring)
+	// single-slot outcome tracker for the one in-flight command the Coach
+	// transition/rollback state machine is ever watching at a time (the
+	// state machine is strictly sequential - only one command is submitted
+	// and awaited per step). assistTrackCommand() must be called
+	// immediately after a successful submit(); assistTrackedStatus()
+	// returns DJ_COMMAND_PENDING until that exact command id resolves via
+	// the normal loop()/finishWithDiagnostics() path, regardless of how
+	// many other commands are processed (and evicted from recentResults)
+	// in between.
+	void assistTrackCommand(uint32_t commandId);
+	DjCommandStatus assistTrackedStatus(uint32_t commandId);
+	// Monotonic count of authoritatively-applied SET_MIX commands whose
+	// origin was NOT DJ_ORIGIN_SYSTEM, incremented exactly once per such
+	// command inside apply() (never inferred from the bounded/evictable
+	// recentResults ring). The Coach controller captures this value at
+	// arm() time and compares it on every guard/rollback check - any
+	// change means a manual mix action has occurred since, durably and
+	// without regard to ring eviction.
+	uint32_t assistNonSystemMixGeneration();
+
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
 	bool libraryWorkAllowed();
@@ -149,6 +170,20 @@ private:
 #if defined(JAYD_ENABLE_WIRELESS)
 	uint32_t pairingGeneration = 0;
 #endif
+
+	// Durable single-slot command-outcome tracker for DjAssist (see
+	// assistTrackCommand()/assistTrackedStatus()) - deliberately separate
+	// from commandResults' bounded/evictable ring.
+	struct DjAssistTrackedCommand {
+		uint32_t id = 0;
+		bool tracked = false;
+		DjCommandStatus status = DJ_COMMAND_PENDING;
+	};
+	DjAssistTrackedCommand assistTracked;
+	// Incremented in apply()'s DJ_COMMAND_SET_MIX case whenever the
+	// command's origin is not DJ_ORIGIN_SYSTEM (see
+	// assistNonSystemMixGeneration()).
+	uint32_t nonSystemMixGeneration = 0;
 
 	DjAssistController assistController;
 	void tickAssist();

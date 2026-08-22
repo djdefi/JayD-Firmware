@@ -58,7 +58,7 @@ public:
 
 	DjCommandStatus poll(uint32_t commandId) const override{
 		if(commandId >= CrossfadeIdBase) return pollCrossfade(commandId);
-		return lookupStatus(commandId);
+		return session_->assistTrackedStatus(commandId);
 	}
 
 private:
@@ -75,25 +75,15 @@ private:
 	mutable bool crossfadeFinalSubmitted_ = false;
 	mutable uint32_t crossfadeFinalCommandId_ = 0;
 
-	static bool acceptedResult(const DjSubmitResult& result, uint32_t& outCommandId){
+	// Records the submitted command as the ONE durable tracked outcome
+	// DjSession will resolve authoritatively when it applies - never
+	// inferred from the bounded/evictable recentResults ring (see
+	// DjSession::assistTrackCommand()/assistTrackedStatus()).
+	bool acceptedResult(const DjSubmitResult& result, uint32_t& outCommandId){
 		if(result.status == DJ_COMMAND_REJECTED) return false;
 		outCommandId = result.id;
+		session_->assistTrackCommand(result.id);
 		return true;
-	}
-
-	DjCommandStatus lookupStatus(uint32_t commandId) const{
-		DjSnapshot snapshot;
-		session_->copySnapshot(snapshot);
-		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; ++i){
-			if(snapshot.recentResults[i].id == commandId) return snapshot.recentResults[i].status;
-		}
-		// Not seen yet (queued but not yet applied, or evicted from the
-		// bounded result ring by unrelated traffic before we observed it) -
-		// DjAssistEngine::tick() treats anything other than
-		// APPLIED/FAILED/REJECTED as "keep waiting", so this is safe; an
-		// explicit cancelTransition() remains the recovery path if a step
-		// never resolves.
-		return DJ_COMMAND_PENDING;
 	}
 
 	bool beginCrossfade(const DjAssistTransitionStep& step, uint32_t& outCommandId){
@@ -112,7 +102,7 @@ private:
 		if(commandId != crossfadeId_) return DJ_COMMAND_FAILED;
 
 		if(crossfadeFinalSubmitted_){
-			const DjCommandStatus status = lookupStatus(crossfadeFinalCommandId_);
+			const DjCommandStatus status = session_->assistTrackedStatus(crossfadeFinalCommandId_);
 			switch(DjAssistBridge::evaluateCommandOutcome(status)){
 				case DjAssistBridge::DJ_ASSIST_COMMAND_DONE:
 					return DJ_COMMAND_APPLIED;
@@ -144,12 +134,14 @@ private:
 			if(result.status != DJ_COMMAND_REJECTED){
 				crossfadeFinalSubmitted_ = true;
 				crossfadeFinalCommandId_ = result.id;
+				session_->assistTrackCommand(result.id);
 			}
 			// Rejected: retry next tick without marking submitted.
 			return DJ_COMMAND_PENDING;
 		}
 
-		// Intermediate ramp value: fire-and-forget, superseded freely.
+		// Intermediate ramp value: fire-and-forget, superseded freely - not
+		// tracked (only the final endpoint command is durably watched).
 		session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
 		return DJ_COMMAND_PENDING;
 	}
@@ -173,9 +165,23 @@ void DjAssistController::begin(DjSession* session){
 		entryCapacity_ = 0;
 	}
 	actuator_ = new DjAssistSessionActuator(session_);
+
+	if(!allocationFailed_){
+		// Lowest priority, unpinned (core=-1): this task only ever reads
+		// already-indexed metadata a record at a time and is never on the
+		// audio-critical path, so it must never contend for CPU against
+		// mixing/loop/sync work.
+		fillTask_ = new Task("DjAssistFill", &DjAssistController::fillTaskTrampoline, 4096, this);
+		fillTask_->start(0, -1);
+	}
 }
 
 void DjAssistController::end(){
+	if(fillTask_){
+		fillTask_->stop(true); // blocking: must not touch entries_ after free() below.
+		delete fillTask_;
+		fillTask_ = nullptr;
+	}
 	delete actuator_;
 	actuator_ = nullptr;
 	free(entries_);
@@ -183,51 +189,88 @@ void DjAssistController::end(){
 	session_ = nullptr;
 }
 
-void DjAssistController::refreshCandidateTable(){
+void DjAssistController::fillTaskTrampoline(Task* task){
+	DjAssistController* self = static_cast<DjAssistController*>(task->arg);
+	while(task->running){
+		self->fillWorkerStep();
+		delay(20); // gentle background cadence; never audio-critical.
+	}
+}
+
+// Background-thread-only: performs the bounded, possibly SD-backed
+// candidate-table fill entirely off DjSession::loop()/the audio thread (see
+// review requirement to remove synchronous SD scanning from the session
+// loop). Reads one metadata record at a time OUTSIDE the lock (the actual
+// I/O never happens while candidateMutex_ is held), then takes the lock
+// only for the brief array write + bookkeeping update - so the main thread
+// is never blocked waiting on a card read, only on a few field writes.
+void DjAssistController::fillWorkerStep(){
 	if(!session_ || allocationFailed_) return;
 
 	const uint32_t currentGeneration = session_->assistLibraryGeneration();
-	if(!generationSeen_ || currentGeneration != loadedGeneration_){
+
+	candidateMutex_.lock();
+	bool freshGeneration = !generationSeen_ || currentGeneration != loadedGeneration_;
+	if(freshGeneration){
 		generationSeen_ = true;
 		loadedGeneration_ = currentGeneration;
 		fillCursor_ = 0;
 		entryTotal_ = 0;
-		scanCursor_ = 0;
-		suggestionCount_ = 0;
 		fillComplete_ = false;
 	}
-	if(fillComplete_) return;
+	const bool complete = fillComplete_;
+	const uint16_t cursor = fillCursor_;
+	candidateMutex_.unlock();
+	if(complete) return;
 
 	const uint32_t rawTotal = session_->assistTrackCount();
 	const uint16_t cappedTotal = rawTotal > entryCapacity_ ? entryCapacity_ : uint16_t(rawTotal);
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
-
-	// DJ_ASSIST_FILL_RECORDS_PER_TICK is deliberately tiny (not
-	// DJ_ASSIST_DEFAULT_SCAN_BUDGET): each iteration is a real, possibly
-	// SD-backed metadata read (assistTrackEntry() ->
-	// JaydMetadata::trackByIndex()), unlike the scoring scan below which
-	// only touches the already-cached PSRAM entries_[] table. Populating
-	// up to DJ_ASSIST_MAX_INDEX_ENTRIES this way is spread across many
-	// DjSession::loop() ticks instead of a synchronous multi-record burst
-	// while decks are playing.
-	uint16_t filled = 0;
-	while(fillCursor_ < cappedTotal && filled < DJ_ASSIST_FILL_RECORDS_PER_TICK){
-		DjAssistLibraryEntry entry;
-		if(!session_->assistTrackEntry(fillCursor_, entry)){
-			// Missing/unreadable record: still occupies a slot (so indices
-			// stay stable) but carries no capabilities/state, which the
-			// scorer treats as reduced confidence rather than a rejection.
-			entry = DjAssistLibraryEntry();
-			entry.libraryIndex = fillCursor_;
+	if(cursor >= cappedTotal){
+		candidateMutex_.lock();
+		// Only finalize if the generation this cursor belongs to is still
+		// current (a fresh generation may have started concurrently).
+		if(loadedGeneration_ == currentGeneration){
+			entryTotal_ = cappedTotal;
+			fillComplete_ = true;
 		}
-		entries_[fillCursor_] = entry;
+		candidateMutex_.unlock();
+		return;
+	}
+
+	// The actual (possibly slow) read happens into a local, unlocked.
+	DjAssistLibraryEntry entry;
+	if(!session_->assistTrackEntry(cursor, entry)){
+		// Missing/unreadable record: still occupies a slot (so indices
+		// stay stable) but carries no capabilities/state, which the
+		// scorer treats as reduced confidence rather than a rejection.
+		entry = DjAssistLibraryEntry();
+		entry.libraryIndex = cursor;
+	}
+
+	candidateMutex_.lock();
+	// The generation may have changed while the read above was in flight
+	// (e.g. a library refresh landed mid-read) - discard this record
+	// rather than writing stale data into the new generation's table.
+	if(loadedGeneration_ == currentGeneration && fillCursor_ == cursor){
+		entries_[cursor] = entry;
 		++fillCursor_;
-		++filled;
+		if(fillCursor_ >= cappedTotal){
+			entryTotal_ = cappedTotal;
+			fillComplete_ = true;
+		}
 	}
-	if(fillCursor_ >= cappedTotal){
-		entryTotal_ = cappedTotal;
-		fillComplete_ = true;
-	}
+	candidateMutex_.unlock();
+}
+
+// Bounded, lock-protected readiness check for the main thread - never
+// blocks on I/O (the fill task never holds candidateMutex_ across a read).
+bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
+	candidateMutex_.lock();
+	const bool ready = fillComplete_;
+	outGeneration = loadedGeneration_;
+	candidateMutex_.unlock();
+	return ready;
 }
 
 void DjAssistController::updateRecentTracks(const DjSnapshot& snapshot){
@@ -286,14 +329,19 @@ DjAssistGuardSnapshot DjAssistController::buildGuard(const DjSnapshot& snapshot)
 		guard.loopActive[d] = snapshot.decks[d].loop.state != DJ_LOOP_INACTIVE;
 		guard.metadataValid[d] = snapshot.decks[d].metadata.state == DJ_METADATA_VALID;
 		guard.rateMilli[d] = uint32_t((uint64_t(snapshot.decks[d].sync.targetRate) * 1000ULL) / DJ_RATE_SCALE);
+		guard.syncActive[d] = snapshot.decks[d].sync.state != DJ_SYNC_OFF;
 		guard.deckIdentity[d] = snapshot.decks[d].identity;
 	}
-	// Only meaningful once a transition has armed and set armWatermarkId_
-	// (see armTransition()); before that it stays 0, so this scan simply
-	// finds nothing relevant to a not-yet-existing plan.
-	guard.manualMixOverride = DjAssistBridge::detectManualMixOverride(
-		snapshot.recentResults, DJ_RECENT_RESULT_COUNT, armWatermarkId_
-	);
+	// Durable: compares DjSession's monotonic non-system-mix generation
+	// counter against the value captured at arm() time (armedMixGeneration_,
+	// see armTransition()) - never inferred from the bounded/evictable
+	// recentResults ring, which can silently drop the very event this
+	// exists to detect. Before a transition has ever armed this simply
+	// compares against 0; guardOk()/tickRollback() only consult this field
+	// while a transition is armed/running/failed, so a stale comparison
+	// beforehand has no effect.
+	guard.manualMixOverride = session_ &&
+		session_->assistNonSystemMixGeneration() != armedMixGeneration_;
 	return guard;
 }
 
@@ -309,18 +357,22 @@ bool DjAssistController::resolveBoundary(const DjSnapshot& snapshot, uint8_t dec
 		hint.downbeatFrame = downbeatFrame;
 	}
 
-	// Phrase lookups do a bounded but real SD read; only refresh the cached
-	// value once we've passed it (or don't have one yet for this deck), not
-	// on every tick, keeping this out of the per-tick file-read budget.
-	if(phraseHintDeck_ != deck || !phraseHintValid_ || currentFrame >= phraseHintFrame_){
+	// Phrase lookups do a bounded but real SD read; only actually perform
+	// one when the cache says it's needed (identity change, backward seek,
+	// or a previously *found* boundary now passed). A cached *terminal*
+	// ("no future phrase") result is deliberately not rescanned every
+	// tick just because it's still terminal - without this, a track
+	// nearing its end would trigger a full phrase-table rescan on every
+	// single Coach/transition tick.
+	const DjTrackIdentity& identity = snapshot.decks[deck].identity;
+	if(DjAssistBridge::phraseCacheNeedsRescan(phraseCache_, deck, currentFrame, identity)){
 		uint64_t phraseFrame = 0;
-		phraseHintValid_ = session_->nextPhraseFrame(deck, currentFrame, phraseFrame);
-		phraseHintDeck_ = deck;
-		phraseHintFrame_ = phraseFrame;
+		const bool found = session_->nextPhraseFrame(deck, currentFrame, phraseFrame);
+		DjAssistBridge::updatePhraseCache(phraseCache_, deck, currentFrame, identity, found, phraseFrame);
 	}
-	if(phraseHintValid_){
+	if(phraseCache_.valid && !phraseCache_.terminal){
 		hint.hasPhrase = true;
-		hint.phraseFrame = phraseHintFrame_;
+		hint.phraseFrame = phraseCache_.frame;
 	}
 	return hint.hasDownbeat || hint.hasPhrase;
 }
@@ -356,11 +408,16 @@ void DjAssistController::tickSuggestions(const DjSnapshot& snapshot){
 		}
 	}
 
+	// entries_[]/entryTotal_ are written by the background fill task (see
+	// fillWorkerStep()); this is the one place the main thread reads them,
+	// so the whole (bounded, I/O-free) scan is done under the same lock.
+	candidateMutex_.lock();
 	DjAssistScoring::scanTick(
 		entries_, entryTotal_, scanCursor_, DJ_ASSIST_DEFAULT_SCAN_BUDGET,
 		deckCtx, loaded, loadedCount, recentTracks_, recentCount_,
 		suggestions_, suggestionCount_, DJ_ASSIST_MAX_SUGGESTIONS
 	);
+	candidateMutex_.unlock();
 
 	if(mode == DJ_ASSIST_MODE_COACH){
 		const uint8_t otherDeck = referenceDeck == 0 ? 1 : 0;
@@ -375,13 +432,18 @@ void DjAssistController::tickSuggestions(const DjSnapshot& snapshot){
 }
 
 // Capture-once-then-compare arrival check for the WAIT_BOUNDARY transition
-// step. The first tick this step is current, latches ONE target boundary
-// frame (prefer phrase, matching Coach's own preference, else the next
-// downbeat); every subsequent tick just compares the live playhead against
-// that fixed target - never re-derives a fresh "next" boundary, which would
-// always be some future frame and therefore never actually "arrive". No
-// SD-read cost beyond what resolveBoundary() already spends once per
-// capture (phrase lookups stay throttled by its own cache).
+// step, using the established quantize tolerance
+// (DJ_QUANTIZE_TOLERANCE_FRAMES) so a boundary is never reported reached
+// arbitrarily late. The first tick this step is current, latches ONE
+// target boundary frame (prefer phrase, matching Coach's own preference,
+// else the next downbeat); every subsequent tick compares the live
+// playhead against that fixed target via
+// DjAssistBridge::evaluateBoundaryArrival(): NOT_YET keeps waiting,
+// REACHED (at or within tolerance past target) fires the hint, and MISSED
+// (more than tolerance past target - e.g. this tick's own scheduling
+// jitter, or the actuator stalled on a prior step) re-captures the next
+// boundary ahead of the current position and keeps waiting rather than
+// ever releasing on a stale target.
 bool DjAssistController::resolveWaitBoundaryReached(const DjSnapshot& snapshot, uint8_t deck){
 	if(!session_ || deck >= DJ_DECK_COUNT || !snapshot.decks[deck].loaded) return false;
 
@@ -393,7 +455,23 @@ bool DjAssistController::resolveWaitBoundaryReached(const DjSnapshot& snapshot, 
 	}
 
 	const uint64_t currentFrame = session_->deckElapsedFrames(deck);
-	return currentFrame >= waitBoundaryTargetFrame_;
+	switch(DjAssistBridge::evaluateBoundaryArrival(currentFrame, waitBoundaryTargetFrame_)){
+		case DjAssistBridge::DJ_ASSIST_BOUNDARY_REACHED:
+			return true;
+		case DjAssistBridge::DJ_ASSIST_BOUNDARY_MISSED: {
+			DjAssistBoundaryHint rescheduled;
+			if(resolveBoundary(snapshot, deck, rescheduled)){
+				waitBoundaryTargetFrame_ = rescheduled.hasPhrase ? rescheduled.phraseFrame : rescheduled.downbeatFrame;
+			}
+			// If no fresh boundary is available, stay latched on the
+			// stale target; the transition's other guards (metadata/media)
+			// fail the transition safely if this persists.
+			return false;
+		}
+		case DjAssistBridge::DJ_ASSIST_BOUNDARY_NOT_YET:
+		default:
+			return false;
+	}
 }
 
 void DjAssistController::tickTransition(const DjSnapshot& snapshot){
@@ -425,13 +503,21 @@ bool planStepSubmitted(const DjAssistTransitionPlan& plan, DjAssistTransitionAct
 } // namespace
 
 // Bounded rollback for a terminally-failed/cancelled transition: undoes
-// only the side effects THIS plan itself submitted (mix/sync/started-deck),
+// only the mutations THIS plan actually introduced (mix/sync/started-deck),
 // in mix -> sync -> stop-deck order, one actuator submit/poll per tick,
 // waiting for each command's real applied/failed/superseded result before
 // advancing (never assumes success from elapsed time). Deliberately never
 // attempts to restart fromDeck once STOP_DECK has run - by that point the
 // transition is essentially complete and un-stopping the new deck would be
 // more disruptive than leaving it playing.
+//
+// Ownership is computed fresh every tick from the plan's arm-time baseline
+// (armedToPlaying/armedToSynced) and the durable mix-generation counter,
+// never merely from "was this step type submitted": a step submitted
+// against a target deck that was already playing/synced before the
+// transition armed is an idempotent no-op the plan did not actually
+// introduce, and must not be undone; a manual mix change at any point
+// after arming means the MIX phase must never restore armedMix over it.
 void DjAssistController::tickRollback(){
 	if(!actuator_) return;
 	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return;
@@ -442,9 +528,13 @@ void DjAssistController::tickRollback(){
 	const bool syncSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_LOCK_TEMPO) ||
 		planStepSubmitted(p, DJ_ASSIST_ACTION_ENABLE_SYNC);
 	const bool startDeckSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_START_DECK);
+	const bool manualMixOccurred = session_ &&
+		session_->assistNonSystemMixGeneration() != armedMixGeneration_;
+	const bool syncOwnedByPlan = syncSubmitted && !p.armedToSynced;
+	const bool startDeckOwnedByPlan = startDeckSubmitted && !p.armedToPlaying;
 
 	rollbackPhase_ = DjAssistBridge::nextRollbackPhase(
-		rollbackPhase_, crossfadeSubmitted, syncSubmitted, startDeckSubmitted
+		rollbackPhase_, crossfadeSubmitted, manualMixOccurred, syncOwnedByPlan, startDeckOwnedByPlan
 	);
 	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
 
@@ -498,13 +588,22 @@ void DjAssistController::tickRollback(){
 
 void DjAssistController::tick(){
 	if(!session_) return;
-	refreshCandidateTable();
 
 	DjSnapshot snapshot;
 	if(!session_->copySnapshot(snapshot)) return;
 
 	updateRecentTracks(snapshot);
-	if(fillComplete_) tickSuggestions(snapshot);
+
+	uint32_t generation = 0;
+	if(candidateTableReady(generation)){
+		if(!scanGenerationSeen_ || generation != scanGeneration_){
+			scanGenerationSeen_ = true;
+			scanGeneration_ = generation;
+			scanCursor_ = 0;
+			suggestionCount_ = 0;
+		}
+		tickSuggestions(snapshot);
+	}
 	tickTransition(snapshot);
 	tickRollback();
 }
@@ -536,11 +635,7 @@ bool DjAssistController::armTransition(
 		waitBoundaryCaptured_ = false;
 		rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_IDLE;
 		rollbackSubmitted_ = false;
-		uint32_t maxId = 0;
-		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; ++i){
-			if(snapshot.recentResults[i].id > maxId) maxId = snapshot.recentResults[i].id;
-		}
-		armWatermarkId_ = maxId;
+		armedMixGeneration_ = session_->assistNonSystemMixGeneration();
 	}
 	return armed;
 }

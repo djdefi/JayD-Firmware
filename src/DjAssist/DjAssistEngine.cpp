@@ -101,6 +101,8 @@ bool DjAssistEngine::armTransition(
 	plan_.armedMix = guard.mix;
 	plan_.armedFromPlaying = guard.deckPlaying[fromDeck];
 	plan_.armedFromRateMilli = guard.rateMilli[fromDeck];
+	plan_.armedToPlaying = guard.deckPlaying[toDeck];
+	plan_.armedToSynced = guard.syncActive[toDeck];
 
 	buildSteps(plan_);
 	mode_ = DJ_ASSIST_MODE_TRANSITION_ARMED;

@@ -88,13 +88,14 @@ uint8_t computeCrossfadeMix(
 DjAssistRollbackPhase nextRollbackPhase(
 	DjAssistRollbackPhase phase,
 	bool crossfadeSubmitted,
-	bool syncSubmitted,
-	bool startDeckSubmitted
+	bool manualMixOccurred,
+	bool syncOwnedByPlan,
+	bool startDeckOwnedByPlan
 ){
 	if(phase == DJ_ASSIST_ROLLBACK_IDLE) phase = DJ_ASSIST_ROLLBACK_MIX;
-	if(phase == DJ_ASSIST_ROLLBACK_MIX && !crossfadeSubmitted) phase = DJ_ASSIST_ROLLBACK_SYNC;
-	if(phase == DJ_ASSIST_ROLLBACK_SYNC && !syncSubmitted) phase = DJ_ASSIST_ROLLBACK_STOP_DECK;
-	if(phase == DJ_ASSIST_ROLLBACK_STOP_DECK && !startDeckSubmitted) phase = DJ_ASSIST_ROLLBACK_DONE;
+	if(phase == DJ_ASSIST_ROLLBACK_MIX && (!crossfadeSubmitted || manualMixOccurred)) phase = DJ_ASSIST_ROLLBACK_SYNC;
+	if(phase == DJ_ASSIST_ROLLBACK_SYNC && !syncOwnedByPlan) phase = DJ_ASSIST_ROLLBACK_STOP_DECK;
+	if(phase == DJ_ASSIST_ROLLBACK_STOP_DECK && !startDeckOwnedByPlan) phase = DJ_ASSIST_ROLLBACK_DONE;
 	return phase;
 }
 
@@ -114,21 +115,39 @@ DjAssistCommandOutcome evaluateCommandOutcome(DjCommandStatus status){
 	}
 }
 
-bool detectManualMixOverride(
-	const DjCommandResult* recentResults,
-	uint8_t resultCount,
-	uint32_t watermarkId
+DjAssistBoundaryArrival evaluateBoundaryArrival(uint64_t currentFrame, uint64_t targetFrame){
+	if(currentFrame < targetFrame) return DJ_ASSIST_BOUNDARY_NOT_YET;
+	const uint64_t lateFrames = currentFrame - targetFrame;
+	return lateFrames <= DJ_QUANTIZE_TOLERANCE_FRAMES ? DJ_ASSIST_BOUNDARY_REACHED : DJ_ASSIST_BOUNDARY_MISSED;
+}
+
+bool phraseCacheNeedsRescan(
+	const DjAssistPhraseCacheState& cache,
+	uint8_t deck,
+	uint64_t currentFrame,
+	const DjTrackIdentity& identity
 ){
-	if(!recentResults) return false;
-	for(uint8_t i = 0; i < resultCount; ++i){
-		const DjCommandResult& result = recentResults[i];
-		if(result.id == 0 || result.id <= watermarkId) continue;
-		if(result.type != DJ_COMMAND_SET_MIX) continue;
-		if(result.origin == DJ_ORIGIN_SYSTEM) continue;
-		if(result.status == DJ_COMMAND_REJECTED) continue;
-		return true;
-	}
+	if(!cache.valid || cache.deck != deck) return true;
+	if(!DjAssistScoring::identityMatches(cache.identity, identity)) return true;
+	if(currentFrame < cache.lastFrame) return true; // backward seek
+	if(!cache.terminal && currentFrame >= cache.frame) return true; // cached boundary passed
 	return false;
+}
+
+void updatePhraseCache(
+	DjAssistPhraseCacheState& cache,
+	uint8_t deck,
+	uint64_t currentFrame,
+	const DjTrackIdentity& identity,
+	bool found,
+	uint64_t phraseFrame
+){
+	cache.deck = deck;
+	cache.valid = true;
+	cache.terminal = !found;
+	cache.frame = found ? phraseFrame : 0;
+	cache.lastFrame = currentFrame;
+	cache.identity = identity;
 }
 
 } // namespace DjAssistBridge

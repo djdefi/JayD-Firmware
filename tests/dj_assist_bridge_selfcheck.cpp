@@ -145,19 +145,21 @@ void testCrossfadeMixOverflowGuard(){
 	assert(computeCrossfadeMix(0, 0xFFFFFFFFFFFFFFFFULL, 32, 1) == 0);
 }
 
-// -- nextRollbackPhase: skips phases with nothing to undo, deterministic --
+// -- nextRollbackPhase: skips phases with nothing to undo/nothing plan-
+// -- owned, deterministic --------------------------------------------------
 
 void testNextRollbackPhaseFullSequence(){
-	// Every side effect was submitted: mix -> sync -> stop-deck -> done,
-	// never skipping a phase.
+	// Every side effect was submitted and plan-owned: mix -> sync ->
+	// stop-deck -> done, never skipping a phase.
 	DjAssistRollbackPhase phase = DJ_ASSIST_ROLLBACK_IDLE;
-	phase = nextRollbackPhase(phase, /*crossfade*/true, /*sync*/true, /*startDeck*/true);
+	phase = nextRollbackPhase(phase, /*crossfade*/true, /*manualMixOccurred*/false,
+		/*syncOwned*/true, /*startDeckOwned*/true);
 	assert(phase == DJ_ASSIST_ROLLBACK_MIX);
-	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, true, true);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, false, true, true);
 	assert(phase == DJ_ASSIST_ROLLBACK_SYNC);
-	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_STOP_DECK, true, true, true);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_STOP_DECK, true, false, true, true);
 	assert(phase == DJ_ASSIST_ROLLBACK_STOP_DECK);
-	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_DONE, true, true, true);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_DONE, true, false, true, true);
 	assert(phase == DJ_ASSIST_ROLLBACK_DONE);
 }
 
@@ -165,18 +167,47 @@ void testNextRollbackPhaseSkipsUnsubmittedSteps(){
 	// Nothing was ever submitted (e.g. failed during WAIT_BOUNDARY, before
 	// any actuator action): every phase must be skipped straight to DONE -
 	// there is nothing to undo.
-	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, false) == DJ_ASSIST_ROLLBACK_DONE);
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, false, false) == DJ_ASSIST_ROLLBACK_DONE);
 
-	// Only the start-deck step was submitted (failed right after START_DECK,
-	// before LOCK_TEMPO/ENABLE_SYNC or CROSSFADE ever ran): mix and sync
-	// phases must both be skipped, landing directly on STOP_DECK.
-	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, true) == DJ_ASSIST_ROLLBACK_STOP_DECK);
+	// Only the start-deck step was submitted and plan-owned (failed right
+	// after START_DECK, before LOCK_TEMPO/ENABLE_SYNC or CROSSFADE ever
+	// ran): mix and sync phases must both be skipped, landing directly on
+	// STOP_DECK.
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, false, true) == DJ_ASSIST_ROLLBACK_STOP_DECK);
 
 	// Mix (crossfade) was submitted but sync/start-deck were not (e.g. a
 	// tempoLock=false, startAtBoundary=false plan that failed mid-ramp):
 	// only the MIX phase runs, then falls straight to DONE.
-	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, true, false, false) == DJ_ASSIST_ROLLBACK_MIX);
-	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, false, false) == DJ_ASSIST_ROLLBACK_DONE);
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, true, false, false, false) == DJ_ASSIST_ROLLBACK_MIX);
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, false, false, false) == DJ_ASSIST_ROLLBACK_DONE);
+}
+
+void testNextRollbackPhaseSkipsOwnershipWhenAlreadyInThatState(){
+	// The sync/start-deck steps were both submitted (buildSteps() always
+	// includes them), but the target deck was ALREADY playing/synced
+	// before the transition armed - those steps were idempotent no-ops the
+	// plan did not actually introduce, so rollback must skip straight from
+	// MIX to DONE without touching sync/playback state a user set up
+	// beforehand.
+	DjAssistRollbackPhase phase = nextRollbackPhase(
+		DJ_ASSIST_ROLLBACK_IDLE, /*crossfade*/true, /*manualMixOccurred*/false,
+		/*syncOwned*/false, /*startDeckOwned*/false
+	);
+	assert(phase == DJ_ASSIST_ROLLBACK_MIX);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, false, false, false);
+	assert(phase == DJ_ASSIST_ROLLBACK_DONE);
+}
+
+void testNextRollbackPhaseSkipsMixOnManualOverride(){
+	// A manual (non-system) mix change happened at any point after arming:
+	// the MIX phase must be skipped entirely, even though crossfade WAS
+	// submitted by the plan - restoring armedMix would silently overwrite
+	// the user's own action.
+	DjAssistRollbackPhase phase = nextRollbackPhase(
+		DJ_ASSIST_ROLLBACK_IDLE, /*crossfade*/true, /*manualMixOccurred*/true,
+		/*syncOwned*/true, /*startDeckOwned*/true
+	);
+	assert(phase == DJ_ASSIST_ROLLBACK_SYNC);
 }
 
 // -- evaluateCommandOutcome: exhaustive status -> outcome mapping ---------
@@ -190,56 +221,68 @@ void testEvaluateCommandOutcomeMapping(){
 	assert(evaluateCommandOutcome(DJ_COMMAND_PENDING) == DJ_ASSIST_COMMAND_WAIT);
 }
 
-// -- detectManualMixOverride: bounded scan, watermark, origin/type gating -
+// -- evaluateBoundaryArrival: tolerance window, never released late ------
 
-DjCommandResult makeResult(uint32_t id, DjCommandType type, DjCommandOrigin origin, DjCommandStatus status){
-	DjCommandResult result;
-	result.id = id;
-	result.type = type;
-	result.origin = origin;
-	result.status = status;
-	return result;
+void testEvaluateBoundaryArrivalNotYet(){
+	assert(evaluateBoundaryArrival(0, 1000) == DJ_ASSIST_BOUNDARY_NOT_YET);
+	assert(evaluateBoundaryArrival(999, 1000) == DJ_ASSIST_BOUNDARY_NOT_YET);
 }
 
-void testDetectManualMixOverrideFindsPostWatermarkNonSystemMix(){
-	DjCommandResult results[8] = {
-		makeResult(1, DJ_COMMAND_SET_MIX, DJ_ORIGIN_SYSTEM, DJ_COMMAND_APPLIED), // before watermark
-		makeResult(9, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED),   // after watermark, manual
-	};
-	assert(detectManualMixOverride(results, 2, /*watermarkId*/5));
+void testEvaluateBoundaryArrivalReachedWithinTolerance(){
+	// Exactly on target, and up to DJ_QUANTIZE_TOLERANCE_FRAMES past it,
+	// both count as reached.
+	assert(evaluateBoundaryArrival(1000, 1000) == DJ_ASSIST_BOUNDARY_REACHED);
+	assert(evaluateBoundaryArrival(1000 + DJ_QUANTIZE_TOLERANCE_FRAMES, 1000) == DJ_ASSIST_BOUNDARY_REACHED);
 }
 
-void testDetectManualMixOverrideIgnoresSystemOrigin(){
-	// A system-origin SET_MIX after the watermark is the transition's own
-	// crossfade ramp, not a manual override.
-	DjCommandResult results[1] = {
-		makeResult(10, DJ_COMMAND_SET_MIX, DJ_ORIGIN_SYSTEM, DJ_COMMAND_ACCEPTED),
-	};
-	assert(!detectManualMixOverride(results, 1, 5));
+void testEvaluateBoundaryArrivalMissedBeyondTolerance(){
+	assert(evaluateBoundaryArrival(1000 + DJ_QUANTIZE_TOLERANCE_FRAMES + 1, 1000) == DJ_ASSIST_BOUNDARY_MISSED);
+	assert(evaluateBoundaryArrival(1000000, 1000) == DJ_ASSIST_BOUNDARY_MISSED);
 }
 
-void testDetectManualMixOverrideIgnoresPreWatermarkAndOtherTypes(){
-	DjCommandResult results[3] = {
-		makeResult(3, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // before watermark
-		makeResult(11, DJ_COMMAND_SET_PLAYING, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // wrong type
-		makeResult(0, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // id 0 == empty slot
-	};
-	assert(!detectManualMixOverride(results, 3, 5));
+// -- phraseCacheNeedsRescan / updatePhraseCache: terminal-aware throttle -
+
+void testPhraseCacheNeedsRescanWhenEmpty(){
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	assert(phraseCacheNeedsRescan(cache, 0, 0, identity));
 }
 
-void testDetectManualMixOverrideIgnoresRejected(){
-	// A rejected manual mix command never actually took effect - it must
-	// not itself count as an override.
-	DjCommandResult results[1] = {
-		makeResult(9, DJ_COMMAND_SET_MIX, DJ_ORIGIN_PHYSICAL, DJ_COMMAND_REJECTED),
-	};
-	assert(!detectManualMixOverride(results, 1, 5));
+void testPhraseCacheDoesNotRescanBeforeFoundBoundaryPassed(){
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	updatePhraseCache(cache, /*deck*/0, /*currentFrame*/100, identity, /*found*/true, /*phraseFrame*/5000);
+	assert(!phraseCacheNeedsRescan(cache, 0, 200, identity)); // still well before 5000.
+	assert(!phraseCacheNeedsRescan(cache, 0, 4999, identity));
+	assert(phraseCacheNeedsRescan(cache, 0, 5000, identity)); // reached/passed - refresh.
 }
 
-void testDetectManualMixOverrideHandlesNullAndEmpty(){
-	assert(!detectManualMixOverride(nullptr, 0, 0));
-	DjCommandResult empty[8] = {};
-	assert(!detectManualMixOverride(empty, 8, 0));
+void testPhraseCacheDoesNotRescanTerminalJustBecauseStillTerminal(){
+	// No future phrase exists (terminal). Forward playback alone must
+	// NOT force a rescan - this is exactly the up-to-128-record-rescan-
+	// every-tick bug the cache exists to prevent.
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	updatePhraseCache(cache, 0, 1000, identity, /*found*/false, 0);
+	assert(!phraseCacheNeedsRescan(cache, 0, 1001, identity));
+	assert(!phraseCacheNeedsRescan(cache, 0, 50000, identity));
+}
+
+void testPhraseCacheRescansOnIdentityChangeOrDeckChange(){
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity a = fingerprintIdentity(1);
+	const DjTrackIdentity b = fingerprintIdentity(2);
+	updatePhraseCache(cache, 0, 1000, a, true, 5000);
+	assert(phraseCacheNeedsRescan(cache, 0, 1500, b)); // new track loaded on same deck.
+	assert(phraseCacheNeedsRescan(cache, 1, 1500, a)); // different deck entirely.
+}
+
+void testPhraseCacheRescansOnBackwardSeek(){
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	updatePhraseCache(cache, 0, 5000, identity, true, 9000);
+	assert(!phraseCacheNeedsRescan(cache, 0, 5500, identity)); // still forward, before cached target.
+	assert(phraseCacheNeedsRescan(cache, 0, 1000, identity)); // seeked backward.
 }
 
 } // namespace
@@ -253,11 +296,16 @@ int main(){
 	testCrossfadeMixOverflowGuard();
 	testNextRollbackPhaseFullSequence();
 	testNextRollbackPhaseSkipsUnsubmittedSteps();
+	testNextRollbackPhaseSkipsOwnershipWhenAlreadyInThatState();
+	testNextRollbackPhaseSkipsMixOnManualOverride();
 	testEvaluateCommandOutcomeMapping();
-	testDetectManualMixOverrideFindsPostWatermarkNonSystemMix();
-	testDetectManualMixOverrideIgnoresSystemOrigin();
-	testDetectManualMixOverrideIgnoresPreWatermarkAndOtherTypes();
-	testDetectManualMixOverrideIgnoresRejected();
-	testDetectManualMixOverrideHandlesNullAndEmpty();
+	testEvaluateBoundaryArrivalNotYet();
+	testEvaluateBoundaryArrivalReachedWithinTolerance();
+	testEvaluateBoundaryArrivalMissedBeyondTolerance();
+	testPhraseCacheNeedsRescanWhenEmpty();
+	testPhraseCacheDoesNotRescanBeforeFoundBoundaryPassed();
+	testPhraseCacheDoesNotRescanTerminalJustBecauseStillTerminal();
+	testPhraseCacheRescansOnIdentityChangeOrDeckChange();
+	testPhraseCacheRescansOnBackwardSeek();
 	return 0;
 }

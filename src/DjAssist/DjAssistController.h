@@ -4,6 +4,9 @@
 #include "DjAssistEngine.h"
 #include "DjAssistSessionBridge.h"
 
+#include <Sync/Mutex.h>
+#include <Util/Task.h>
+
 class DjSession;
 
 // Bounded, POD, browser/API/physical-bank-ready snapshot of Coach/transition
@@ -20,12 +23,14 @@ struct DjAssistSnapshot {
 
 // ESP32-coupled owner of the Coach/one-shot-transition engine. Builds the
 // bounded PSRAM candidate table from DjSession's already-indexed metadata
-// (never a fresh file read per scoring tick), advances the scan/suggestion
-// pipeline a bounded amount per DjSession::loop() tick, resolves boundary
-// hints from DjSession's grid/phrase accessors only when actually needed
-// (downbeats are cheap/in-memory and refreshed every tick; phrase lookups
-// are a bounded real SD read and are throttled - only refreshed once the
-// previously cached boundary has been passed), and drives the real
+// on a dedicated low-priority background Task (see fillWorkerStep()) so no
+// SD read ever happens on the DjSession::loop()/audio thread; advances the
+// scan/suggestion pipeline a bounded amount per DjSession::loop() tick over
+// the already-filled table, resolves boundary hints from DjSession's
+// grid/phrase accessors only when actually needed (downbeats are cheap/
+// in-memory and refreshed every tick; phrase lookups are a bounded real SD
+// read and are throttled by a terminal-aware cache - see
+// DjAssistBridge::DjAssistPhraseCacheState), and drives the real
 // Sync/quantize/mix primitives through a concrete DjAssistActuator.
 //
 // Deliberately validated only by the real firmware build, matching
@@ -40,10 +45,11 @@ public:
 	DjAssistController(const DjAssistController&) = delete;
 	DjAssistController& operator=(const DjAssistController&) = delete;
 
-	// Allocates the PSRAM candidate table and binds the actuator to
-	// `session`. Safe to call once, from DjSession's constructor. A failed
-	// PSRAM allocation disables the candidate table (suggestions/advice
-	// simply stay empty) without affecting the rest of the session.
+	// Allocates the PSRAM candidate table, binds the actuator to `session`,
+	// and starts the background fill task. Safe to call once, from
+	// DjSession's constructor. A failed PSRAM allocation disables the
+	// candidate table (suggestions/advice simply stay empty, and the fill
+	// task is never started) without affecting the rest of the session.
 	void begin(DjSession* session);
 	void end();
 
@@ -79,19 +85,30 @@ private:
 
 	DjAssistLibraryEntry* entries_ = nullptr;
 	uint16_t entryCapacity_ = 0;
-	uint16_t entryTotal_ = 0;
-	uint16_t scanCursor_ = 0;
 	bool allocationFailed_ = false;
 
-	// One-time (per library generation) bounded incremental fill of
-	// entries_[] from DjSession::assistTrackEntry(). Kept separate from
-	// scanCursor_ (the scoring pass) so scanTick() never sees `total`
-	// change mid-pass - a fresh scoring pass over entries_ only begins once
-	// the fill for the current generation has fully completed.
+	// Candidate-table fill state below this point is owned by the
+	// background fillTask_ (see fillWorkerStep()) and must only be touched
+	// while holding candidateMutex_ - this is what keeps the real,
+	// possibly SD-backed metadata read (assistTrackEntry()) off the main
+	// DjSession::loop() thread entirely. entries_[]/entryTotal_ are read
+	// by the main thread too (tickSuggestions()'s scanTick() call), always
+	// under the same lock.
+	Mutex candidateMutex_;
+	Task* fillTask_ = nullptr;
+	uint16_t entryTotal_ = 0;
 	uint32_t loadedGeneration_ = 0;
 	bool generationSeen_ = false;
 	uint16_t fillCursor_ = 0;
 	bool fillComplete_ = false;
+
+	// Main-thread-only mirror of the fill generation, used solely to
+	// notice (once per tick, via a single locked read) when a NEW
+	// generation's fill has completed so scanCursor_/suggestionCount_ are
+	// reset for the new table - never written by the background task.
+	uint32_t scanGeneration_ = 0;
+	bool scanGenerationSeen_ = false;
+	uint16_t scanCursor_ = 0;
 
 	DjAssistSuggestion suggestions_[DJ_ASSIST_MAX_SUGGESTIONS] = {};
 	uint8_t suggestionCount_ = 0;
@@ -102,9 +119,11 @@ private:
 	DjTrackIdentity lastDeckIdentity_[DJ_DECK_COUNT] = {};
 	bool lastDeckLoaded_[DJ_DECK_COUNT] = {};
 
-	uint8_t phraseHintDeck_ = 0xFF;
-	uint64_t phraseHintFrame_ = 0;
-	bool phraseHintValid_ = false;
+	// Main-thread-only (Coach advice and the transition's
+	// resolveWaitBoundaryReached() are mutually exclusive per mode, and
+	// both only ever run from tick(), never the background fill task) -
+	// see DjAssistBridge::DjAssistPhraseCacheState.
+	DjAssistBridge::DjAssistPhraseCacheState phraseCache_;
 
 	// WAIT_BOUNDARY capture-once state: the ONE target frame latched the
 	// first tick this step becomes current, compared against the live
@@ -114,11 +133,12 @@ private:
 	bool waitBoundaryCaptured_ = false;
 	uint64_t waitBoundaryTargetFrame_ = 0;
 
-	// Highest command result id observed at the moment the current
-	// transition armed. Any SET_MIX result with id above this and a
-	// non-system origin is a manual override that happened after arming -
-	// see DjAssistBridge::detectManualMixOverride().
-	uint32_t armWatermarkId_ = 0;
+	// DjSession's durable non-system-mix generation counter (see
+	// DjSession::assistNonSystemMixGeneration()), captured at the moment
+	// the current transition armed. Any later change - checked by simple
+	// inequality, never inferred from the bounded/evictable recentResults
+	// ring - means a manual mix action has occurred since arming.
+	uint32_t armedMixGeneration_ = 0;
 
 	// Controller-owned rollback state (see tickRollback()): advances one
 	// bounded actuator submit/poll per tick, exactly mirroring the forward
@@ -129,7 +149,9 @@ private:
 
 	DjAssistCoachAdvice lastAdvice_ = {};
 
-	void refreshCandidateTable();
+	static void fillTaskTrampoline(Task* task);
+	void fillWorkerStep();
+	bool candidateTableReady(uint32_t& outGeneration);
 	void updateRecentTracks(const DjSnapshot& snapshot);
 	DjAssistGuardSnapshot buildGuard(const DjSnapshot& snapshot) const;
 	DjAssistDeckContext buildDeckContext(const DjSnapshot& snapshot, uint8_t deck) const;

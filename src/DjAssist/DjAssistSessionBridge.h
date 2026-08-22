@@ -66,17 +66,29 @@ enum DjAssistRollbackPhase : uint8_t {
 	DJ_ASSIST_ROLLBACK_DONE
 };
 
-// Given the current rollback phase and which of this plan's side effects
-// were actually submitted (crossfade/sync/start-deck steps), returns the
-// next phase to attempt - skipping any phase with nothing to undo. Pure and
-// deterministic; the caller does the actual actuator submit/poll for
-// whichever phase this returns and re-normalizes after each completed
-// phase.
+// Given the current rollback phase, whether a manual (non-system) mix
+// change has occurred since arm, and whether the sync/start-deck steps were
+// both submitted AND actually plan-owned (i.e. the target deck was NOT
+// already in that state when the transition armed - see
+// DjAssistTransitionPlan::armedToPlaying/armedToSynced), returns the next
+// phase to attempt - skipping any phase with nothing to undo, or that would
+// clobber state the plan never introduced. Pure and deterministic; the
+// caller does the actual actuator submit/poll for whichever phase this
+// returns and re-normalizes after each completed phase.
+//
+// The MIX phase is unconditionally skipped once a manual mix change has
+// occurred: restoring armedMix over a user's own subsequent action would
+// silently overwrite it, which the caller must never do. The SYNC and
+// STOP_DECK phases are skipped whenever the corresponding step was never
+// submitted, OR the target deck was already in that state at arm time (an
+// idempotent no-op the plan did not actually introduce, so rollback must
+// not undo pre-existing user state).
 DjAssistRollbackPhase nextRollbackPhase(
 	DjAssistRollbackPhase phase,
 	bool crossfadeSubmitted,
-	bool syncSubmitted,
-	bool startDeckSubmitted
+	bool manualMixOccurred,
+	bool syncOwnedByPlan,
+	bool startDeckOwnedByPlan
 );
 
 // Outcome of polling a single in-flight command's status - used by both the
@@ -94,16 +106,65 @@ enum DjAssistCommandOutcome : uint8_t {
 };
 DjAssistCommandOutcome evaluateCommandOutcome(DjCommandStatus status);
 
-// True when a bounded scan of the most recent command results (the
-// existing DJ_RECENT_RESULT_COUNT ring, never a fresh history scan) finds a
-// SET_MIX command from a non-system origin (physical/browser) with an id
-// greater than `watermarkId` - i.e. submitted after the transition armed.
-// A programmatic crossfade must not silently overwrite this on its next
-// ramp tick; see DjAssistGuardSnapshot::manualMixOverride.
-bool detectManualMixOverride(
-	const DjCommandResult* recentResults,
-	uint8_t resultCount,
-	uint32_t watermarkId
+// Result of comparing a live position against a captured WAIT_BOUNDARY
+// target using the established quantize tolerance
+// (DJ_QUANTIZE_TOLERANCE_FRAMES, DjBeatEngine.h) - the same "one audio
+// output block" window already used for quantize scheduling elsewhere, so a
+// boundary is never treated as reached arbitrarily late.
+enum DjAssistBoundaryArrival : uint8_t {
+	DJ_ASSIST_BOUNDARY_NOT_YET,
+	DJ_ASSIST_BOUNDARY_REACHED,
+	DJ_ASSIST_BOUNDARY_MISSED
+};
+
+// Pure arrival decision for a captured WAIT_BOUNDARY target: NOT_YET while
+// still approaching, REACHED once at or within tolerance past the target,
+// or MISSED once more than tolerance has elapsed past it - in which case
+// the caller must re-capture the next boundary ahead of currentFrame rather
+// than ever releasing on a stale, long-passed target.
+DjAssistBoundaryArrival evaluateBoundaryArrival(uint64_t currentFrame, uint64_t targetFrame);
+
+// Cached result of a (possibly SD-backed) phrase lookup for one deck, used
+// to throttle DjAssistController::resolveBoundary() so it does not rescan
+// up to the metadata reader's whole phrase table every tick. `terminal`
+// records a confirmed "no future phrase exists for this identity/position"
+// result so that case is cached too, not just a found boundary - without
+// this, a track nearing its end (no phrase left ahead) would trigger a
+// full rescan every single tick.
+struct DjAssistPhraseCacheState {
+	uint8_t deck = 0xFF; // 0xFF = unset/never cached
+	bool valid = false;
+	bool terminal = false;
+	uint64_t frame = 0;       // cached phrase frame, only meaningful if valid && !terminal
+	uint64_t lastFrame = 0;   // playback position at last (re)cache, to detect backward seeks
+	DjTrackIdentity identity = {};
+};
+
+// True when the cache must be refreshed via a real lookup rather than
+// reused: no cache yet for this deck, the loaded identity changed, playback
+// seeked backward (lastFrame > currentFrame), or a previously *found*
+// cached boundary has now been passed (currentFrame >= cached frame). A
+// cached *terminal* ("no future phrase") result is deliberately NOT
+// rescanned just because it is still terminal, and is not invalidated by
+// forward playback alone - only by an identity change or a backward seek.
+// The caller performs the actual lookup and calls updatePhraseCache() with
+// the result whenever this returns true.
+bool phraseCacheNeedsRescan(
+	const DjAssistPhraseCacheState& cache,
+	uint8_t deck,
+	uint64_t currentFrame,
+	const DjTrackIdentity& identity
+);
+
+// Records the outcome of a (possibly skipped) phrase lookup into the cache.
+// Pure/no I/O - the caller already performed the real lookup, if any.
+void updatePhraseCache(
+	DjAssistPhraseCacheState& cache,
+	uint8_t deck,
+	uint64_t currentFrame,
+	const DjTrackIdentity& identity,
+	bool found,
+	uint64_t phraseFrame
 );
 
 } // namespace DjAssistBridge

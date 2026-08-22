@@ -421,6 +421,35 @@ void testArmRequiresValidPreconditions(){
 	assert(!engine.armTransition(0, 0, 5, target, 16, true, true, badBeats)); // same deck
 }
 
+// arm() must capture the toDeck's playing/sync baseline *at arm time* so
+// rollback can later tell an idempotent no-op (target already
+// playing/synced before this plan armed) apart from a mutation the plan
+// itself introduced - see DjAssistTransitionPlan::armedToPlaying/armedToSynced.
+void testArmTransitionCapturesToDeckBaseline(){
+	DjTrackIdentity target = fingerprintIdentity(1);
+
+	// Target deck idle/not synced at arm time: baseline false/false.
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+		assert(!engine.plan().armedToPlaying);
+		assert(!engine.plan().armedToSynced);
+	}
+
+	// Target deck already playing and already sync-active at arm time:
+	// baseline must reflect both true/true.
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		guard.deckPlaying[1] = true;
+		guard.syncActive[1] = true;
+		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+		assert(engine.plan().armedToPlaying);
+		assert(engine.plan().armedToSynced);
+	}
+}
+
 void testTransitionHappyPath(){
 	DjAssistEngine engine;
 	FakeActuator actuator;
@@ -561,13 +590,13 @@ void testTransitionManualOverride(){
 	}
 
 	// Manual mix override observed via the controller-set guard flag (a
-	// bounded scan of recent command results finding a non-system SET_MIX
-	// submitted after arming - see DjAssistBridge::detectManualMixOverride())
-	// must abort immediately. Unlike the plain mix-threshold check above,
-	// this one is NOT skipped once the crossfade step has been submitted -
-	// that is exactly the gap the review flagged (a manual override during
-	// an active programmatic ramp must not be silently overwritten by the
-	// next system tick).
+	// durable comparison of DjSession's monotonic non-system-mix generation
+	// counter against the value captured at arm() time - see
+	// DjSession::assistNonSystemMixGeneration()) must abort immediately.
+	// Unlike the plain mix-threshold check above, this one is NOT skipped
+	// once the crossfade step has been submitted - that is exactly the gap
+	// the review flagged (a manual override during an active programmatic
+	// ramp must not be silently overwritten by the next system tick).
 	{
 		DjAssistEngine engine;
 		FakeActuator actuator;
@@ -790,6 +819,7 @@ int main(){
 	testMergeSuggestionExcludedRemovesStaleEntry();
 	testCrossfadeCurveAndOverflowGuards();
 	testArmRequiresValidPreconditions();
+	testArmTransitionCapturesToDeckBaseline();
 	testTransitionHappyPath();
 	testTransitionWaitsForAppliedResult();
 	testTransitionCancel();
