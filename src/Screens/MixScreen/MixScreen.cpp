@@ -27,6 +27,10 @@ MixScreen::MixScreen::MixScreen(Display& display) : Context(display),
 		effectElements[i] = new EffectElement(rightLayout, true);
 	}
 
+	session = DjSession::begin(
+			InputJayD::getInstance()->getPotValue(POT_L),
+			InputJayD::getInstance()->getPotValue(POT_R),
+			InputJayD::getInstance()->getPotValue(POT_MID));
 	instance = this;
 	buildUI();
 	MixScreen::pack();
@@ -34,10 +38,9 @@ MixScreen::MixScreen::MixScreen(Display& display) : Context(display),
 
 MixScreen::MixScreen::~MixScreen(){
 	instance = nullptr;
-	if(system){
-		system->stop();
-		delete system;
-		system = nullptr;
+	if(session && session == DjSession::get()){
+		DjSession::end();
+		session = nullptr;
 	}
 	free(selectedBackgroundBuffer);
 }
@@ -113,6 +116,7 @@ void MixScreen::MixScreen::saveRecording(){
 
 void MixScreen::MixScreen::returned(void* data){
 	String* filename = (String*) data;
+	songListOpen = false;
 
 	if(doneRecording){
 		saveFilename = String("/") + *filename + ".aac";
@@ -120,35 +124,73 @@ void MixScreen::MixScreen::returned(void* data){
 		return;
 	}
 
-	fs::File file = SD.open(*filename);
-	loadChannel(loadingChannel, file);
+	session->setGain(0, InputJayD::getInstance()->getPotValue(POT_L), DJ_ORIGIN_LOCAL_UI);
+	session->setGain(1, InputJayD::getInstance()->getPotValue(POT_R), DJ_ORIGIN_LOCAL_UI);
+	if(!loadChannel(loadingChannel, *filename)){
+		Serial.println("MixScreen: load command rejected");
+	}
 	delete filename;
 }
 
-bool MixScreen::MixScreen::loadChannel(uint8_t channel, const fs::File& file){
-	if(channel >= 2 || !file) return false;
-
-	if(system){
-		if(!system->openChannel(channel, file)) return false;
-
-		SongSeekBar* bar = channel == 0 ? leftSeekBar : rightSeekBar;
-		SongName* nameLabel = channel == 0 ? leftSongName : rightSongName;
-
-		String name = file.name();
-		nameLabel->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
-		bar->setCurrentDuration(0);
-		bar->setPlaying(true);
-		nameLabel->checkScrollUpdate();
-		drawQueued = true;
-	}
-
-	fs::File& slot = channel == 0 ? f1 : f2;
-	slot = file;
-	return true;
+bool MixScreen::MixScreen::loadChannel(uint8_t channel, const String& path){
+	if(!session) return false;
+	return session->loadDeck(channel, path.c_str(), DJ_ORIGIN_LOCAL_UI).accepted();
 }
 
 void MixScreen::MixScreen::setBigVuStarted(bool bigVuStarted){
 	MixScreen::bigVuStarted = bigVuStarted;
+}
+
+bool MixScreen::MixScreen::syncFromSnapshot(const DjSnapshot& snapshot, bool force){
+	bool changed = force;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		const DjDeckSnapshot& deckSnapshot = snapshot.decks[deck];
+		SongSeekBar* bar = deck == 0 ? leftSeekBar : rightSeekBar;
+		SongName* nameLabel = deck == 0 ? leftSongName : rightSongName;
+
+		if(force || strcmp(displayedPaths[deck], deckSnapshot.path) != 0){
+			memcpy(displayedPaths[deck], deckSnapshot.path, DJ_PATH_CAPACITY);
+			String name = deckSnapshot.path;
+			const int slash = name.lastIndexOf('/');
+			const int end = name.endsWith(".aac") ? name.length() - 4 : name.length();
+			nameLabel->setSongName(name.substring(slash + 1, end));
+			nameLabel->checkScrollUpdate();
+			changed = true;
+		}
+
+		if(bar->getTotalDuration() != deckSnapshot.duration){
+			bar->setTotalDuration(deckSnapshot.duration);
+			changed = true;
+		}
+		if(seekTime == 0 || seekChannel != deck){
+			if(bar->getCurrentDuration() != deckSnapshot.elapsed){
+				bar->setCurrentDuration(deckSnapshot.elapsed);
+				changed = true;
+			}
+			if(bar->isPlaying() != deckSnapshot.playing){
+				bar->setPlaying(deckSnapshot.playing);
+				changed = true;
+			}
+		}
+
+		for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
+			EffectElement* element = effectElements[deck * DJ_EFFECT_SLOT_COUNT + slot];
+			const EffectType type = static_cast<EffectType>(deckSnapshot.effects[slot].type);
+			if(force || element->getType() != type){
+				element->setType(type);
+				changed = true;
+			}
+			if(element->getIntensity() != deckSnapshot.effects[slot].intensity){
+				element->setIntensity(deckSnapshot.effects[slot].intensity);
+				changed = true;
+			}
+		}
+	}
+	if(isRecording != snapshot.recording){
+		isRecording = snapshot.recording;
+		changed = true;
+	}
+	return changed;
 }
 
 void MixScreen::MixScreen::start(){
@@ -159,88 +201,25 @@ void MixScreen::MixScreen::start(){
 		saveRecording();
 	}
 
-
-	if(!f1 && !f2){
+	if(!session) return;
+	DjSnapshot snapshot;
+	session->copySnapshot(snapshot);
+	const bool hasTarget = snapshot.decks[0].path[0] != '\0' || snapshot.decks[1].path[0] != '\0';
+	if(!hasTarget && !session->hasPendingLoad()){
 		loadingChannel = 0;
+		songListOpen = true;
 		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
 		return;
 	}
 
-	if(f1){
-		String name = f1.name();
-		leftSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
-	}
-	if(f2){
-		String name = f2.name();
-		rightSongName->setSongName(name.substring(name.lastIndexOf('/') + 1, name.length() - 4));
-	}
-
-	if(system){
-		leftSeekBar->setTotalDuration(system->getDuration(0));
-		rightSeekBar->setTotalDuration(system->getDuration(1));
-		leftSeekBar->setPlaying(!system->isChannelPaused(0));
-		rightSeekBar->setPlaying(!system->isChannelPaused(1));
-
-		if(bigVuStarted) startBigVu();
-		LoopManager::addListener(&leftVu);
-		LoopManager::addListener(&rightVu);
-		LoopManager::addListener(this);
-		Input.addListener(this);
-		InputJayD::getInstance()->addListener(this);
-
-		draw();
-		screen.commit();
-		return;
-	}
-
-	system = new MixSystem();
-	if(f1) system->openChannel(0, f1);
-	if(f2) system->openChannel(1, f2);
-
-	system->setVolume(0, InputJayD::getInstance()->getPotValue(POT_L));
-	system->setVolume(1, InputJayD::getInstance()->getPotValue(POT_R));
-
-	system->setChannelInfo(0, leftVu.getInfoGenerator());
-	system->setChannelInfo(1, rightVu.getInfoGenerator());
-	system->setChannelInfo(2, midVu.getInfoGenerator());
+	session->attachView(leftVu.getInfoGenerator(), rightVu.getInfoGenerator(), midVu.getInfoGenerator());
+	syncFromSnapshot(snapshot, true);
 	if(bigVuStarted){
 		startBigVu();
 	}
 
-	uint8_t potMidVal = f1 && f2
-		? InputJayD::getInstance()->getPotValue(POT_MID)
-		: (f1 ? 0 : 255);
-	system->setMix(potMidVal);
-	matrixManager.fillMatrixMid(potMidVal);
+	matrixManager.fillMatrixMid(snapshot.mix);
 	matrixManager.matrixMid.push();
-
-	leftSeekBar->setTotalDuration(system->getDuration(0));
-	rightSeekBar->setTotalDuration(system->getDuration(1));
-
-	leftSeekBar->setPlaying(true);
-	rightSeekBar->setPlaying(true);
-
-
-	leftSongName->checkScrollUpdate();
-	rightSongName->checkScrollUpdate();
-
-	for(int i = 0; i < 6; i++){
-		effectElements[i]->setType(NONE);
-		effectElements[i]->setIntensity(0);
-	}
-
-	/*system->setChannelDoneCallback(0, [](){
-		instance->system->resumeChannel(0);
-	});
-	system->setChannelDoneCallback(1, [](){
-		instance->system->resumeChannel(1);
-	});*/
-
-
-	Serial.printf("System constructed. Heap: %u B, PSRAM: %u B\n", ESP.getFreeHeap(), ESP.getFreePsram());
-	system->start();
-	delay(1);
-	Serial.printf("System started. Heap: %u B, PSRAM: %u B\n", ESP.getFreeHeap(), ESP.getFreePsram());
 
 	LoopManager::addListener(&leftVu);
 	LoopManager::addListener(&rightVu);
@@ -261,6 +240,7 @@ void MixScreen::MixScreen::stop(){
 
 	Input.removeListener(this);
 	InputJayD::getInstance()->removeListener(this);
+	if(session) session->detachView();
 
 	if(bigVuStarted){
 		stopBigVu();
@@ -269,13 +249,6 @@ void MixScreen::MixScreen::stop(){
 			delete *matrixManager.matrixBig.getAnimations().begin();
 		}
 	}
-
-	if(system && !keepSystemOnStop){
-		system->stop();
-		delete system;
-		system = nullptr;
-	}
-	keepSystemOnStop = false;
 
 }
 
@@ -360,10 +333,10 @@ void MixScreen::MixScreen::loop(uint micros){
 	if(seekTime != 0 && millis() - seekTime >= 100){
 		SongSeekBar* bar = seekChannel ? rightSeekBar : leftSeekBar;
 
-		system->seekChannel(seekChannel, bar->getCurrentDuration());
+		session->seek(seekChannel, bar->getCurrentDuration(), DJ_ORIGIN_PHYSICAL);
 
 		if(wasRunning){
-			system->resumeChannel(seekChannel);
+			session->setPlaying(seekChannel, true, DJ_ORIGIN_PHYSICAL);
 		}
 
 		seekChannel = -1;
@@ -375,43 +348,16 @@ void MixScreen::MixScreen::loop(uint micros){
 		update |= element->needsUpdate();
 	}
 
-	if(system && system->getDuration(0) != leftSeekBar->getTotalDuration()){
-		leftSeekBar->setTotalDuration(system->getDuration(0));
-		update = true;
-	}
-
-	if(system && system->getDuration(1) != rightSeekBar->getTotalDuration()){
-		rightSeekBar->setTotalDuration(system->getDuration(1));
-		update = true;
-	}
-
-	if(system && system->getElapsed(0) != leftSeekBar->getCurrentDuration()){
-		if(seekTime == 0 || seekChannel != 0){
-			leftSeekBar->setCurrentDuration(system->getElapsed(0));
-			update = true;
+	DjSnapshot snapshot;
+	if(session && session->copySnapshot(snapshot)){
+		update |= syncFromSnapshot(snapshot);
+		const bool hasTarget = snapshot.decks[0].path[0] != '\0' || snapshot.decks[1].path[0] != '\0';
+		if(!hasTarget && !songListOpen && !session->hasPendingLoad()){
+			loadingChannel = 0;
+			songListOpen = true;
+			(new SongList::SongList(*getScreen().getDisplay()))->push(this);
+			return;
 		}
-	}
-
-	if(system && system->getElapsed(1) != rightSeekBar->getCurrentDuration()){
-		if(seekTime == 0 || seekChannel != 1){
-			rightSeekBar->setCurrentDuration(system->getElapsed(1));
-			update = true;
-		}
-	}
-
-	if(system && system->isRecording() != isRecording){
-		isRecording = system->isRecording();
-		update = true;
-	}
-
-	if(system && system->isChannelPaused(0) != !leftSeekBar->isPlaying() && seekTime == 0){
-		leftSeekBar->setPlaying(!system->isChannelPaused(0));
-		update = true;
-	}
-
-	if(system && system->isChannelPaused(1) != !rightSeekBar->isPlaying() && seekTime == 0){
-		rightSeekBar->setPlaying(!system->isChannelPaused(1));
-		update = true;
 	}
 
 	bool songNameUpdateL = leftSongName->checkScrollUpdate();
@@ -432,13 +378,13 @@ void MixScreen::MixScreen::loop(uint micros){
 
 void MixScreen::MixScreen::potMove(uint8_t id, uint8_t value){
 	if(id == POT_MID){
-		system->setMix(value);
+		session->setMix(value, DJ_ORIGIN_PHYSICAL);
 		matrixManager.fillMatrixMid(value);
 		matrixManager.matrixMid.push();
 	}else if(id == POT_L){
-		system->setVolume(0, value);
+		session->setGain(0, value, DJ_ORIGIN_PHYSICAL);
 	}else if(id == POT_R){
-		system->setVolume(1, value);
+		session->setGain(1, value, DJ_ORIGIN_PHYSICAL);
 	}
 }
 
@@ -451,17 +397,22 @@ void MixScreen::MixScreen::stopBigVu(){
 }
 
 void MixScreen::MixScreen::encTwoBot(){
-	if(system->isRecording()){
-		system->stopRecording();
+	if(isRecording){
+		if(!session->setRecording(false, DJ_ORIGIN_PHYSICAL).accepted()) return;
 		doneRecording = true;
 
 		(new TextInputScreen::TextInputScreen(*screen.getDisplay()))->push(this);
 	}else{
-		system->startRecording();
+		session->setRecording(true, DJ_ORIGIN_PHYSICAL);
 	}
 }
 
 void MixScreen::MixScreen::encTwoTop(){
+	if(session){
+		session->detachView();
+		DjSession::end();
+		session = nullptr;
+	}
 	pop();
 }
 
@@ -475,13 +426,9 @@ void MixScreen::MixScreen::btnCombination(){
 
 void MixScreen::MixScreen::btn(uint8_t i){
 	SongSeekBar* bar = i == 0 ? leftSeekBar : rightSeekBar;
-	if(bar->isPlaying()){
-		system->pauseChannel(i);
-	}else{
-		system->resumeChannel(i);
-	}
-
-	bar->setPlaying(!bar->isPlaying());
+	const bool playing = !bar->isPlaying();
+	if(!session->setPlaying(i, playing, DJ_ORIGIN_PHYSICAL).accepted()) return;
+	bar->setPlaying(playing);
 
 	drawQueued = true;
 }
@@ -502,17 +449,18 @@ void MixScreen::MixScreen::btnEnc(uint8_t i){
 void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 
 	if(index == 6){
-		if(!system->hasChannel(selectedChannel)) return;
+		DjSnapshot snapshot;
+		if(!session->copySnapshot(snapshot) || !snapshot.decks[selectedChannel].loaded) return;
 		if(seekTime == 0){
 			seekChannel = selectedChannel;
-			wasRunning = !system->isChannelPaused(selectedChannel);
-			system->pauseChannel(selectedChannel);
+			wasRunning = snapshot.decks[selectedChannel].playing;
+			session->setPlaying(selectedChannel, false, DJ_ORIGIN_PHYSICAL);
 		}
 
 		seekTime = millis();
 
 		SongSeekBar* bar = seekChannel ? rightSeekBar : leftSeekBar;
-		uint16_t seekTime = constrain( bar->getCurrentDuration() + value, 0, system->getDuration(selectedChannel));
+		uint16_t seekTime = constrain(bar->getCurrentDuration() + value, 0, bar->getTotalDuration());
 		bar->setCurrentDuration(seekTime);
 
 		drawQueued = true;
@@ -547,21 +495,17 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 			}
 		}
 
-		if(element->getType() == EffectType::SPEED){
-			system->removeSpeed(index >= 3);
-		}
-
 		EffectType type = static_cast<EffectType>(e);
+		const uint8_t deck = index >= 3;
+		const uint8_t slot = index % 3;
+		if(!session->setEffectType(deck, slot, type, DJ_ORIGIN_PHYSICAL).accepted()) return;
 		element->setType(type);
 		element->setIntensity(0);
 
 		if(type == EffectType::SPEED){
-			system->addSpeed(index >= 3);
 			element->setIntensity(255 / 2);
 			return;
 		}
-
-		system->setEffect(index >= 3, index < 3 ? index : index - 3, type);
 	}else{
 		EffectType type = element->getType();
 		if(type == EffectType::NONE) return;
@@ -570,13 +514,8 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 		intensity = max((int16_t) 0, intensity);
 		intensity = min((int16_t) 255, intensity);
 
+		if(!session->setEffectIntensity(index >= 3, index % 3, intensity, DJ_ORIGIN_PHYSICAL).accepted()) return;
 		element->setIntensity(intensity);
-
-		if(type == EffectType::SPEED){
-			system->setSpeed(index >= 3, intensity);
-		}else{
-			system->setEffectIntensity(index >= 3, index < 3 ? index : index - 3, element->getIntensity());
-		}
 	}
 
 	drawQueued = true;
@@ -585,7 +524,7 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 void MixScreen::MixScreen::encBtnHold(uint8_t i){
 	if(i == 6){
 		loadingChannel = selectedChannel;
-		keepSystemOnStop = true;
+		songListOpen = true;
 		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
 		return;
 	}
