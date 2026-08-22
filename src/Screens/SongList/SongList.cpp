@@ -1025,5 +1025,3 @@ void SongList::SongList::updateBrowseResult(){
 		}
 	}
 }
-
-}
