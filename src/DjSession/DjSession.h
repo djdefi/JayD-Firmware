@@ -35,6 +35,9 @@ public:
 	DjSubmitResult loopReloop(uint8_t deck, DjCommandOrigin origin);
 	// masterDeck: -1 requests auto-master (the other deck); otherwise an explicit deck index.
 	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin);
+	DjSubmitResult setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
+	DjSubmitResult triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
+	DjSubmitResult clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -60,6 +63,7 @@ private:
 	static DjSession* instance;
 	static uint64_t bootId;
 	static uint32_t sessionCounter;
+	static bool orphanRecoveryDone;
 
 	MixSystem* system = nullptr;
 	fs::File files[DJ_DECK_COUNT];
@@ -67,7 +71,7 @@ private:
 	uint8_t gains[DJ_DECK_COUNT] = { 255, 255 };
 	uint8_t mix = 127;
 	DjEffectState effectState;
-	bool recordingRequested = false;
+	DjCueState cues;
 	bool ending = false;
 	bool viewAttached = false;
 	InfoGenerator* viewInfo[3] = {};
@@ -99,13 +103,24 @@ private:
 	int8_t syncMasterDeck[DJ_DECK_COUNT] = { -1, -1 }; // -1 = auto (the other deck)
 	DjCommandError syncLastError[DJ_DECK_COUNT] = {};
 
+	DjRecordingSnapshot recordingSnapshot;
+	DjRecordingState lastRecordingState = DJ_RECORDING_IDLE;
+	// Set to the specific storage-layer error when finalizeRecording() fails
+	// (naming space exhausted vs. rename I/O failure); DJ_RECORDING_ERROR_NONE
+	// otherwise. Overrides a library-reported success once set.
+	DjRecordingError finalizeError = DJ_RECORDING_ERROR_NONE;
+
 	DjCommandError validate(const DjCommand& command) const;
+	bool hasDeck(uint8_t deck) const;
 	bool apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics);
 	bool applyLoad(const DjCommand& command, DjCommandError& error);
 	bool buildGrid(uint8_t deck);
 	uint8_t resolveMasterDeck(uint8_t followerDeck) const;
 	void tickLoops();
 	void tickSync();
+	void pollRecording();
+	static DjRecordingState mapRecordingState(RecordingState state);
+	static DjRecordingError mapRecordingError(RecordingError error);
 	DjMetadataState resolveMetadata(
 		const char* path,
 		uint32_t generation,

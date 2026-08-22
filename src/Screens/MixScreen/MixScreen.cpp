@@ -5,7 +5,7 @@
 #include <FS/CompressedFile.h>
 #include "MixScreen.h"
 #include "../SongList/SongList.h"
-#include "../TextInputScreen/TextInputScreen.h"
+#include "../Settings/SettingsScreen.h"
 #include "../../Fonts.h"
 
 MixScreen::MixScreen* MixScreen::MixScreen::instance = nullptr;
@@ -65,64 +65,11 @@ void MixScreen::MixScreen::unpack(){
 	bgFile.close();
 }
 
-void MixScreen::MixScreen::saveRecording(){
-	if(!SD.exists(MixSystem::recordPath)){
-		doneRecording = false;
-		return;
-	}
-
-	Task saveTask("MixSave", [](Task* task){
-		String saveFilename = * (String*) task->arg;
-
-		if(SD.exists(saveFilename)){
-			SD.remove(saveFilename);
-		}
-
-		File inFile = SD.open(MixSystem::recordPath);
-		File outFile = SD.open(saveFilename, "w");
-
-		SourceWAV input(inFile);
-		OutputAAC output(outFile);
-
-		output.setSource(&input);
-		output.start();
-
-		while(output.isRunning()){
-			output.loop(0);
-		}
-
-		output.stop();
-		input.close();
-
-		inFile.close();
-		outFile.close();
-	}, 8 * 1024, &saveFilename);
-
-	saveTask.start(1, 0);
-
-	while(!saveTask.isStopped()){
-		if(millis() - lastDraw >= 30){
-			lastDraw = millis();
-			drawSaveStatus();
-			screen.commit();
-		}
-
-		Sched.loop(0);
-	}
-
-	SD.remove(MixSystem::recordPath);
-	doneRecording = false;
-}
-
 void MixScreen::MixScreen::returned(void* data){
+	songListOpen = false;
+	if(data == nullptr) return;
 	String* filename = (String*) data;
 	songListOpen = false;
-
-	if(doneRecording){
-		saveFilename = String("/") + *filename + ".aac";
-		delete filename;
-		return;
-	}
 
 	session->setGain(0, InputJayD::getInstance()->getPotValue(POT_L), DJ_ORIGIN_LOCAL_UI);
 	session->setGain(1, InputJayD::getInstance()->getPotValue(POT_R), DJ_ORIGIN_LOCAL_UI);
@@ -131,6 +78,7 @@ void MixScreen::MixScreen::returned(void* data){
 	}
 	delete filename;
 }
+
 
 bool MixScreen::MixScreen::loadChannel(uint8_t channel, const String& path){
 	if(!session) return false;
@@ -186,29 +134,81 @@ bool MixScreen::MixScreen::syncFromSnapshot(const DjSnapshot& snapshot, bool for
 			}
 		}
 	}
-	if(isRecording != snapshot.recording){
-		isRecording = snapshot.recording;
+	if(recordingState != snapshot.recordingInfo.state){
+		recordingState = snapshot.recordingInfo.state;
 		changed = true;
+		switch(recordingState){
+			case DJ_RECORDING_STARTING:
+				statusText = "STARTING RECORDING...";
+				statusUntil = millis() + 2500;
+				break;
+			case DJ_RECORDING_ACTIVE:
+				statusText = "RECORDING";
+				statusUntil = millis() + 1500;
+				break;
+			case DJ_RECORDING_STOPPING:
+				statusText = "FINALIZING RECORDING...";
+				statusUntil = millis() + 2500;
+				break;
+			case DJ_RECORDING_COMPLETE:
+				statusText = snapshot.recordingInfo.valid ? "RECORDING SAVED" : "RECORDING INVALID";
+				statusUntil = millis() + 3000;
+				break;
+			case DJ_RECORDING_FAILED:
+				statusText = recordingErrorText(snapshot.recordingInfo.error);
+				statusUntil = millis() + 3000;
+				break;
+			default:
+				break;
+		}
 	}
 	return changed;
 }
 
-void MixScreen::MixScreen::start(){
-	if(doneRecording){
-		lastDraw = 0;
-		draw();
-		screen.commit();
-		saveRecording();
+void MixScreen::MixScreen::processCommandResults(const DjSnapshot& snapshot){
+	for(const auto& result : snapshot.recentResults){
+		if(result.id == 0 || result.status == DJ_COMMAND_ACCEPTED || resultHandled(result.id)) continue;
+		markResultHandled(result.id);
+		if(result.status == DJ_COMMAND_FAILED || result.status == DJ_COMMAND_REJECTED){
+			showCommandError(result.error);
+		}
 	}
+}
+
+bool MixScreen::MixScreen::resultHandled(uint32_t id) const{
+	for(const uint32_t handled : handledResults){
+		if(handled == id) return true;
+	}
+	return false;
+}
+
+void MixScreen::MixScreen::markResultHandled(uint32_t id){
+	handledResults[handledResultNext] = id;
+	handledResultNext = (handledResultNext + 1) % DJ_RECENT_RESULT_COUNT;
+}
+
+void MixScreen::MixScreen::openBrowse(){
+	if(songListOpen || !session) return;
+	songListOpen = true;
+	browseWasOpened = true;
+	(new SongList::SongList(*getScreen().getDisplay(), session))->push(this);
+}
+
+void MixScreen::MixScreen::start(){
+	songListOpen = false;
 
 	if(!session) return;
 	DjSnapshot snapshot;
 	session->copySnapshot(snapshot);
+	for(const auto& result : snapshot.recentResults){
+		if(result.id && result.status != DJ_COMMAND_ACCEPTED) markResultHandled(result.id);
+	}
+
 	const bool hasTarget = snapshot.decks[0].path[0] != '\0' || snapshot.decks[1].path[0] != '\0';
-	if(!hasTarget && !session->hasPendingLoad()){
+	if(!hasTarget && !browseWasOpened && !session->hasPendingLoad()){
 		loadingChannel = 0;
-		songListOpen = true;
-		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
+		controls.bank = MIX_BANK_BROWSE;
+		openBrowse();
 		return;
 	}
 
@@ -262,30 +262,235 @@ void MixScreen::MixScreen::draw(){
 		screen.getSprite()->drawIcon(selectedBackgroundBuffer, screen.getTotalX() + 81, screen.getTotalY(), 79, 128, 1, TFT_TRANSPARENT);
 	}
 
-	if(isRecording){
+	if(recordingState == DJ_RECORDING_ACTIVE){
 		screen.getSprite()->fillCircle(79, 64, 6, TFT_BLACK);
 		screen.getSprite()->fillCircle(79, 64, 4, TFT_RED);
+	}else if(recordingState == DJ_RECORDING_STARTING || recordingState == DJ_RECORDING_STOPPING){
+		screen.getSprite()->fillCircle(79, 64, 6, TFT_BLACK);
+		screen.getSprite()->fillCircle(79, 64, 4, TFT_ORANGE);
 	}
 	screen.draw();
 
-	if(doneRecording){
-		drawSaveStatus();
+	if(controls.bank == MIX_BANK_MIX){
+		drawMixLabels();
+	}else if(controls.bank == MIX_BANK_CUES){
+		drawCueBank();
+	}else if(controls.bank == MIX_BANK_LOOPSYNC){
+		drawLoopSyncBank();
+	}else{
+		drawBrowseBank();
+	}
+	if(controls.paletteOpen) drawPalette();
+	drawStatus();
+}
+
+void MixScreen::MixScreen::drawMixLabels(){
+	Sprite* canvas = screen.getSprite();
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextDatum(TC_DATUM);
+	canvas->fillRect(0, 0, 160, 13, TFT_BLACK);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->drawString(selectedChannel == 0 ? "MIX | SELECTED DECK A" : "MIX | SELECTED DECK B", 80, 2);
+
+	static const char* names[] = { "OFF", "SPD", "LPF", "HPF", "RVB", "BIT" };
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
+			const uint8_t index = deck * DJ_EFFECT_SLOT_COUNT + slot;
+			EffectElement* effect = effectElements[index];
+			char label[16];
+			snprintf(label, sizeof(label), "%u %s %s %u", slot + 1, names[effect->getType()],
+					 effect->isSelected() ? "TYPE" : "AMT", effect->getIntensity());
+			const int16_t x = deck == 0 ? 2 : 83;
+			const int16_t y = 47 + slot * 25;
+			canvas->fillRect(x, y, 75, 10, TFT_BLACK);
+			canvas->setTextColor(TFT_WHITE);
+			canvas->setTextDatum(TL_DATUM);
+			canvas->drawString(label, x + 2, y + 1);
+		}
+	}
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::drawCueBank(){
+	DjSnapshot snapshot;
+	if(!session || !session->copySnapshot(snapshot)) return;
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextDatum(TC_DATUM);
+	canvas->setTextColor(TFT_WHITE);
+	char header[30];
+	const uint8_t cueEnd = controls.cuePage == 2 ? 8 : controls.cuePage * 3 + 3;
+	snprintf(header, sizeof(header), "CUES %u-%u | SELECTED %c", controls.cuePage * 3 + 1,
+			 cueEnd, selectedChannel ? 'B' : 'A');
+	canvas->drawString(header, 80, 2);
+
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		const int16_t x = deck == 0 ? 3 : 82;
+		canvas->setTextDatum(TC_DATUM);
+		canvas->drawString(deck == 0 ? "DECK A" : "DECK B", x + 37, 13);
+		for(uint8_t pad = 0; pad < 3; pad++){
+			const int8_t cue = controls.cueForEncoder(deck * 3 + pad);
+			if(cue < 0) continue;
+			const DjCueSnapshot& cueState = snapshot.decks[deck].cues[cue];
+			const int16_t y = 24 + pad * 30;
+			canvas->drawRoundRect(x, y, 75, 26, 2, TFT_WHITE);
+			char line[20];
+			if(cueState.occupied){
+				snprintf(line, sizeof(line), "C%u %u:%02u GO", cue + 1,
+						 cueState.position / 60, cueState.position % 60);
+			}else{
+				snprintf(line, sizeof(line), "C%u EMPTY SET", cue + 1);
+			}
+			canvas->setTextDatum(MC_DATUM);
+			canvas->drawString(line, x + 37, y + 13);
+		}
+	}
+	canvas->setTextDatum(BC_DATUM);
+	canvas->drawString("CENTER: PAGE/SELECT  HOLD: MENU", 80, 126);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::drawBrowseBank(){
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(MC_DATUM);
+	canvas->drawString("BROWSE", 80, 20);
+	canvas->drawString("PRESS CENTER TO OPEN", 80, 48);
+	canvas->drawString("A BUTTON: LOAD DECK A", 80, 68);
+	canvas->drawString("B BUTTON: LOAD DECK B", 80, 82);
+	canvas->drawString("AUDIO KEEPS PLAYING", 80, 102);
+	canvas->setTextDatum(BC_DATUM);
+	canvas->drawString("HOLD CENTER: MENU", 80, 126);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::drawLoopSyncBank(){
+	DjSnapshot snapshot;
+	if(!session || !session->copySnapshot(snapshot)) return;
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(TC_DATUM);
+	canvas->drawString("LOOP / SYNC", 80, 2);
+
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		const int16_t x = deck == 0 ? 3 : 82;
+		canvas->setTextDatum(TC_DATUM);
+		canvas->drawString(deck == 0 ? "DECK A" : "DECK B", x + 37, 15);
+
+		const DjLoopSnapshot& loop = snapshot.decks[deck].loop;
+		const DjSyncSnapshot& sync = snapshot.decks[deck].sync;
+
+		char loopLine[24];
+		if(loop.state == DJ_LOOP_INACTIVE){
+			snprintf(loopLine, sizeof(loopLine), "LOOP: OFF");
+		}else if(loop.length == DJ_LOOP_BEAT_4){
+			snprintf(loopLine, sizeof(loopLine), "LOOP: 4 BEAT");
+		}else if(loop.length == DJ_LOOP_BEAT_1){
+			snprintf(loopLine, sizeof(loopLine), "LOOP: 1 BEAT");
+		}else{
+			snprintf(loopLine, sizeof(loopLine), "LOOP: 1/2 BEAT");
+		}
+		const char* syncLine;
+		switch(sync.state){
+			case DJ_SYNC_LOCKED: syncLine = "SYNC: LOCKED"; break;
+			case DJ_SYNC_ARMED: syncLine = "SYNC: ARMED"; break;
+			default: syncLine = "SYNC: OFF"; break;
+		}
+
+		canvas->setTextDatum(TL_DATUM);
+		canvas->drawString(loopLine, x + 2, 32);
+		canvas->drawString("HOLD 1/2: 1 BEAT", x + 2, 48);
+		canvas->drawString("HOLD 3: 4 BEAT", x + 2, 60);
+		canvas->drawString(syncLine, x + 2, 78);
+		canvas->drawString("HOLD SYNC: TOGGLE", x + 2, 94);
+	}
+
+	canvas->setTextDatum(BC_DATUM);
+	canvas->drawString("HOLD CENTER: MENU", 80, 126);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::drawPalette(){
+	static const char* items[] = {
+			"MIX", "CUES", "BROWSE", "LOOP/SYNC", "MATRIX", "RESCAN SD", "SETTINGS", "EXIT DJ"
+	};
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextDatum(TC_DATUM);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->drawString("CONTROL BANKS / ACTIONS", 80, 2);
+	for(uint8_t i = 0; i < MIX_PALETTE_COUNT; i++){
+		const int16_t y = 17 + i * 14;
+		if(i == controls.paletteSelection){
+			canvas->fillRect(8, y - 1, 144, 12, TFT_WHITE);
+			canvas->setTextColor(TFT_BLACK);
+		}else{
+			canvas->setTextColor(TFT_WHITE);
+		}
+		canvas->drawString(items[i], 80, y);
+	}
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(BC_DATUM);
+	canvas->drawString("ROTATE / PRESS CONFIRM", 80, 127);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::drawStatus(){
+	if(statusText.length() == 0 || millis() >= statusUntil) return;
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 111, 160, 17, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(BC_DATUM);
+	canvas->drawString(statusText.substring(0, 26), 80, 124);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+const char* MixScreen::MixScreen::commandErrorText(DjCommandError error) const{
+	switch(error){
+		case DJ_COMMAND_ERROR_QUEUE_FULL: return "COMMAND QUEUE FULL";
+		case DJ_COMMAND_ERROR_NO_DECK: return "LOAD A DECK FIRST";
+		case DJ_COMMAND_ERROR_NO_EFFECT: return "SELECT AN EFFECT";
+		case DJ_COMMAND_ERROR_OPEN_FAILED: return "TRACK LOAD FAILED";
+		case DJ_COMMAND_ERROR_EMPTY_CUE: return "CUE IS EMPTY";
+		case DJ_COMMAND_ERROR_RECORDING_ACTIVE: return "STOP RECORDING TO LOAD";
+		case DJ_COMMAND_ERROR_RECORDING_BUSY: return "RECORDING BUSY";
+		case DJ_COMMAND_ERROR_RECORDING_FAILED: return "RECORDING FAILED";
+		case DJ_COMMAND_ERROR_SESSION_ENDING: return "DJ SESSION ENDING";
+		default: return "COMMAND REJECTED";
 	}
 }
 
-void MixScreen::MixScreen::drawSaveStatus(){
-	Sprite* canvas = screen.getSprite();
+const char* MixScreen::MixScreen::recordingErrorText(DjRecordingError error) const{
+	switch(error){
+		case DJ_RECORDING_ERROR_SD_UNAVAILABLE: return "SD CARD UNAVAILABLE";
+		case DJ_RECORDING_ERROR_OPEN_FAILED: return "RECORDING FILE ERROR";
+		case DJ_RECORDING_ERROR_WRITE_FAILED: return "RECORDING WRITE FAILED";
+		case DJ_RECORDING_ERROR_FINALIZE_FAILED: return "RECORDING SAVE FAILED";
+		case DJ_RECORDING_ERROR_BUFFER_OVERRUN: return "RECORDING OVERRUN";
+		case DJ_RECORDING_ERROR_QUEUE_FULL: return "RECORDING QUEUE FULL";
+		case DJ_RECORDING_ERROR_NAME_EXHAUSTED: return "RECORDING STORAGE FULL";
+		case DJ_RECORDING_ERROR_RENAME_FAILED: return "RECORDING SAVE FAILED";
+		default: return "RECORDING FAILED";
+	}
+}
 
-	canvas->fillRoundRect((screen.getWidth() - 80) / 2, (screen.getHeight() - 40) / 2, 80, 40, 2, C_RGB(52, 204, 235));
-	canvas->drawRoundRect((screen.getWidth() - 80) / 2, (screen.getHeight() - 40) / 2, 80, 40, 2, TFT_BLACK);
-
-	canvas->setTextColor(TFT_WHITE);
-	canvas->setFont(&u8g2_font_DigitalDisco_tf);
-	canvas->setTextDatum(BC_DATUM);
-	canvas->drawString("Saving...", screen.getWidth() / 2, (screen.getHeight() - 40) / 2 + 23);
-	canvas->setTextDatum(TL_DATUM);
-
-	canvas->fillRoundRect((screen.getWidth() - 80) / 2 + 10 + (cos((float) millis() / 200.0f)+1) / 2.0f * 45.0f, (screen.getHeight() - 40) / 2 + 30, 15, 5, 2, TFT_WHITE);
+void MixScreen::MixScreen::showCommandError(DjCommandError error){
+	statusText = commandErrorText(error);
+	statusUntil = millis() + 2500;
+	drawQueued = true;
 }
 
 void MixScreen::MixScreen::buildUI(){
@@ -333,10 +538,13 @@ void MixScreen::MixScreen::loop(uint micros){
 	if(seekTime != 0 && millis() - seekTime >= 100){
 		SongSeekBar* bar = seekChannel ? rightSeekBar : leftSeekBar;
 
-		session->seek(seekChannel, bar->getCurrentDuration(), DJ_ORIGIN_PHYSICAL);
+		const DjSubmitResult seekResult =
+				session->seek(seekChannel, bar->getCurrentDuration(), DJ_ORIGIN_PHYSICAL);
+		if(!seekResult.accepted()) showCommandError(seekResult.error);
 
-		if(wasRunning){
-			session->setPlaying(seekChannel, true, DJ_ORIGIN_PHYSICAL);
+		if(wasRunning && seekResult.accepted()){
+			const DjSubmitResult playResult = session->setPlaying(seekChannel, true, DJ_ORIGIN_PHYSICAL);
+			if(!playResult.accepted()) showCommandError(playResult.error);
 		}
 
 		seekChannel = -1;
@@ -350,12 +558,13 @@ void MixScreen::MixScreen::loop(uint micros){
 
 	DjSnapshot snapshot;
 	if(session && session->copySnapshot(snapshot)){
+		processCommandResults(snapshot);
 		update |= syncFromSnapshot(snapshot);
 		const bool hasTarget = snapshot.decks[0].path[0] != '\0' || snapshot.decks[1].path[0] != '\0';
-		if(!hasTarget && !songListOpen && !session->hasPendingLoad()){
+		if(!hasTarget && !browseWasOpened && !songListOpen && !session->hasPendingLoad()){
 			loadingChannel = 0;
-			songListOpen = true;
-			(new SongList::SongList(*getScreen().getDisplay()))->push(this);
+			controls.bank = MIX_BANK_BROWSE;
+			openBrowse();
 			return;
 		}
 	}
@@ -365,7 +574,11 @@ void MixScreen::MixScreen::loop(uint micros){
 	update |= songNameUpdateL | songNameUpdateR;
 
 	uint32_t currentTime = millis();
-	if((update || drawQueued) && (currentTime - lastDraw) >= (isRecording ? 200 : 50)){
+	if(statusText.length() && currentTime >= statusUntil){
+		statusText = "";
+		update = true;
+	}
+	if((update || drawQueued) && (currentTime - lastDraw) >= (recordingState == DJ_RECORDING_ACTIVE ? 200 : 50)){
 		drawQueued = false;
 		draw();
 		screen.commit();
@@ -378,13 +591,19 @@ void MixScreen::MixScreen::loop(uint micros){
 
 void MixScreen::MixScreen::potMove(uint8_t id, uint8_t value){
 	if(id == POT_MID){
-		session->setMix(value, DJ_ORIGIN_PHYSICAL);
-		matrixManager.fillMatrixMid(value);
-		matrixManager.matrixMid.push();
+		const DjSubmitResult result = session->setMix(value, DJ_ORIGIN_PHYSICAL);
+		if(result.accepted()){
+			matrixManager.fillMatrixMid(value);
+			matrixManager.matrixMid.push();
+		}else{
+			showCommandError(result.error);
+		}
 	}else if(id == POT_L){
-		session->setGain(0, value, DJ_ORIGIN_PHYSICAL);
+		const DjSubmitResult result = session->setGain(0, value, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
 	}else if(id == POT_R){
-		session->setGain(1, value, DJ_ORIGIN_PHYSICAL);
+		const DjSubmitResult result = session->setGain(1, value, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
 	}
 }
 
@@ -396,65 +615,86 @@ void MixScreen::MixScreen::stopBigVu(){
 	LoopManager::removeListener(&midVu);
 }
 
-void MixScreen::MixScreen::encTwoBot(){
-	if(isRecording){
-		if(!session->setRecording(false, DJ_ORIGIN_PHYSICAL).accepted()) return;
-		doneRecording = true;
-
-		(new TextInputScreen::TextInputScreen(*screen.getDisplay()))->push(this);
-	}else{
-		session->setRecording(true, DJ_ORIGIN_PHYSICAL);
-	}
-}
-
-void MixScreen::MixScreen::encTwoTop(){
-	if(session){
-		session->detachView();
-		DjSession::end();
-		session = nullptr;
-	}
-	pop();
-}
-
 void MixScreen::MixScreen::btnCombination(){
-	stop();
-
-	MatrixPopUpPicker* popUpPicker = new MatrixPopUpPicker(*this);
-	popUpPicker->unpack();
-	popUpPicker->start();
+	// Guard against re-triggering while the library hasn't yet applied the
+	// previous start/stop request -- avoids duplicate toggles racing the
+	// async accepted-vs-applied recording lifecycle.
+	if(recordingState == DJ_RECORDING_STARTING || recordingState == DJ_RECORDING_STOPPING){
+		return;
+	}
+	const bool wantRecording = recordingState != DJ_RECORDING_ACTIVE;
+	const DjSubmitResult result = session->setRecording(wantRecording, DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()) showCommandError(result.error);
 }
 
 void MixScreen::MixScreen::btn(uint8_t i){
-	SongSeekBar* bar = i == 0 ? leftSeekBar : rightSeekBar;
-	const bool playing = !bar->isPlaying();
-	if(!session->setPlaying(i, playing, DJ_ORIGIN_PHYSICAL).accepted()) return;
-	bar->setPlaying(playing);
-
-	drawQueued = true;
+	DjSnapshot snapshot;
+	if(!session || !session->copySnapshot(snapshot) || i >= DJ_DECK_COUNT) return;
+	const DjSubmitResult result =
+			session->setPlaying(i, !snapshot.decks[i].playing, DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()) showCommandError(result.error);
 }
 
 void MixScreen::MixScreen::btnEnc(uint8_t i){
 	if(i > 6) return;
 
 	if(i == 6){
+		if(controls.paletteOpen){
+			applyPaletteSelection(controls.confirmPalette());
+			return;
+		}
+		if(controls.bank == MIX_BANK_BROWSE){
+			openBrowse();
+			return;
+		}
 		selectedChannel = !selectedChannel;
-	}else{
-		EffectElement* effect = effectElements[i];
-		effect->setSelected(!effect->isSelected());
+		drawQueued = true;
+		return;
 	}
 
+	if(controls.bank == MIX_BANK_CUES){
+		const int8_t cue = controls.cueForEncoder(i);
+		if(cue < 0) return;
+		DjSnapshot snapshot;
+		if(!session->copySnapshot(snapshot)) return;
+		const uint8_t deck = i >= 3;
+		const DjSubmitResult result = snapshot.decks[deck].cues[cue].occupied
+				? session->triggerCue(deck, cue, DJ_ORIGIN_PHYSICAL)
+				: session->setCue(deck, cue, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
+		return;
+	}
+	if(controls.bank != MIX_BANK_MIX) return;
+	EffectElement* effect = effectElements[i];
+	effect->setSelected(!effect->isSelected());
 	drawQueued = true;
 }
 
 void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
-
 	if(index == 6){
+		if(controls.paletteOpen){
+			controls.movePalette(value);
+			drawQueued = true;
+			return;
+		}
+		if(controls.bank == MIX_BANK_CUES){
+			controls.moveCuePage(value);
+			drawQueued = true;
+			return;
+		}
+		if(controls.bank != MIX_BANK_MIX) return;
 		DjSnapshot snapshot;
 		if(!session->copySnapshot(snapshot) || !snapshot.decks[selectedChannel].loaded) return;
 		if(seekTime == 0){
 			seekChannel = selectedChannel;
 			wasRunning = snapshot.decks[selectedChannel].playing;
-			session->setPlaying(selectedChannel, false, DJ_ORIGIN_PHYSICAL);
+			const DjSubmitResult result =
+					session->setPlaying(selectedChannel, false, DJ_ORIGIN_PHYSICAL);
+			if(!result.accepted()){
+				showCommandError(result.error);
+				seekChannel = -1;
+				return;
+			}
 		}
 
 		seekTime = millis();
@@ -467,6 +707,7 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 		return;
 	}
 
+	if(controls.bank != MIX_BANK_MIX) return;
 	EffectElement* element = effectElements[index];
 
 	if(element->isSelected()){
@@ -498,13 +739,10 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 		EffectType type = static_cast<EffectType>(e);
 		const uint8_t deck = index >= 3;
 		const uint8_t slot = index % 3;
-		if(!session->setEffectType(deck, slot, type, DJ_ORIGIN_PHYSICAL).accepted()) return;
-		element->setType(type);
-		element->setIntensity(0);
-
-		if(type == EffectType::SPEED){
-			element->setIntensity(255 / 2);
-			return;
+		const DjSubmitResult result =
+				session->setEffectType(deck, slot, type, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()){
+			showCommandError(result.error);
 		}
 	}else{
 		EffectType type = element->getType();
@@ -514,43 +752,90 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 		intensity = max((int16_t) 0, intensity);
 		intensity = min((int16_t) 255, intensity);
 
-		if(!session->setEffectIntensity(index >= 3, index % 3, intensity, DJ_ORIGIN_PHYSICAL).accepted()) return;
-		element->setIntensity(intensity);
+		const DjSubmitResult result =
+				session->setEffectIntensity(index >= 3, index % 3, intensity, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
 	}
-
-	drawQueued = true;
 }
 
 void MixScreen::MixScreen::encBtnHold(uint8_t i){
 	if(i == 6){
-		loadingChannel = selectedChannel;
-		songListOpen = true;
-		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
+		controls.openPalette();
+		drawQueued = true;
 		return;
 	}
-	if(i > 5) return;
+	if(i >= 6) return;
 
-	// Reuses the previously-unbound per-slot encoder hold (L1-L3/R1-R3) as a
-	// stable, labeled LOOP/SYNC bank, gated on the beat-grid capability by
-	// DjSession itself (setSync/loopEngage reject rather than silently
-	// no-op when the grid/BPM capability is unavailable). Mix (potMove),
-	// Cues/transport (btn), and Browse (enc/encBtnHold on index 6) are
-	// untouched. No new multi-button chords are introduced.
-	const uint8_t deck = i >= 3;
-	const uint8_t slot = i % 3; // slot 0/1 -> LOOP bank, slot 2 -> SYNC/ASSIST
-
-	DjSnapshot snapshot;
-	session->copySnapshot(snapshot);
-
-	if(slot == 2){
-		const bool currentlyArmed = snapshot.decks[deck].sync.state != DJ_SYNC_OFF;
-		session->setSync(deck, !currentlyArmed, -1, DJ_ORIGIN_PHYSICAL);
-	}else if(snapshot.decks[deck].loop.state != DJ_LOOP_INACTIVE){
-		session->loopDisengage(deck, DJ_ORIGIN_PHYSICAL);
-	}else{
-		const DjLoopLength length = slot == 0 ? DJ_LOOP_BEAT_1 : DJ_LOOP_BEAT_4;
-		session->loopEngage(deck, length, DJ_ORIGIN_PHYSICAL);
+	if(controls.bank == MIX_BANK_CUES){
+		const int8_t cue = controls.cueForEncoder(i);
+		if(cue < 0) return;
+		const DjSubmitResult result = session->clearCue(i >= 3, cue, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
+		return;
 	}
+	if(controls.bank == MIX_BANK_LOOPSYNC){
+		// Per-slot encoder hold (L1-L3/R1-R3) doubles as the LOOP/SYNC bank
+		// here, gated on the beat-grid capability by DjSession itself
+		// (setSync/loopEngage reject rather than silently no-op when the
+		// grid/BPM capability is unavailable). Only active while this bank
+		// is selected via the palette, so Cues/Mix hold behavior is untouched.
+		const uint8_t deck = i >= 3;
+		const uint8_t slot = i % 3; // slot 0/1 -> LOOP bank, slot 2 -> SYNC/ASSIST
 
-	drawQueued = true;
+		DjSnapshot snapshot;
+		session->copySnapshot(snapshot);
+
+		if(slot == 2){
+			const bool currentlyArmed = snapshot.decks[deck].sync.state != DJ_SYNC_OFF;
+			session->setSync(deck, !currentlyArmed, -1, DJ_ORIGIN_PHYSICAL);
+		}else if(snapshot.decks[deck].loop.state != DJ_LOOP_INACTIVE){
+			session->loopDisengage(deck, DJ_ORIGIN_PHYSICAL);
+		}else{
+			const DjLoopLength length = slot == 0 ? DJ_LOOP_BEAT_1 : DJ_LOOP_BEAT_4;
+			session->loopEngage(deck, length, DJ_ORIGIN_PHYSICAL);
+		}
+
+		drawQueued = true;
+		return;
+	}
+	if(controls.bank == MIX_BANK_MIX){
+		const DjSubmitResult result =
+				session->setEffectType(i >= 3, i % 3, EffectType::NONE, DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
+	}
+}
+
+bool MixScreen::MixScreen::allowsEncoderChords() const{
+	return MixControlState::encoderChordsEnabled();
+}
+
+void MixScreen::MixScreen::applyPaletteSelection(MixPaletteItem item){
+	switch(item){
+		case MIX_PALETTE_BROWSE:
+		case MIX_PALETTE_RESCAN:
+			controls.bank = MIX_BANK_BROWSE;
+			openBrowse();
+			return;
+		case MIX_PALETTE_MATRIX: {
+			stop();
+			MatrixPopUpPicker* popUpPicker = new MatrixPopUpPicker(*this);
+			popUpPicker->unpack();
+			popUpPicker->start();
+			return;
+		}
+		case MIX_PALETTE_SETTINGS:
+			(new SettingsScreen::SettingsScreen(*screen.getDisplay(), false))->push(this);
+			return;
+		case MIX_PALETTE_EXIT:
+			if(session){
+				session->detachView();
+				DjSession::end();
+				session = nullptr;
+			}
+			pop();
+			return;
+		default:
+			drawQueued = true;
+			return;
+	}
 }

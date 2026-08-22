@@ -8,6 +8,8 @@
 #include "../../InputKeys.h"
 #include "LibraryIndex.h"
 
+class DjSession;
+
 namespace SongList {
 	class SongList : public Context, public LoopListener, public InputListener {
 	public:
@@ -22,7 +24,7 @@ namespace SongList {
 			uint32_t progressTotal;
 		};
 
-		explicit SongList(Display &display);
+		explicit SongList(Display &display, DjSession* browseSession = nullptr);
 
 		virtual ~SongList() override;
 
@@ -72,6 +74,16 @@ namespace SongList {
 
 		void encTwoTop() override;
 		void encTwoBot() override;
+		void btn(uint8_t i) override;
+		bool allowsEncoderChords() const override;
+		bool selectedPath(String& path);
+		void loadSelected(uint8_t deck);
+		void updateBrowseResult();
+
+		DjSession* browseSession = nullptr;
+		uint32_t pendingLoad[2] = {};
+		String browseStatus;
+		bool browseMode = false;
 		bool waiting = false;
 		bool insertedSD = true;
 		bool empty = true;
@@ -95,6 +107,7 @@ namespace SongList {
 		static const uint8_t maxDirectoryDepth = 12;
 		static const uint8_t visibleRows = 5;
 		static const uint8_t rowHeight = 20;
+		static const uint32_t holdTime = 500;
 	};
 }
 #endif //JAYD_FIRMWARE_SONGLIST_H

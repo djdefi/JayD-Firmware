@@ -8,6 +8,7 @@
 
 static constexpr uint8_t DJ_DECK_COUNT = 2;
 static constexpr uint8_t DJ_EFFECT_SLOT_COUNT = 3;
+static constexpr uint8_t DJ_CUE_COUNT = 8;
 static constexpr uint8_t DJ_COMMAND_CAPACITY = 16;
 static constexpr uint8_t DJ_RECENT_RESULT_COUNT = 8;
 static constexpr size_t DJ_PATH_CAPACITY = 128;
@@ -79,7 +80,10 @@ enum DjCommandType : uint8_t {
 	DJ_COMMAND_LOOP_ENGAGE,
 	DJ_COMMAND_LOOP_DISENGAGE,
 	DJ_COMMAND_LOOP_RELOOP,
-	DJ_COMMAND_SET_SYNC
+	DJ_COMMAND_SET_SYNC,
+	DJ_COMMAND_SET_CUE,
+	DJ_COMMAND_TRIGGER_CUE,
+	DJ_COMMAND_CLEAR_CUE
 };
 
 enum DjCommandStatus : uint8_t {
@@ -108,7 +112,10 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_LOOP_BUSY,
 	DJ_COMMAND_ERROR_SYNC_UNAVAILABLE,
 	DJ_COMMAND_ERROR_SYNC_CONFLICT,
-	DJ_COMMAND_ERROR_INVALID_MASTER
+	DJ_COMMAND_ERROR_INVALID_MASTER,
+	DJ_COMMAND_ERROR_EMPTY_CUE,
+	DJ_COMMAND_ERROR_RECORDING_ACTIVE,
+	DJ_COMMAND_ERROR_RECORDING_BUSY
 };
 
 enum DjTimingQuality : uint8_t {
@@ -125,6 +132,39 @@ enum DjEffectType : uint8_t {
 	DJ_EFFECT_BITCRUSHER,
 	DJ_EFFECT_COUNT
 };
+
+// Recording-busy gate shared by DjSession::validate() and the host
+// self-check: only a new *start* is rejected while a previous start/stop is
+// still in flight (STARTING/ACTIVE/STOPPING). A stop is always allowed
+// through, even while STARTING, so a stop issued before the library applies
+// an accepted start is forwarded rather than silently rejected -- the
+// library's own recording state machine is designed to accept a stop during
+// STARTING and transition safely to STOPPING.
+enum DjRecordingState : uint8_t {
+	DJ_RECORDING_IDLE,
+	DJ_RECORDING_STARTING,
+	DJ_RECORDING_ACTIVE,
+	DJ_RECORDING_STOPPING,
+	DJ_RECORDING_COMPLETE,
+	DJ_RECORDING_FAILED
+};
+
+enum DjRecordingError : uint8_t {
+	DJ_RECORDING_ERROR_NONE,
+	DJ_RECORDING_ERROR_SD_UNAVAILABLE,
+	DJ_RECORDING_ERROR_OPEN_FAILED,
+	DJ_RECORDING_ERROR_WRITE_FAILED,
+	DJ_RECORDING_ERROR_FINALIZE_FAILED,
+	DJ_RECORDING_ERROR_BUFFER_OVERRUN,
+	DJ_RECORDING_ERROR_QUEUE_FULL,
+	DJ_RECORDING_ERROR_NAME_EXHAUSTED,
+	DJ_RECORDING_ERROR_RENAME_FAILED
+};
+
+inline bool djRecordingStartBusy(bool isStartCommand, DjRecordingState state){
+	return isStartCommand &&
+		   (state == DJ_RECORDING_STARTING || state == DJ_RECORDING_ACTIVE || state == DJ_RECORDING_STOPPING);
+}
 
 struct DjCommand {
 	uint32_t id = 0;
@@ -271,6 +311,11 @@ struct DjSyncSnapshot {
 	DjCommandError lastError = DJ_COMMAND_ERROR_NONE;
 };
 
+struct DjCueSnapshot {
+	bool occupied = false;
+	uint16_t position = 0;
+};
+
 struct DjDeckSnapshot {
 	bool loaded = false;
 	bool playing = false;
@@ -280,11 +325,27 @@ struct DjDeckSnapshot {
 	uint8_t gain = 255;
 	char path[DJ_PATH_CAPACITY] = {};
 	DjEffectSnapshot effects[DJ_EFFECT_SLOT_COUNT] = {};
+	DjCueSnapshot cues[DJ_CUE_COUNT] = {};
 	DjTrackMetadataSnapshot metadata = {};
 	DjGridSnapshot grid = {};
 	DjQuantizeSnapshot quantize = {};
 	DjLoopSnapshot loop = {};
 	DjSyncSnapshot sync = {};
+};
+
+// Authoritative recording lifecycle snapshot: accepted (STARTING/STOPPING)
+// vs applied (ACTIVE/COMPLETE/FAILED) state, stable error mapping, validity,
+// byte/duration counters, the finalized file path once available, and
+// boot-time orphan recovery diagnostics.
+struct DjRecordingSnapshot {
+	DjRecordingState state = DJ_RECORDING_IDLE;
+	DjRecordingError error = DJ_RECORDING_ERROR_NONE;
+	bool valid = false;
+	uint32_t bytes = 0;
+	uint32_t durationMs = 0;
+	char path[DJ_PATH_CAPACITY] = {};
+	uint32_t orphansRepaired = 0;
+	uint32_t orphansFailed = 0;
 };
 
 struct DjSnapshot {
@@ -294,15 +355,18 @@ struct DjSnapshot {
 	bool sessionActive = false;
 	bool mixerRunning = false;
 	uint8_t mix = 127;
-	bool recording = false;
+	DjRecordingSnapshot recordingInfo;
 	DjDeckSnapshot decks[DJ_DECK_COUNT] = {};
 	uint8_t queueDepth = 0;
 	uint32_t queueDrops = 0;
 	DjCommandResult recentResults[DJ_RECENT_RESULT_COUNT] = {};
 };
 
+// Recording is considered "busy" for library-work purposes across the same
+// STARTING/ACTIVE/STOPPING span that djRecordingStartBusy() gates for new
+// start commands; COMPLETE/FAILED/IDLE do not block library work.
 inline bool djAllowsLibraryWork(const DjSnapshot& snapshot){
-	if(snapshot.recording) return false;
+	if(djRecordingStartBusy(true, snapshot.recordingInfo.state)) return false;
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		if(snapshot.decks[deck].playing) return false;
 	}
@@ -340,6 +404,41 @@ public:
 private:
 	DjTrackMetadataSnapshot snapshot_ = {};
 	bool attached_ = false;
+};
+
+class DjCueState {
+public:
+	bool set(uint8_t deck, uint8_t cue, uint16_t position){
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT) return false;
+		cues[deck][cue].occupied = true;
+		cues[deck][cue].position = position;
+		return true;
+	}
+
+	bool trigger(uint8_t deck, uint8_t cue, uint16_t& position) const{
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT || !cues[deck][cue].occupied) return false;
+		position = cues[deck][cue].position;
+		return true;
+	}
+
+	bool clear(uint8_t deck, uint8_t cue){
+		if(deck >= DJ_DECK_COUNT || cue >= DJ_CUE_COUNT) return false;
+		cues[deck][cue] = {};
+		return true;
+	}
+
+	void clearDeck(uint8_t deck){
+		if(deck >= DJ_DECK_COUNT) return;
+		memset(cues[deck], 0, sizeof(cues[deck]));
+	}
+
+	void copyDeck(uint8_t deck, DjCueSnapshot* destination) const{
+		if(deck >= DJ_DECK_COUNT || !destination) return;
+		memcpy(destination, cues[deck], sizeof(cues[deck]));
+	}
+
+private:
+	DjCueSnapshot cues[DJ_DECK_COUNT][DJ_CUE_COUNT] = {};
 };
 
 class DjCommandQueue {
@@ -393,7 +492,9 @@ private:
 			   type == DJ_COMMAND_SET_EFFECT_TYPE ||
 			   type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
 			   type == DJ_COMMAND_SET_QUANTIZE ||
-			   type == DJ_COMMAND_SET_SYNC;
+			   type == DJ_COMMAND_SET_SYNC ||
+			   type == DJ_COMMAND_SET_CUE ||
+			   type == DJ_COMMAND_CLEAR_CUE;
 	}
 
 	static bool sameTarget(const DjCommand& first, const DjCommand& second){
@@ -401,7 +502,9 @@ private:
 		if(first.type == DJ_COMMAND_SET_MIX) return true;
 		if(first.deck != second.deck) return false;
 		if(first.type == DJ_COMMAND_SET_EFFECT_TYPE ||
-		   first.type == DJ_COMMAND_SET_EFFECT_INTENSITY){
+		   first.type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+		   first.type == DJ_COMMAND_SET_CUE ||
+		   first.type == DJ_COMMAND_CLEAR_CUE){
 			return first.slot == second.slot;
 		}
 		return true;

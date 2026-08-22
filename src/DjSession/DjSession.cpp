@@ -1,4 +1,5 @@
 #include "DjSession.h"
+#include "DjRecordingStorage.h"
 #include <Arduino.h>
 #include <AudioLib/EffectType.hpp>
 #include <AudioLib/SpeedModifier.h>
@@ -20,6 +21,7 @@ static_assert(DJ_RATE_MAX == SpeedModifier::MaxRate, "DJ_RATE_MAX must match Spe
 DjSession* DjSession::instance = nullptr;
 uint64_t DjSession::bootId = 0;
 uint32_t DjSession::sessionCounter = 0;
+bool DjSession::orphanRecoveryDone = false;
 static const char* metadataPath = "/library.jydm";
 
 static uint64_t metadataIdentity(fs::File& file){
@@ -58,6 +60,13 @@ void DjSession::end(){
 DjSession::DjSession(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix) :
 		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter){
 	system = new MixSystem();
+	if(!orphanRecoveryDone){
+		orphanRecoveryDone = true;
+		const DjRecordingStorage::RecoveryResult recovery =
+				DjRecordingStorage::recoverOrphan(MixSystem::recordPath);
+		recordingSnapshot.orphansRepaired = recovery.repaired;
+		recordingSnapshot.orphansFailed = recovery.failed;
+	}
 	publishSnapshot();
 }
 
@@ -228,8 +237,35 @@ DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, D
 	return submit(command);
 }
 
+DjSubmitResult DjSession::setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_SET_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_TRIGGER_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_CLEAR_CUE;
+	command.deck = deck;
+	command.slot = cue;
+	return submit(command);
+}
+
 DjCommandError DjSession::validate(const DjCommand& command) const{
-	if(command.type > DJ_COMMAND_SET_SYNC) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_CLEAR_CUE) return DJ_COMMAND_ERROR_INVALID_VALUE;
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
 							 command.type == DJ_COMMAND_SET_PLAYING ||
 							 command.type == DJ_COMMAND_SEEK ||
@@ -240,11 +276,18 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 							 command.type == DJ_COMMAND_LOOP_ENGAGE ||
 							 command.type == DJ_COMMAND_LOOP_DISENGAGE ||
 							 command.type == DJ_COMMAND_LOOP_RELOOP ||
-							 command.type == DJ_COMMAND_SET_SYNC;
+							 command.type == DJ_COMMAND_SET_SYNC ||
+							 command.type == DJ_COMMAND_SET_CUE ||
+							 command.type == DJ_COMMAND_TRIGGER_CUE ||
+							 command.type == DJ_COMMAND_CLEAR_CUE;
 	if(deckCommand && command.deck >= DJ_DECK_COUNT) return DJ_COMMAND_ERROR_INVALID_DECK;
 	if((command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
 	   command.slot >= DJ_EFFECT_SLOT_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
+	if((command.type == DJ_COMMAND_SET_CUE ||
+		command.type == DJ_COMMAND_TRIGGER_CUE ||
+		command.type == DJ_COMMAND_CLEAR_CUE) &&
+	   command.slot >= DJ_CUE_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
 	if(command.type == DJ_COMMAND_SET_EFFECT_TYPE && command.value >= DJ_EFFECT_COUNT){
 		return DJ_COMMAND_ERROR_INVALID_VALUE;
 	}
@@ -270,7 +313,17 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		if(command.slot > DJ_DECK_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
 		if(command.slot != 0 && command.slot - 1 == command.deck) return DJ_COMMAND_ERROR_INVALID_MASTER;
 	}
+	if(command.type == DJ_COMMAND_SET_RECORDING && system){
+		const DjRecordingState mapped = mapRecordingState(system->getRecordingStatus().state);
+		if(djRecordingStartBusy(command.value != 0, mapped)){
+			return DJ_COMMAND_ERROR_RECORDING_BUSY;
+		}
+	}
 	return DJ_COMMAND_ERROR_NONE;
+}
+
+bool DjSession::hasDeck(uint8_t deck) const{
+	return system && system->hasChannel(deck);
 }
 
 bool DjSession::copySnapshot(DjSnapshot& snapshot){
@@ -336,7 +389,7 @@ DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t 
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		DjMetadataState state = DJ_METADATA_ABSENT;
-		if(system && system->hasChannel(deck)){
+		if(hasDeck(deck)){
 			state = hadAssociation[deck] || metadataReaderStatus == JaydMetadata::Status::Ready
 				? DJ_METADATA_STALE
 				: metadataState(metadataReaderStatus);
@@ -534,6 +587,7 @@ void DjSession::loop(uint micros){
 
 	tickLoops();
 	tickSync();
+	pollRecording();
 	publishSnapshot();
 }
 
@@ -553,8 +607,10 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		command.type == DJ_COMMAND_LOOP_ENGAGE ||
 		command.type == DJ_COMMAND_LOOP_DISENGAGE ||
 		command.type == DJ_COMMAND_LOOP_RELOOP ||
-		command.type == DJ_COMMAND_SET_SYNC) &&
-	   !system->hasChannel(command.deck)){
+		command.type == DJ_COMMAND_SET_SYNC ||
+		command.type == DJ_COMMAND_SET_CUE ||
+		command.type == DJ_COMMAND_TRIGGER_CUE) &&
+	   !hasDeck(command.deck)){
 		error = DJ_COMMAND_ERROR_NO_DECK;
 		return false;
 	}
@@ -634,27 +690,18 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			}
 			return true;
 		}
-		case DJ_COMMAND_SET_RECORDING:
-			if(!system->hasChannel(0) && !system->hasChannel(1)){
+		case DJ_COMMAND_SET_RECORDING: {
+			if(!hasDeck(0) && !hasDeck(1)){
 				error = DJ_COMMAND_ERROR_NO_DECK;
 				return false;
 			}
-			recordingRequested = command.value;
-			if(recordingRequested) system->startRecording();
-			else system->stopRecording();
-			{
-				const uint32_t started = millis();
-				while(system->isRecording() != recordingRequested &&
-					  millis() - started < 250){
-					Sched.loop(0);
-				}
-				if(system->isRecording() != recordingRequested){
-					recordingRequested = system->isRecording();
-					error = DJ_COMMAND_ERROR_RECORDING_FAILED;
-					return false;
-				}
+			const bool ok = command.value ? system->startRecording() : system->stopRecording();
+			if(!ok){
+				error = DJ_COMMAND_ERROR_RECORDING_FAILED;
+				return false;
 			}
 			return true;
+		}
 		case DJ_COMMAND_SET_QUANTIZE:
 			if(command.value >= DJ_QUANTIZE_RESOLUTION_COUNT){
 				error = DJ_COMMAND_ERROR_INVALID_VALUE;
@@ -741,14 +788,35 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			}
 			return true;
 		}
+		case DJ_COMMAND_SET_CUE:
+			return cues.set(command.deck, command.slot, system->getElapsed(command.deck));
+		case DJ_COMMAND_TRIGGER_CUE: {
+			uint16_t position = 0;
+			if(!cues.trigger(command.deck, command.slot, position)){
+				error = DJ_COMMAND_ERROR_EMPTY_CUE;
+				return false;
+			}
+			system->seekChannel(command.deck, position);
+			return true;
+		}
+		case DJ_COMMAND_CLEAR_CUE:
+			return cues.clear(command.deck, command.slot);
 		default:
 			error = DJ_COMMAND_ERROR_INVALID_VALUE;
 			return false;
 	}
 }
 
-
 bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
+	if(system){
+		const RecordingState state = system->getRecordingStatus().state;
+		if(state == RecordingState::STARTING ||
+		   state == RecordingState::RECORDING ||
+		   state == RecordingState::STOPPING){
+			error = DJ_COMMAND_ERROR_RECORDING_ACTIVE;
+			return false;
+		}
+	}
 	fs::File file = SD.open(command.path);
 	if(!file){
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
@@ -767,8 +835,8 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 		candidateMetadata
 	);
 
-	const bool hadLeft = system->hasChannel(0);
-	const bool hadRight = system->hasChannel(1);
+	const bool hadLeft = hasDeck(0);
+	const bool hadRight = hasDeck(1);
 	const bool opened = system->openChannel(command.deck, file);
 	if(!opened){
 		deckMetadata[command.deck].commitIfLoaded(candidateMetadata, false, false);
@@ -794,6 +862,7 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	// untouched.
 	loopEngines[command.deck].disengage();
 	buildGrid(command.deck);
+	cues.clearDeck(command.deck);
 
 	system->setVolume(command.deck, gains[command.deck]);
 	DjEffectTransition effectTransition;
@@ -879,7 +948,7 @@ void DjSession::tickLoops(){
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		DjLoopEngine& engine = loopEngines[deck];
 		if(engine.state() == DJ_LOOP_INACTIVE) continue;
-		if(!system->hasChannel(deck)){
+		if(!hasDeck(deck)){
 			engine.disengage();
 			continue;
 		}
@@ -923,7 +992,7 @@ void DjSession::tickSync(){
 		DjSyncInputs inputs;
 		inputs.armed = true;
 
-		const bool followerReady = system->hasChannel(deck) && grids[deck].valid();
+		const bool followerReady = hasDeck(deck) && grids[deck].valid();
 		if(followerReady){
 			const uint8_t masterDeck = resolveMasterDeck(deck);
 			inputs.followerValid = true;
@@ -931,7 +1000,7 @@ void DjSession::tickSync(){
 			inputs.followerBpmMilli = grids[deck].bpmMilli();
 			inputs.followerSampleRate = grids[deck].sampleRate();
 
-			inputs.masterValid = system->hasChannel(masterDeck) && grids[masterDeck].valid();
+			inputs.masterValid = hasDeck(masterDeck) && grids[masterDeck].valid();
 			if(inputs.masterValid){
 				inputs.masterPlaying = !system->isChannelPaused(masterDeck);
 				inputs.masterBpmMilli = grids[masterDeck].bpmMilli();
@@ -968,6 +1037,81 @@ void DjSession::tickSync(){
 	}
 }
 
+DjRecordingState DjSession::mapRecordingState(RecordingState state){
+	switch(state){
+		case RecordingState::IDLE: return DJ_RECORDING_IDLE;
+		case RecordingState::STARTING: return DJ_RECORDING_STARTING;
+		case RecordingState::RECORDING: return DJ_RECORDING_ACTIVE;
+		case RecordingState::STOPPING: return DJ_RECORDING_STOPPING;
+		case RecordingState::COMPLETE: return DJ_RECORDING_COMPLETE;
+		case RecordingState::FAILED: return DJ_RECORDING_FAILED;
+		default: return DJ_RECORDING_FAILED;
+	}
+}
+
+DjRecordingError DjSession::mapRecordingError(RecordingError error){
+	switch(error){
+		case RecordingError::NONE: return DJ_RECORDING_ERROR_NONE;
+		case RecordingError::SD_UNAVAILABLE: return DJ_RECORDING_ERROR_SD_UNAVAILABLE;
+		case RecordingError::OPEN_FAILED: return DJ_RECORDING_ERROR_OPEN_FAILED;
+		case RecordingError::WRITE_FAILED: return DJ_RECORDING_ERROR_WRITE_FAILED;
+		case RecordingError::FINALIZE_FAILED: return DJ_RECORDING_ERROR_FINALIZE_FAILED;
+		case RecordingError::BUFFER_OVERRUN: return DJ_RECORDING_ERROR_BUFFER_OVERRUN;
+		case RecordingError::QUEUE_FULL: return DJ_RECORDING_ERROR_QUEUE_FULL;
+		default: return DJ_RECORDING_ERROR_NONE;
+	}
+}
+
+void DjSession::pollRecording(){
+	if(!system) return;
+	const RecordingStatus status = system->getRecordingStatus();
+	const DjRecordingState mapped = mapRecordingState(status.state);
+
+	if(mapped != lastRecordingState){
+		if(mapped == DJ_RECORDING_STARTING){
+			// fresh attempt: clear any stale path/error from a prior recording
+			recordingSnapshot.path[0] = '\0';
+			recordingSnapshot.error = DJ_RECORDING_ERROR_NONE;
+			recordingSnapshot.valid = false;
+			finalizeError = DJ_RECORDING_ERROR_NONE;
+		}else if(mapped == DJ_RECORDING_COMPLETE && status.fileValid){
+			// finalize exactly once, on the completion edge
+			char finalPath[DJ_PATH_CAPACITY];
+			const auto outcome = DjRecordingStorage::finalizeRecording(MixSystem::recordPath, finalPath, sizeof(finalPath));
+			if(outcome == DjRecordingStorage::FinalizeOutcome::SUCCESS){
+				memcpy(recordingSnapshot.path, finalPath, strlen(finalPath) + 1);
+			}else{
+				recordingSnapshot.path[0] = '\0';
+				finalizeError = outcome == DjRecordingStorage::FinalizeOutcome::RENAME_FAILED
+					? DJ_RECORDING_ERROR_RENAME_FAILED
+					: DJ_RECORDING_ERROR_NAME_EXHAUSTED;
+			}
+		}
+		lastRecordingState = mapped;
+	}
+
+	recordingSnapshot.state = mapped;
+	// Freeze the terminal error/validity once the outcome is settled so a
+	// subsequent idle poll can't clobber what the UI/API needs to show. A
+	// storage-layer finalize failure (bounded naming exhausted or rename
+	// failed) overrides a library-reported success: the recording captured
+	// fine but could not be moved into permanent, collision-safe storage.
+	if(mapped == DJ_RECORDING_COMPLETE || mapped == DJ_RECORDING_FAILED){
+		if(finalizeError != DJ_RECORDING_ERROR_NONE){
+			recordingSnapshot.error = finalizeError;
+			recordingSnapshot.valid = false;
+		}else{
+			recordingSnapshot.error = mapRecordingError(status.error);
+			recordingSnapshot.valid = mapped == DJ_RECORDING_COMPLETE && status.fileValid;
+		}
+	}else{
+		recordingSnapshot.error = DJ_RECORDING_ERROR_NONE;
+		recordingSnapshot.valid = false;
+	}
+	recordingSnapshot.bytes = status.bytes;
+	recordingSnapshot.durationMs = status.durationMs;
+}
+
 void DjSession::publishSnapshot(){
 	DjSnapshot snapshot = {};
 	snapshot.seq = ++snapshotSeq;
@@ -976,11 +1120,11 @@ void DjSession::publishSnapshot(){
 	snapshot.sessionActive = !ending;
 	snapshot.mixerRunning = system && system->isRunning();
 	snapshot.mix = mix;
-	snapshot.recording = recordingRequested || (system && system->isRecording());
+	snapshot.recordingInfo = recordingSnapshot;
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
 		DjDeckSnapshot& deckSnapshot = snapshot.decks[deck];
-		deckSnapshot.loaded = system && system->hasChannel(deck);
+		deckSnapshot.loaded = hasDeck(deck);
 		deckSnapshot.playing = deckSnapshot.loaded && !system->isChannelPaused(deck);
 		deckSnapshot.elapsed = deckSnapshot.loaded ? system->getElapsed(deck) : 0;
 		deckSnapshot.duration = deckSnapshot.loaded ? system->getDuration(deck) : 0;
@@ -988,6 +1132,7 @@ void DjSession::publishSnapshot(){
 		deckSnapshot.gain = gains[deck];
 		memcpy(deckSnapshot.path, paths[deck], DJ_PATH_CAPACITY);
 		effectState.copyDeck(deck, deckSnapshot.effects);
+		cues.copyDeck(deck, deckSnapshot.cues);
 
 		deckSnapshot.grid.valid = grids[deck].valid();
 		if(deckSnapshot.grid.valid){
