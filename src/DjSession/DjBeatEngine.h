@@ -563,6 +563,7 @@ public:
 		state_ = DJ_SYNC_OFF;
 		ticksSinceNudge_ = DJ_SYNC_NUDGE_COOLDOWN_TICKS;
 		hasCommandedRate_ = false;
+		correctionActive_ = false;
 	}
 
 	DjSyncState state() const{ return state_; }
@@ -575,6 +576,7 @@ public:
 			state_ = DJ_SYNC_OFF;
 			out.state = state_;
 			hasCommandedRate_ = false;
+			correctionActive_ = false;
 			return out;
 		}
 
@@ -582,6 +584,7 @@ public:
 			state_ = DJ_SYNC_ERROR;
 			out.state = state_;
 			hasCommandedRate_ = false;
+			correctionActive_ = false;
 			return out;
 		}
 
@@ -591,6 +594,7 @@ public:
 			state_ = DJ_SYNC_ERROR;
 			out.state = state_;
 			hasCommandedRate_ = false;
+			correctionActive_ = false;
 			return out;
 		}
 		const DjRate targetRate = DjRate(targetRateWide);
@@ -599,6 +603,7 @@ public:
 			state_ = DJ_SYNC_OUT_OF_RANGE;
 			out.state = state_;
 			hasCommandedRate_ = false;
+			correctionActive_ = false;
 			return out;
 		}
 
@@ -613,6 +618,10 @@ public:
 			out.targetRate = targetRate;
 			hasCommandedRate_ = true;
 			commandedRate_ = targetRate;
+			// A brand-new baseline overwrites requestedRate outright, so any
+			// nudge residue from a prior correction is moot -- nothing left
+			// to explicitly cancel.
+			correctionActive_ = false;
 		}
 
 		if(!in.masterPlaying || !in.followerPlaying){
@@ -637,6 +646,21 @@ public:
 		if(magnitude <= DJ_SYNC_LOCK_TOLERANCE_FRAMES){
 			state_ = DJ_SYNC_LOCKED;
 			out.state = state_;
+			// Phase has converged. Any nudges that got us here are baked
+			// permanently into the real requestedRate (SpeedModifier::
+			// nudgeRate() only ever adds to it, never removes); left alone,
+			// that residual offset would run the follower away from its true
+			// BPM-derived tempo forever and eventually force reverse nudges
+			// once it drifts back out past master. Restore the exact
+			// baseline exactly once on this lock transition -- not every
+			// tick, so a future genuine drift can still nudge again.
+			if(correctionActive_){
+				out.applyRate = true;
+				out.targetRate = targetRate;
+				hasCommandedRate_ = true;
+				commandedRate_ = targetRate;
+				correctionActive_ = false;
+			}
 			return out;
 		}
 
@@ -648,6 +672,17 @@ public:
 			state_ = DJ_SYNC_ARMED;
 			out.state = state_;
 			ticksSinceNudge_ = 0;
+			// The upcoming seek corrects position directly; a leftover rate
+			// nudge from before the hard align would immediately start
+			// drifting the (now-aligned) phase again in the wrong direction.
+			// Cancel it the same way as at lock.
+			if(correctionActive_){
+				out.applyRate = true;
+				out.targetRate = targetRate;
+				hasCommandedRate_ = true;
+				commandedRate_ = targetRate;
+				correctionActive_ = false;
+			}
 			return out;
 		}
 
@@ -661,6 +696,7 @@ public:
 				out.applyNudge = true;
 				out.nudgeAmount = int32_t(nudge);
 				ticksSinceNudge_ = 0;
+				correctionActive_ = true;
 			}
 		}
 		return out;
@@ -694,6 +730,12 @@ private:
 	uint8_t ticksSinceNudge_ = DJ_SYNC_NUDGE_COOLDOWN_TICKS;
 	bool hasCommandedRate_ = false;
 	DjRate commandedRate_ = DJ_RATE_NEUTRAL;
+	// True once a nudge has biased the real requestedRate away from the
+	// pure BPM-derived baseline; cleared exactly once (at the next lock,
+	// hard align, or baseline/target change) when that bias is explicitly
+	// cancelled -- never per-tick, so it doesn't fight a still-converging
+	// correction.
+	bool correctionActive_ = false;
 };
 
 #endif

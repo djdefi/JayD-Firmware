@@ -555,6 +555,21 @@ struct FaithfulSpeedModifierModel {
 // accumulator, not a direct rate-to-frame subtraction) across multiple
 // cooldown windows and proves the correction persists/accumulates and
 // converges without oscillation or rate-command spam.
+//
+// Also covers a second, related regression found by post-lock review: the
+// nudges that drive convergence are *permanent* additions to requestedRate
+// (SpeedModifier::nudgeRate() never removes them), so once locked, the
+// residual offset from the correction would otherwise stay baked in forever
+// -- running the follower away from its true BPM-derived tempo and
+// eventually forcing reverse nudges once it drifts back out past master.
+// The controller now forces a one-shot baseline restoration exactly on the
+// lock transition (and on hard align) instead of leaving that residual
+// active, without reintroducing the original bug (i.e. it must NOT re-issue
+// applyRate every tick while already locked/settled). This test drives well
+// past the first lock and proves: phase stays within tolerance, requestedRate
+// settles to and stays at the exact BPM-derived baseline (no leftover
+// offset), no further nudges fire (no reverse corrections/oscillation), and
+// no further applyRate calls occur (no setRate spam) during settling.
 static void testSyncNudgePersistsAndConverges(){
 	DjSyncController sync;
 	FaithfulSpeedModifierModel model;
@@ -575,12 +590,25 @@ static void testSyncNudgePersistsAndConverges(){
 	int64_t cumulativeNudge = 0;
 	uint32_t nudgeCount = 0;
 	int64_t lastNudgeMagnitude = INT64_MAX;
+	// True once the one-shot baseline restoration has cancelled the nudge
+	// residue (at lock or hard align); while true, requestedRate must be
+	// exactly baselineTarget with no accumulated offset left over.
+	bool baselineRestored = false;
 
-	for(uint32_t tick = 0; tick < uint32_t(DJ_SYNC_NUDGE_COOLDOWN_TICKS) * 32; ++tick){
+	uint32_t lockTick = 0;
+	bool locked = false;
+	const uint32_t maxTicks = uint32_t(DJ_SYNC_NUDGE_COOLDOWN_TICKS) * 32;
+	for(uint32_t tick = 0; tick < maxTicks; ++tick){
 		DjSyncOutputs out = sync.tick(in);
 		if(out.applyRate){
 			assert(out.targetRate == baselineTarget);
 			model.setRate(out.targetRate);
+			if(nudgeCount > 0 && !baselineRestored){
+				// One-shot cancellation of the nudge residue (lock or hard
+				// align transition), not a per-tick re-command.
+				cumulativeNudge = 0;
+				baselineRestored = true;
+			}
 		}
 		if(out.applyNudge){
 			const int64_t magnitude = out.nudgeAmount < 0 ? -int64_t(out.nudgeAmount) : int64_t(out.nudgeAmount);
@@ -589,14 +617,18 @@ static void testSyncNudgePersistsAndConverges(){
 			model.nudgeRate(out.nudgeAmount);
 			cumulativeNudge += out.nudgeAmount;
 			++nudgeCount;
+			baselineRestored = false; // a fresh correction is active again
 		}
 
 		// The critical regression check: once a baseline has been commanded,
-		// every persisted nudge must remain visible in requestedRate. Before
-		// the fix, the very next tick's unconditional setRate(baselineTarget)
-		// erased it here.
+		// every persisted nudge must remain visible in requestedRate until
+		// explicitly (and only explicitly) cancelled. Before the first fix,
+		// the very next tick's unconditional setRate(baselineTarget) erased
+		// it here; before the second fix, it was never cancelled at all.
 		if(nudgeCount > 0){
-			assert(int64_t(model.requestedRate) == int64_t(baselineTarget) + cumulativeNudge);
+			const int64_t expected = baselineRestored
+				? int64_t(baselineTarget) : int64_t(baselineTarget) + cumulativeNudge;
+			assert(int64_t(model.requestedRate) == expected);
 		}
 
 		// Advance the follower's actual playback via the real ramp +
@@ -607,21 +639,51 @@ static void testSyncNudgePersistsAndConverges(){
 		const int64_t consumed = model.consumeSourceFrames(FaithfulSpeedModifierModel::kBufferSamples);
 		in.followerPhaseFrames -= (consumed - int64_t(FaithfulSpeedModifierModel::kBufferSamples));
 
-		if(out.state == DJ_SYNC_LOCKED) break;
+		if(!locked && out.state == DJ_SYNC_LOCKED){
+			locked = true;
+			lockTick = tick;
+			break;
+		}
 	}
 
+	assert(locked);
 	assert(nudgeCount >= 2); // correction continued across multiple cooldown windows
 	assert(in.followerPhaseFrames >= 0 &&
 		uint64_t(in.followerPhaseFrames) <= DJ_SYNC_LOCK_TOLERANCE_FRAMES);
 	assert(sync.state() == DJ_SYNC_LOCKED); // converged, not oscillating/spamming forever
+	assert(baselineRestored); // the residual nudge offset was explicitly cancelled at lock
+	assert(model.requestedRate == baselineTarget); // no leftover offset baked in
 
 	// Exact result for this starting error/geometry, derived from the
 	// faithful ramp+accumulator model above (not a naive rate-to-frame
 	// analytic guess): 17 nudges of strictly non-increasing magnitude
-	// (proving no oscillation), final phase error 26 frames (within the
-	// 64-frame lock tolerance).
+	// (proving no oscillation) before the first lock/baseline-restore.
 	assert(nudgeCount == 17);
-	assert(in.followerPhaseFrames == 26);
+	(void)lockTick;
+
+	// Extend well past the first lock for a bounded settling interval and
+	// prove the fix holds up over time, not just at the instant of lock:
+	// phase stays within tolerance, requestedRate/currentRate stay pinned to
+	// the exact baseline (no drift back off it), no further nudges fire
+	// (no reverse corrections/oscillation), and no further applyRate calls
+	// occur (no setRate spam) as long as nothing external changes.
+	const int64_t phaseAtLock = in.followerPhaseFrames;
+	const DjRate requestedAtLock = model.requestedRate;
+	const DjRate currentAtLock = model.currentRate;
+	for(uint32_t settleTick = 0; settleTick < uint32_t(DJ_SYNC_NUDGE_COOLDOWN_TICKS) * 4; ++settleTick){
+		DjSyncOutputs out = sync.tick(in);
+		assert(out.state == DJ_SYNC_LOCKED); // no oscillation back to ARMED/OUT_OF_RANGE
+		assert(!out.applyNudge);             // no reverse corrective nudges
+		assert(!out.applyRate);               // no setRate spam once settled
+		const int64_t consumed = model.consumeSourceFrames(FaithfulSpeedModifierModel::kBufferSamples);
+		in.followerPhaseFrames -= (consumed - int64_t(FaithfulSpeedModifierModel::kBufferSamples));
+		assert(in.followerPhaseFrames >= 0 &&
+			uint64_t(in.followerPhaseFrames) <= DJ_SYNC_LOCK_TOLERANCE_FRAMES);
+		assert(model.requestedRate == baselineTarget);
+	}
+	assert(model.requestedRate == requestedAtLock);
+	assert(model.currentRate == currentAtLock);
+	assert(in.followerPhaseFrames == phaseAtLock); // fully settled, no residual drift
 }
 
 int main(){
