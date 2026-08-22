@@ -53,7 +53,33 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_OPEN_FAILED,
 	DJ_COMMAND_ERROR_SESSION_ENDING,
 	DJ_COMMAND_ERROR_EMPTY_CUE,
-	DJ_COMMAND_ERROR_RECORDING_ACTIVE
+	DJ_COMMAND_ERROR_RECORDING_ACTIVE,
+	DJ_COMMAND_ERROR_RECORDING_BUSY,
+	DJ_COMMAND_ERROR_RECORDING_FAILED
+};
+
+// Firmware-owned recording lifecycle, decoupled from the library's own
+// RecordingState/RecordingError so the snapshot stays a stable shape for
+// physical UI and a future API v2 regardless of library internals.
+enum DjRecordingState : uint8_t {
+	DJ_RECORDING_IDLE,
+	DJ_RECORDING_STARTING,
+	DJ_RECORDING_ACTIVE,
+	DJ_RECORDING_STOPPING,
+	DJ_RECORDING_COMPLETE,
+	DJ_RECORDING_FAILED
+};
+
+enum DjRecordingError : uint8_t {
+	DJ_RECORDING_ERROR_NONE,
+	DJ_RECORDING_ERROR_SD_UNAVAILABLE,
+	DJ_RECORDING_ERROR_OPEN_FAILED,
+	DJ_RECORDING_ERROR_WRITE_FAILED,
+	DJ_RECORDING_ERROR_FINALIZE_FAILED,
+	DJ_RECORDING_ERROR_BUFFER_OVERRUN,
+	DJ_RECORDING_ERROR_QUEUE_FULL,
+	DJ_RECORDING_ERROR_NAME_EXHAUSTED,
+	DJ_RECORDING_ERROR_RENAME_FAILED
 };
 
 enum DjTimingQuality : uint8_t {
@@ -70,6 +96,18 @@ enum DjEffectType : uint8_t {
 	DJ_EFFECT_BITCRUSHER,
 	DJ_EFFECT_COUNT
 };
+
+// Recording-busy gate shared by DjSession::validate() and the host
+// self-check: only a new *start* is rejected while a previous start/stop is
+// still in flight (STARTING/ACTIVE/STOPPING). A stop is always allowed
+// through, even while STARTING, so a stop issued before the library applies
+// an accepted start is forwarded rather than silently rejected -- the
+// library's own recording state machine is designed to accept a stop during
+// STARTING and transition safely to STOPPING.
+inline bool djRecordingStartBusy(bool isStartCommand, DjRecordingState state){
+	return isStartCommand &&
+		   (state == DJ_RECORDING_STARTING || state == DJ_RECORDING_ACTIVE || state == DJ_RECORDING_STOPPING);
+}
 
 struct DjCommand {
 	uint32_t id = 0;
@@ -203,6 +241,21 @@ struct DjDeckSnapshot {
 	DjCueSnapshot cues[DJ_CUE_COUNT] = {};
 };
 
+// Authoritative recording lifecycle snapshot: accepted (STARTING/STOPPING)
+// vs applied (ACTIVE/COMPLETE/FAILED) state, stable error mapping, validity,
+// byte/duration counters, the finalized file path once available, and
+// boot-time orphan recovery diagnostics.
+struct DjRecordingSnapshot {
+	DjRecordingState state = DJ_RECORDING_IDLE;
+	DjRecordingError error = DJ_RECORDING_ERROR_NONE;
+	bool valid = false;
+	uint32_t bytes = 0;
+	uint32_t durationMs = 0;
+	char path[DJ_PATH_CAPACITY] = {};
+	uint32_t orphansRepaired = 0;
+	uint32_t orphansFailed = 0;
+};
+
 struct DjSnapshot {
 	uint64_t seq = 0;
 	uint64_t bootId = 0;
@@ -210,7 +263,7 @@ struct DjSnapshot {
 	bool sessionActive = false;
 	bool mixerRunning = false;
 	uint8_t mix = 127;
-	bool recording = false;
+	DjRecordingSnapshot recordingInfo;
 	DjDeckSnapshot decks[DJ_DECK_COUNT] = {};
 	uint8_t queueDepth = 0;
 	uint32_t queueDrops = 0;

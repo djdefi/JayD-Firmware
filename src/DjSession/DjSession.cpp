@@ -1,4 +1,5 @@
 #include "DjSession.h"
+#include "DjRecordingStorage.h"
 #include <Arduino.h>
 #include <AudioLib/EffectType.hpp>
 #include <Loop/LoopManager.h>
@@ -8,6 +9,7 @@
 DjSession* DjSession::instance = nullptr;
 uint64_t DjSession::bootId = 0;
 uint32_t DjSession::sessionCounter = 0;
+bool DjSession::orphanRecoveryDone = false;
 
 DjSession* DjSession::begin(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix){
 	if(instance) return instance;
@@ -35,6 +37,13 @@ void DjSession::end(){
 DjSession::DjSession(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix) :
 		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter){
 	system = new MixSystem();
+	if(!orphanRecoveryDone){
+		orphanRecoveryDone = true;
+		const DjRecordingStorage::RecoveryResult recovery =
+				DjRecordingStorage::recoverOrphan(MixSystem::recordPath);
+		recordingSnapshot.orphansRepaired = recovery.repaired;
+		recordingSnapshot.orphansFailed = recovery.failed;
+	}
 	publishSnapshot();
 }
 
@@ -210,6 +219,12 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 			return DJ_COMMAND_ERROR_INVALID_PATH;
 		}
 	}
+	if(command.type == DJ_COMMAND_SET_RECORDING && system){
+		const DjRecordingState mapped = mapRecordingState(system->getRecordingStatus().state);
+		if(djRecordingStartBusy(command.value != 0, mapped)){
+			return DJ_COMMAND_ERROR_RECORDING_BUSY;
+		}
+	}
 	return DJ_COMMAND_ERROR_NONE;
 }
 
@@ -263,6 +278,7 @@ void DjSession::loop(uint micros){
 		commandMutex.unlock();
 	}
 
+	pollRecording();
 	publishSnapshot();
 }
 
@@ -332,14 +348,18 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 			}
 			return true;
 		}
-		case DJ_COMMAND_SET_RECORDING:
+		case DJ_COMMAND_SET_RECORDING: {
 			if(!hasDeck(0) && !hasDeck(1)){
 				error = DJ_COMMAND_ERROR_NO_DECK;
 				return false;
 			}
-			if(command.value) system->startRecording();
-			else system->stopRecording();
+			const bool ok = command.value ? system->startRecording() : system->stopRecording();
+			if(!ok){
+				error = DJ_COMMAND_ERROR_RECORDING_FAILED;
+				return false;
+			}
 			return true;
+		}
 		case DJ_COMMAND_SET_CUE:
 			return cues.set(command.deck, command.slot, system->getElapsed(command.deck));
 		case DJ_COMMAND_TRIGGER_CUE: {
@@ -360,9 +380,14 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 }
 
 bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
-	if(system->isRecording()){
-		error = DJ_COMMAND_ERROR_RECORDING_ACTIVE;
-		return false;
+	if(system){
+		const RecordingState state = system->getRecordingStatus().state;
+		if(state == RecordingState::STARTING ||
+		   state == RecordingState::RECORDING ||
+		   state == RecordingState::STOPPING){
+			error = DJ_COMMAND_ERROR_RECORDING_ACTIVE;
+			return false;
+		}
 	}
 	fs::File file = SD.open(command.path);
 	if(!file){
@@ -404,6 +429,81 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	return true;
 }
 
+DjRecordingState DjSession::mapRecordingState(RecordingState state){
+	switch(state){
+		case RecordingState::IDLE: return DJ_RECORDING_IDLE;
+		case RecordingState::STARTING: return DJ_RECORDING_STARTING;
+		case RecordingState::RECORDING: return DJ_RECORDING_ACTIVE;
+		case RecordingState::STOPPING: return DJ_RECORDING_STOPPING;
+		case RecordingState::COMPLETE: return DJ_RECORDING_COMPLETE;
+		case RecordingState::FAILED: return DJ_RECORDING_FAILED;
+		default: return DJ_RECORDING_FAILED;
+	}
+}
+
+DjRecordingError DjSession::mapRecordingError(RecordingError error){
+	switch(error){
+		case RecordingError::NONE: return DJ_RECORDING_ERROR_NONE;
+		case RecordingError::SD_UNAVAILABLE: return DJ_RECORDING_ERROR_SD_UNAVAILABLE;
+		case RecordingError::OPEN_FAILED: return DJ_RECORDING_ERROR_OPEN_FAILED;
+		case RecordingError::WRITE_FAILED: return DJ_RECORDING_ERROR_WRITE_FAILED;
+		case RecordingError::FINALIZE_FAILED: return DJ_RECORDING_ERROR_FINALIZE_FAILED;
+		case RecordingError::BUFFER_OVERRUN: return DJ_RECORDING_ERROR_BUFFER_OVERRUN;
+		case RecordingError::QUEUE_FULL: return DJ_RECORDING_ERROR_QUEUE_FULL;
+		default: return DJ_RECORDING_ERROR_NONE;
+	}
+}
+
+void DjSession::pollRecording(){
+	if(!system) return;
+	const RecordingStatus status = system->getRecordingStatus();
+	const DjRecordingState mapped = mapRecordingState(status.state);
+
+	if(mapped != lastRecordingState){
+		if(mapped == DJ_RECORDING_STARTING){
+			// fresh attempt: clear any stale path/error from a prior recording
+			recordingSnapshot.path[0] = '\0';
+			recordingSnapshot.error = DJ_RECORDING_ERROR_NONE;
+			recordingSnapshot.valid = false;
+			finalizeError = DJ_RECORDING_ERROR_NONE;
+		}else if(mapped == DJ_RECORDING_COMPLETE && status.fileValid){
+			// finalize exactly once, on the completion edge
+			char finalPath[DJ_PATH_CAPACITY];
+			const auto outcome = DjRecordingStorage::finalizeRecording(MixSystem::recordPath, finalPath, sizeof(finalPath));
+			if(outcome == DjRecordingStorage::FinalizeOutcome::SUCCESS){
+				memcpy(recordingSnapshot.path, finalPath, strlen(finalPath) + 1);
+			}else{
+				recordingSnapshot.path[0] = '\0';
+				finalizeError = outcome == DjRecordingStorage::FinalizeOutcome::RENAME_FAILED
+					? DJ_RECORDING_ERROR_RENAME_FAILED
+					: DJ_RECORDING_ERROR_NAME_EXHAUSTED;
+			}
+		}
+		lastRecordingState = mapped;
+	}
+
+	recordingSnapshot.state = mapped;
+	// Freeze the terminal error/validity once the outcome is settled so a
+	// subsequent idle poll can't clobber what the UI/API needs to show. A
+	// storage-layer finalize failure (bounded naming exhausted or rename
+	// failed) overrides a library-reported success: the recording captured
+	// fine but could not be moved into permanent, collision-safe storage.
+	if(mapped == DJ_RECORDING_COMPLETE || mapped == DJ_RECORDING_FAILED){
+		if(finalizeError != DJ_RECORDING_ERROR_NONE){
+			recordingSnapshot.error = finalizeError;
+			recordingSnapshot.valid = false;
+		}else{
+			recordingSnapshot.error = mapRecordingError(status.error);
+			recordingSnapshot.valid = mapped == DJ_RECORDING_COMPLETE && status.fileValid;
+		}
+	}else{
+		recordingSnapshot.error = DJ_RECORDING_ERROR_NONE;
+		recordingSnapshot.valid = false;
+	}
+	recordingSnapshot.bytes = status.bytes;
+	recordingSnapshot.durationMs = status.durationMs;
+}
+
 void DjSession::publishSnapshot(){
 	DjSnapshot snapshot = {};
 	snapshot.seq = ++snapshotSeq;
@@ -412,7 +512,7 @@ void DjSession::publishSnapshot(){
 	snapshot.sessionActive = !ending;
 	snapshot.mixerRunning = system && system->isRunning();
 	snapshot.mix = mix;
-	snapshot.recording = system && system->isRecording();
+	snapshot.recordingInfo = recordingSnapshot;
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
 		DjDeckSnapshot& deckSnapshot = snapshot.decks[deck];

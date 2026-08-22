@@ -49,7 +49,7 @@ namespace MixScreen {
 
 		bool loadChannel(uint8_t channel, const String& path);
 		bool syncFromSnapshot(const DjSnapshot& snapshot, bool force = false);
-		bool processCommandResults(const DjSnapshot& snapshot);
+		void processCommandResults(const DjSnapshot& snapshot);
 		bool resultHandled(uint32_t id) const;
 		void markResultHandled(uint32_t id);
 		void openBrowse();
@@ -61,6 +61,7 @@ namespace MixScreen {
 		void drawStatus();
 		void showCommandError(DjCommandError error);
 		const char* commandErrorText(DjCommandError error) const;
+		const char* recordingErrorText(DjRecordingError error) const;
 
 		LinearLayout* screenLayout;
 		LinearLayout* leftLayout;
@@ -77,17 +78,11 @@ namespace MixScreen {
 		void buildUI();
 
 		uint8_t selectedChannel = 0;
-		bool isRecording = false;
-		bool doneRecording = false;
-		uint32_t pendingRecordingStop = 0;
+		DjRecordingState recordingState = DJ_RECORDING_IDLE;
 		uint32_t handledResults[DJ_RECENT_RESULT_COUNT] = {};
 		uint8_t handledResultNext = 0;
 		uint32_t statusUntil = 0;
 		String statusText;
-		String saveFilename;
-		void saveRecording();
-		void drawSaveStatus();
-
 
 		uint32_t lastDraw = 0;
 		bool drawQueued = false;
