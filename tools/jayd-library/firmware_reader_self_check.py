@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import binascii
+import importlib.util
 import json
 import shutil
 import struct
@@ -35,6 +36,21 @@ def section_index(data: bytes, kind: bytes) -> int:
         if data[HEADER.size + index * entry_size:HEADER.size + index * entry_size + 4] == kind:
             return index
     raise AssertionError(f"missing section {kind!r}")
+
+
+def section(data: bytes, kind: bytes) -> tuple[int, int]:
+    index = section_index(data, kind)
+    entry = HEADER.size + index * SECTION.size
+    return struct.unpack_from("<Q", data, entry + 16)[0], struct.unpack_from("<H", data, entry + 6)[0]
+
+
+def converter_module():
+    spec = importlib.util.spec_from_file_location("jayd_library_self_check", CONVERTER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def fixtures(directory: Path) -> None:
@@ -72,6 +88,74 @@ def fixtures(directory: Path) -> None:
         "-o", str(directory / "valid.jydm"),
     ], check=True, stdout=subprocess.DEVNULL)
     valid = (directory / "valid.jydm").read_bytes()
+
+    jayd = converter_module()
+    fractional = jayd.encode(jayd.LibraryData([jayd.TrackData(
+        "fractional.aac", "fractional", "self-check",
+        sample_rate=44100,
+        duration_frames=110250,
+        cues=[
+            jayd.CuePoint(position_seconds=jayd.Fraction(5, 2)),
+            jayd.CuePoint(
+                kind=2,
+                position_seconds=jayd.Fraction(1),
+                length_seconds=jayd.Fraction(3, 2),
+            ),
+        ],
+        grid=[jayd.GridSegment(position_seconds=jayd.Fraction(5, 2))],
+        phrases=[jayd.PhraseMarker("end", position_seconds=jayd.Fraction(5, 2))],
+    )]))
+    (directory / "fractional-valid.jydm").write_bytes(fractional)
+    boundary = jayd.encode(jayd.LibraryData([jayd.TrackData(
+        "boundary.aac", "boundary", "self-check",
+        sample_rate=jayd.MAX_SAMPLE_RATE,
+        duration_frames=jayd.MAX_DURATION_FRAMES,
+        cues=[jayd.CuePoint(position_seconds=jayd.Fraction(
+            jayd.MAX_DURATION_FRAMES, jayd.MAX_SAMPLE_RATE
+        ))],
+        grid=[jayd.GridSegment(position_seconds=jayd.Fraction(
+            jayd.MAX_DURATION_FRAMES, jayd.MAX_SAMPLE_RATE
+        ))],
+        phrases=[jayd.PhraseMarker("end", position_seconds=jayd.Fraction(
+            jayd.MAX_DURATION_FRAMES, jayd.MAX_SAMPLE_RATE
+        ))],
+    )]))
+    (directory / "fractional-boundary.jydm").write_bytes(boundary)
+
+    cue_offset, cue_size = section(fractional, b"CUES")
+    grid_offset, _ = section(fractional, b"GRID")
+    phrase_offset, _ = section(fractional, b"PHRA")
+
+    denominator_zero = bytearray(fractional)
+    struct.pack_into("<I", denominator_zero, cue_offset + 32, 0)
+    (directory / "fractional-denominator-zero.jydm").write_bytes(repaired(denominator_zero))
+
+    cue_over = bytearray(fractional)
+    struct.pack_into("<Q", cue_over, cue_offset + cue_size + 24, 110251)
+    struct.pack_into("<I", cue_over, cue_offset + cue_size + 32, 44100)
+    (directory / "fractional-cue-over.jydm").write_bytes(repaired(cue_over))
+
+    loop_over = bytearray(fractional)
+    struct.pack_into("<Q", loop_over, cue_offset + 36, 66151)
+    struct.pack_into("<I", loop_over, cue_offset + 44, 44100)
+    (directory / "fractional-loop-over.jydm").write_bytes(repaired(loop_over))
+
+    grid_over = bytearray(fractional)
+    struct.pack_into("<Q", grid_over, grid_offset + 12, 110251)
+    struct.pack_into("<I", grid_over, grid_offset + 20, 44100)
+    (directory / "fractional-grid-over.jydm").write_bytes(repaired(grid_over))
+
+    phrase_over = bytearray(fractional)
+    struct.pack_into("<Q", phrase_over, phrase_offset + 12, 110251)
+    struct.pack_into("<I", phrase_over, phrase_offset + 20, 44100)
+    (directory / "fractional-phrase-over.jydm").write_bytes(repaired(phrase_over))
+
+    product_overflow = bytearray(fractional)
+    struct.pack_into("<Q", product_overflow, cue_offset + 24, 0xFFFFFFFFFFFFFFFF)
+    struct.pack_into("<I", product_overflow, cue_offset + 32, 0xFFFFFFFF)
+    (directory / "fractional-64-bit-product-overflow.jydm").write_bytes(
+        repaired(product_overflow)
+    )
 
     corrupt = bytearray(valid)
     corrupt[-1] ^= 1

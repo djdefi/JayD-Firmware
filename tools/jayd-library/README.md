@@ -93,6 +93,11 @@ frame-or-rational convention. Grid records contain BPM times 1000, signed beat
 number (`1` is a downbeat; zero unknown), confidence `0..10000`, and flags.
 Phrase records contain a kind string and confidence.
 
+When source rate and duration are known, frame and rational positions must be
+within the source duration. Cue position plus loop length must also fit. Readers
+compare these values exactly and must not use overflow-prone fixed-width
+cross-multiplication.
+
 Version 1 bounds: 4,096 tracks; 64 cues, 256 grid segments, and 128 phrase
 markers per track; 8,192 metadata entries; 256 playlists; 65,535 playlist
 entries; 1,024-byte paths; 4,096-byte strings; 768 kHz sample rate; and

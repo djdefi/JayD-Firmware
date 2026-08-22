@@ -204,18 +204,24 @@ CREATE TABLE cues (
             jayd.encode(jayd.LibraryData(too_many))
 
     def test_duplicate_tie_break_and_manifest_targets_are_deterministic(self):
-        one = jayd.TrackData("same.wav", "1", "test", cues=[jayd.CuePoint(label="A")])
-        two = jayd.TrackData("same.wav", "2", "test", cues=[jayd.CuePoint(label="B")])
+        one = jayd.TrackData("same.wav", "1", "test", cues=[
+            jayd.CuePoint(position_frames=0, label="A")
+        ])
+        two = jayd.TrackData("same.wav", "2", "test", cues=[
+            jayd.CuePoint(position_frames=0, label="B")
+        ])
         self.assertEqual(
             jayd.encode(jayd.LibraryData([one, two])),
             jayd.encode(jayd.LibraryData([two, one])),
         )
         library = jayd.LibraryData([
             jayd.TrackData("same.wav", "1", "test", cues=[
-                jayd.CuePoint(label="B"), jayd.CuePoint(label="A")
+                jayd.CuePoint(position_frames=0, label="B"),
+                jayd.CuePoint(position_frames=0, label="A"),
             ]),
             jayd.TrackData("same.wav", "2", "test", cues=[
-                jayd.CuePoint(label="A"), jayd.CuePoint(label="C")
+                jayd.CuePoint(position_frames=0, label="A"),
+                jayd.CuePoint(position_frames=0, label="C"),
             ]),
         ])
         self.assertEqual(jayd.encode(library), jayd.encode(library))
@@ -306,6 +312,67 @@ CREATE TABLE cues (
         warnings = []
         self.assertEqual(jayd._source_duration("1", 0, warnings, "test duration"), 0)
         self.assertIn("sample rate", warnings[0])
+
+    def test_rational_timeline_bounds(self):
+        track = jayd.TrackData(
+            "fractional.aac", "1", "test",
+            sample_rate=44100,
+            duration_frames=110250,
+            cues=[
+                jayd.CuePoint(position_seconds=jayd.Fraction(5, 2)),
+                jayd.CuePoint(
+                    kind=2,
+                    position_seconds=jayd.Fraction(1),
+                    length_seconds=jayd.Fraction(3, 2),
+                ),
+            ],
+            grid=[jayd.GridSegment(position_seconds=jayd.Fraction(5, 2))],
+            phrases=[jayd.PhraseMarker("end", position_seconds=jayd.Fraction(5, 2))],
+        )
+        encoded = jayd.encode(jayd.LibraryData([track]))
+        self.assertEqual(jayd.decode(encoded)["track_count"], 1)
+
+        boundary = jayd.TrackData(
+            "boundary.aac", "2", "test",
+            sample_rate=jayd.MAX_SAMPLE_RATE,
+            duration_frames=jayd.MAX_DURATION_FRAMES,
+            cues=[jayd.CuePoint(position_seconds=jayd.Fraction(
+                jayd.MAX_DURATION_FRAMES, jayd.MAX_SAMPLE_RATE
+            ))],
+        )
+        self.assertEqual(jayd.decode(jayd.encode(jayd.LibraryData([boundary])))["track_count"], 1)
+
+        invalid_positions = [
+            ("cue", {"cues": [jayd.CuePoint(position_seconds=jayd.Fraction(110251, 44100))]}),
+            ("loop", {"cues": [jayd.CuePoint(
+                kind=2,
+                position_seconds=jayd.Fraction(1),
+                length_seconds=jayd.Fraction(66151, 44100),
+            )]}),
+            ("beatgrid", {"grid": [jayd.GridSegment(position_seconds=jayd.Fraction(110251, 44100))]}),
+            ("phrase", {"phrases": [jayd.PhraseMarker(
+                "late", position_seconds=jayd.Fraction(110251, 44100)
+            )]}),
+            ("64-bit-product-overflow", {"cues": [jayd.CuePoint(position_seconds=jayd.Fraction(
+                jayd.NO_FRAME, 0xFFFFFFFF
+            ))]}),
+        ]
+        for label, values in invalid_positions:
+            with self.subTest(label=label), self.assertRaisesRegex(jayd.FormatError, "duration"):
+                jayd.encode(jayd.LibraryData([jayd.TrackData(
+                    f"{label}.aac", label, "test",
+                    sample_rate=44100,
+                    duration_frames=110250,
+                    **values,
+                )]))
+
+        malformed = bytearray(encoded)
+        summary = jayd._decode_layout(malformed)
+        struct.pack_into("<I", malformed, summary["sections"]["CUES"]["offset"] + 32, 0)
+        struct.pack_into("<I", malformed, 44, 0)
+        struct.pack_into("<I", malformed, 44, jayd.binascii.crc32(malformed) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(jayd.FormatError, "invalid rational"):
+            jayd.decode(malformed)
 
 
 if __name__ == "__main__":

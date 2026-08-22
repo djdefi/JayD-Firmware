@@ -744,6 +744,65 @@ def _track_score(track: TrackData) -> tuple[int, str]:
     return score, tie
 
 
+def _timeline_frames(
+    frame: int | None,
+    seconds: Fraction | None,
+    sample_rate: int,
+    required: bool,
+    label: str,
+) -> Fraction | None:
+    if frame is not None:
+        if not 0 <= frame <= MAX_DURATION_FRAMES:
+            raise FormatError(f"{label} frame position exceeds bounds")
+        return Fraction(frame)
+    if seconds is None:
+        if required:
+            raise FormatError(f"{label} has no frame or rational position")
+        return None
+    if seconds < 0:
+        raise FormatError(f"{label} rational position is negative")
+    return seconds * sample_rate if sample_rate else None
+
+
+def _validate_track_timeline(track: TrackData) -> None:
+    if track.duration_frames and not track.sample_rate:
+        raise FormatError(f"{track.path}: duration frames require a sample rate")
+
+    def position(frame: int | None, seconds: Fraction | None, label: str) -> Fraction | None:
+        value = _timeline_frames(frame, seconds, track.sample_rate, True, label)
+        if value is not None and track.duration_frames and value > track.duration_frames:
+            raise FormatError(f"{label} exceeds track duration")
+        return value
+
+    for cue in track.cues:
+        cue_position = position(cue.position_frames, cue.position_seconds, f"{track.path}: cue position")
+        cue_length = _timeline_frames(
+            cue.length_frames, cue.length_seconds, track.sample_rate, False,
+            f"{track.path}: cue length",
+        )
+        if (cue_position is not None and cue_length is not None and track.duration_frames
+                and cue_position + cue_length > track.duration_frames):
+            raise FormatError(f"{track.path}: cue position and length exceed track duration")
+    for segment in track.grid:
+        position(segment.position_frames, segment.position_seconds, f"{track.path}: beatgrid position")
+    for phrase in track.phrases:
+        position(phrase.position_frames, phrase.position_seconds, f"{track.path}: phrase position")
+
+
+def _decoded_time(
+    frame: int,
+    numerator: int,
+    denominator: int,
+    required: bool,
+    label: str,
+) -> tuple[int | None, Fraction | None]:
+    if denominator == 0:
+        if numerator or (frame == NO_FRAME and required):
+            raise FormatError(f"{label} has an invalid rational position")
+        return (None if frame == NO_FRAME else frame), None
+    return (None if frame == NO_FRAME else frame), Fraction(numerator, denominator)
+
+
 def finalize(library: LibraryData) -> LibraryData:
     library = copy.deepcopy(library)
     if len(library.tracks) > MAX_TRACKS:
@@ -782,6 +841,7 @@ def finalize(library: LibraryData) -> LibraryData:
             raise FormatError(f"{track.path}: sample rate out of range")
         if not 0 <= track.duration_frames <= MAX_DURATION_FRAMES:
             raise FormatError(f"{track.path}: duration frames out of range")
+        _validate_track_timeline(track)
         if not track.source_id:
             track.source_id = hashlib.sha256(
                 f"{track.source}\0{track.native_id}".encode("utf-8")
@@ -1121,13 +1181,19 @@ def _decode_library(data: bytes, summary: dict[str, object]) -> LibraryData:
             ) = record
             if owner != track_index or cue_reserved != b"\0" * 8:
                 raise FormatError("cue owner or reserved bytes are invalid")
+            cue_position, cue_seconds = _decoded_time(
+                position_frames, position_num, position_den, True, "cue position"
+            )
+            cue_length, cue_length_seconds = _decoded_time(
+                length_frames, length_num, length_den, False, "cue length"
+            )
             track.cues.append(CuePoint(
                 kind=kind,
                 slot=slot,
-                position_frames=None if position_frames == NO_FRAME else position_frames,
-                length_frames=None if length_frames == NO_FRAME else length_frames,
-                position_seconds=Fraction(position_num, position_den) if position_den else None,
-                length_seconds=Fraction(length_num, length_den) if length_den else None,
+                position_frames=cue_position,
+                length_frames=cue_length,
+                position_seconds=cue_seconds,
+                length_seconds=cue_length_seconds,
                 label=read_string(label_offset),
                 color=cue_color,
                 flags=cue_flags,
@@ -1139,9 +1205,12 @@ def _decode_library(data: bytes, summary: dict[str, object]) -> LibraryData:
             ) = record
             if owner != track_index or grid_reserved != b"\0" * 4:
                 raise FormatError("beatgrid owner or reserved bytes are invalid")
+            grid_position, grid_seconds = _decoded_time(
+                position_frames, position_num, position_den, True, "beatgrid position"
+            )
             track.grid.append(GridSegment(
-                position_frames=None if position_frames == NO_FRAME else position_frames,
-                position_seconds=Fraction(position_num, position_den) if position_den else None,
+                position_frames=grid_position,
+                position_seconds=grid_seconds,
                 bpm_milli=grid_bpm,
                 beat_number=beat_number,
                 confidence=confidence,
@@ -1151,13 +1220,17 @@ def _decode_library(data: bytes, summary: dict[str, object]) -> LibraryData:
             owner, position_frames, position_num, position_den, kind_offset, confidence, phrase_flags = record
             if owner != track_index:
                 raise FormatError("phrase owner is invalid")
+            phrase_position, phrase_seconds = _decoded_time(
+                position_frames, position_num, position_den, True, "phrase position"
+            )
             track.phrases.append(PhraseMarker(
                 kind=read_string(kind_offset),
-                position_frames=None if position_frames == NO_FRAME else position_frames,
-                position_seconds=Fraction(position_num, position_den) if position_den else None,
+                position_frames=phrase_position,
+                position_seconds=phrase_seconds,
                 confidence=confidence,
                 flags=phrase_flags,
             ))
+        _validate_track_timeline(track)
         tracks.append(track)
 
     entry_records = _decode_records(data, sections["PLEN"], PLAYLIST_ENTRY)
