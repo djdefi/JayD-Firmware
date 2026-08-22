@@ -1,7 +1,30 @@
 #include "DjAssistSessionBridge.h"
 #include "DjAssistScoring.h"
+#include <string.h>
 
 namespace DjAssistBridge {
+
+namespace {
+bool isNonZero16(const uint8_t bytes[16]){
+	for(uint8_t i = 0; i < 16; ++i){
+		if(bytes[i] != 0) return true;
+	}
+	return false;
+}
+} // namespace
+
+DjTrackIdentity buildTrackIdentity(const uint8_t fingerprint[16], const uint8_t sourceId[16]){
+	DjTrackIdentity identity;
+	if(isNonZero16(fingerprint)){
+		identity.flags |= DJ_TRACK_IDENTITY_FINGERPRINT;
+		memcpy(identity.fingerprint, fingerprint, 16);
+	}
+	if(isNonZero16(sourceId)){
+		identity.flags |= DJ_TRACK_IDENTITY_SOURCE;
+		memcpy(identity.sourceId, sourceId, 16);
+	}
+	return identity;
+}
 
 DjAssistLibraryEntry buildLibraryEntry(
 	uint32_t libraryIndex,

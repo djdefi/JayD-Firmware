@@ -14,6 +14,41 @@ DjTrackIdentity fingerprintIdentity(uint8_t seed){
 	return identity;
 }
 
+// -- buildTrackIdentity: zero-array evidence gating -----------------------
+
+void testBuildTrackIdentityGatesZeroEvidence(){
+	uint8_t zero[16] = {};
+	uint8_t fp[16];
+	memset(fp, 0xAB, sizeof(fp));
+	uint8_t src[16];
+	memset(src, 0xCD, sizeof(src));
+
+	// Both zero: no evidence at all.
+	const DjTrackIdentity none = buildTrackIdentity(zero, zero);
+	assert(none.flags == 0);
+
+	// Only fingerprint real.
+	const DjTrackIdentity fpOnly = buildTrackIdentity(fp, zero);
+	assert(fpOnly.flags == DJ_TRACK_IDENTITY_FINGERPRINT);
+	assert(memcmp(fpOnly.fingerprint, fp, 16) == 0);
+
+	// Only sourceId real.
+	const DjTrackIdentity srcOnly = buildTrackIdentity(zero, src);
+	assert(srcOnly.flags == DJ_TRACK_IDENTITY_SOURCE);
+	assert(memcmp(srcOnly.sourceId, src, 16) == 0);
+
+	// Both real.
+	const DjTrackIdentity both = buildTrackIdentity(fp, src);
+	assert(both.flags == (DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE));
+	assert(memcmp(both.fingerprint, fp, 16) == 0);
+	assert(memcmp(both.sourceId, src, 16) == 0);
+
+	// Two independently-built all-zero identities must never claim to
+	// match via DjAssistScoring::identityMatches (no comparable evidence).
+	const DjTrackIdentity otherNone = buildTrackIdentity(zero, zero);
+	assert(none.flags == otherNone.flags && none.flags == 0);
+}
+
 // -- buildLibraryEntry: capability bits mirror DjSession::resolveMetadata()
 // -- exactly (minus the deliberately-out-of-scope downbeat enumeration).
 
@@ -113,6 +148,7 @@ void testCrossfadeMixOverflowGuard(){
 } // namespace
 
 int main(){
+	testBuildTrackIdentityGatesZeroEvidence();
 	testBuildLibraryEntryFullCapabilities();
 	testBuildLibraryEntryMissingFieldsClearBitsOnly();
 	testCrossfadeMixEndpoints();
