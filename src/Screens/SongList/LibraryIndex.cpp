@@ -120,6 +120,10 @@ bool matchesFile(const Record& record, const FileEvidence& evidence){
 	return true;
 }
 
+State stateAfterRecovery(State recoveredState, bool recovered){
+	return recovered ? recoveredState : State::Error;
+}
+
 ValidationResult validate(ReadAt readAt, void* context, uint32_t fileSize, const Limits& limits){
 	Header header{};
 	if(readAt == nullptr || fileSize < sizeof(Header) ||

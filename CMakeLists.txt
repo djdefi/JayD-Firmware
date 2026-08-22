@@ -76,3 +76,11 @@ add_custom_target(CMUpload ALL
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(${CMAKE_PROJECT_NAME}.bin ${CMAKE_PROJECT_NAME}.ino ${SOURCES})
+
+enable_testing()
+add_executable(LibraryIndexSelfCheck
+        tests/library_index_selfcheck.cpp
+        src/Screens/SongList/LibraryIndex.cpp)
+set_target_properties(LibraryIndexSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME LibraryIndexSelfCheck COMMAND LibraryIndexSelfCheck)

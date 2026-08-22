@@ -173,6 +173,14 @@ int main(){
 	std::vector<uint8_t> generationB = makeIndex(8, BuildState::Complete, card, original);
 	assert(validate(generationA).error == ValidationError::None);
 	assert(newestValid(generationA, generationB, card) == 1);
+	assert(LibraryIndex::stateAfterRecovery(
+		LibraryIndex::State::Verifying,
+		true
+	) == LibraryIndex::State::Verifying);
+	assert(LibraryIndex::stateAfterRecovery(
+		LibraryIndex::State::Building,
+		false
+	) == LibraryIndex::State::Error);
 
 	std::vector<uint8_t> interrupted = generationB;
 	header(interrupted).buildState = static_cast<uint8_t>(BuildState::Building);
