@@ -4,9 +4,6 @@
 #include <Support/Context.h>
 #include <UI/Screen.h>
 #include <UI/Image.h>
-#include <UI/LinearLayout.h>
-#include <UI/ScrollLayout.h>
-#include "ListItem.h"
 #include <Input/InputJayD.h>
 #include "../../InputKeys.h"
 
@@ -32,29 +29,38 @@ namespace SongList {
 
 	private:
 		static SongList *instance;
-		ScrollLayout* scrollLayout;
-		LinearLayout* list;
 
 		int selectedElement = 0;
+		int firstVisible = 0;
 
 		Color *backgroundBuffer = nullptr;
+		char* pathBuffer = nullptr;
+		uint32_t* songOffsets = nullptr;
+		size_t pathBytes = 0;
+		size_t pathCapacity = 0;
+		size_t songCount = 0;
+		size_t songCapacity = 0;
 
-		std::vector<ListItem *> songs;
-
-		void buildUI();
-
+		void clearSongs();
 		void checkSD();
-
-		void searchDirectories(File dir);
+		bool searchDirectories(File dir);
+		bool addSong(const char* path);
+		bool reservePaths(size_t required);
+		bool reserveSongs(size_t required);
+		const char* songPath(size_t index) const;
 
 		void encTwoTop() override;
 		bool waiting = false;
 		bool insertedSD = true;
 		bool empty = true;
+		bool scanLimited = false;
+		bool allocationFailed = false;
 
-		uint32_t prevSDCheck = 0;
-
-		static const uint16_t checkInterval = 500;
+		static const size_t maxTrackCount = 4096;
+		static const size_t maxPathLength = 255;
+		static const size_t maxPathPayload = 128 * 1024;
+		static const uint8_t visibleRows = 5;
+		static const uint8_t rowHeight = 20;
 	};
 }
 #endif //JAYD_FIRMWARE_SONGLIST_H
