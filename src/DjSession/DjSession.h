@@ -38,6 +38,9 @@ public:
 	DjSubmitResult setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
+#if defined(JAYD_ENABLE_WIRELESS)
+	DjSubmitResult requestPairing(DjCommandOrigin origin);
+#endif
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -109,6 +112,9 @@ private:
 	// (naming space exhausted vs. rename I/O failure); DJ_RECORDING_ERROR_NONE
 	// otherwise. Overrides a library-reported success once set.
 	DjRecordingError finalizeError = DJ_RECORDING_ERROR_NONE;
+#if defined(JAYD_ENABLE_WIRELESS)
+	uint32_t pairingGeneration = 0;
+#endif
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;

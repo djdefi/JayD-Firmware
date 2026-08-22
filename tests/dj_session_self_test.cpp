@@ -244,5 +244,26 @@ int main(){
 	assert(controls.confirmPalette() == MIX_PALETTE_LOOPSYNC);
 	assert(controls.bank == MIX_BANK_LOOPSYNC);
 
+#if defined(JAYD_ENABLE_WIRELESS)
+	// Stale-identity regression: a command captured against a pre-reboot
+	// boot_id/session_id must never match the device's current identity,
+	// across the full uint64 range (not just small test values) - this is
+	// the exact compare the boot_id-precision fix depends on staying
+	// correct now that boot_id travels the wire as an opaque string.
+	DjCommand preReboot = command(40, DJ_COMMAND_SET_MIX);
+	preReboot.origin = DJ_ORIGIN_HTTP;
+	preReboot.requestBootId = UINT64_MAX - 1;
+	preReboot.requestSessionId = 42;
+	assert(djCommandIdentityMatches(preReboot, UINT64_MAX - 1, 42));
+	// Device rebooted: new boot_id, session reset to 0. The stale command
+	// must be rejected, not accidentally accepted.
+	assert(!djCommandIdentityMatches(preReboot, UINT64_MAX, 0));
+	// Non-HTTP-origin commands (local UI on the device itself) carry no
+	// request identity and must never be subject to this check.
+	DjCommand local = command(41, DJ_COMMAND_SET_MIX);
+	local.origin = DJ_ORIGIN_LOCAL_UI;
+	assert(djCommandIdentityMatches(local, UINT64_MAX, 0));
+#endif
+
 	return 0;
 }

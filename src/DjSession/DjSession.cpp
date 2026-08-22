@@ -77,6 +77,15 @@ DjSession::~DjSession(){
 
 DjSubmitResult DjSession::submit(DjCommand command){
 	commandMutex.lock();
+#if defined(JAYD_ENABLE_WIRELESS)
+	if(command.origin == DJ_ORIGIN_HTTP && command.clientCommandId[0] != '\0'){
+		DjCommandResult duplicate;
+		if(commandResults.findClientCommand(command.clientId, command.clientCommandId, duplicate)){
+			commandMutex.unlock();
+			return { duplicate.id, duplicate.status, duplicate.error, true };
+		}
+	}
+#endif
 	command.id = ++nextCommandId;
 	if(command.id == 0) command.id = ++nextCommandId;
 
@@ -264,8 +273,33 @@ DjSubmitResult DjSession::clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin or
 	return submit(command);
 }
 
+#if defined(JAYD_ENABLE_WIRELESS)
+DjSubmitResult DjSession::requestPairing(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_OPEN_PAIRING;
+	return submit(command);
+}
+#endif
+
 DjCommandError DjSession::validate(const DjCommand& command) const{
+#if defined(JAYD_ENABLE_WIRELESS)
+	if(command.type > DJ_COMMAND_OPEN_PAIRING) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type == DJ_COMMAND_OPEN_PAIRING){
+		return command.origin == DJ_ORIGIN_PHYSICAL || command.origin == DJ_ORIGIN_LOCAL_UI ?
+			DJ_COMMAND_ERROR_NONE : DJ_COMMAND_ERROR_INVALID_VALUE;
+	}
+	if(command.origin == DJ_ORIGIN_HTTP &&
+	   (command.clientId[0] == '\0' || command.clientCommandId[0] == '\0')){
+		return DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED;
+	}
+	if(!djCommandIdentityMatches(command, bootId, sessionId)){
+		return DJ_COMMAND_ERROR_STALE_IDENTITY;
+	}
+#else
 	if(command.type > DJ_COMMAND_CLEAR_CUE) return DJ_COMMAND_ERROR_INVALID_VALUE;
+#endif
+
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
 							 command.type == DJ_COMMAND_SET_PLAYING ||
 							 command.type == DJ_COMMAND_SEEK ||
@@ -801,6 +835,12 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		}
 		case DJ_COMMAND_CLEAR_CUE:
 			return cues.clear(command.deck, command.slot);
+#if defined(JAYD_ENABLE_WIRELESS)
+		case DJ_COMMAND_OPEN_PAIRING:
+			pairingGeneration++;
+			if(pairingGeneration == 0) pairingGeneration++;
+			return true;
+#endif
 		default:
 			error = DJ_COMMAND_ERROR_INVALID_VALUE;
 			return false;
@@ -1170,6 +1210,9 @@ void DjSession::publishSnapshot(){
 	commandMutex.lock();
 	snapshot.queueDepth = commandQueue.depth();
 	snapshot.queueDrops = queueDrops;
+#if defined(JAYD_ENABLE_WIRELESS)
+	snapshot.pairingGeneration = pairingGeneration;
+#endif
 	commandResults.copyTo(snapshot.recentResults);
 	commandMutex.unlock();
 
