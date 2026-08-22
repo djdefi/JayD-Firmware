@@ -528,4 +528,29 @@ void MixScreen::MixScreen::encBtnHold(uint8_t i){
 		(new SongList::SongList(*getScreen().getDisplay()))->push(this);
 		return;
 	}
+	if(i > 5) return;
+
+	// Reuses the previously-unbound per-slot encoder hold (L1-L3/R1-R3) as a
+	// stable, labeled LOOP/SYNC bank, gated on the beat-grid capability by
+	// DjSession itself (setSync/loopEngage reject rather than silently
+	// no-op when the grid/BPM capability is unavailable). Mix (potMove),
+	// Cues/transport (btn), and Browse (enc/encBtnHold on index 6) are
+	// untouched. No new multi-button chords are introduced.
+	const uint8_t deck = i >= 3;
+	const uint8_t slot = i % 3; // slot 0/1 -> LOOP bank, slot 2 -> SYNC/ASSIST
+
+	DjSnapshot snapshot;
+	session->copySnapshot(snapshot);
+
+	if(slot == 2){
+		const bool currentlyArmed = snapshot.decks[deck].sync.state != DJ_SYNC_OFF;
+		session->setSync(deck, !currentlyArmed, -1, DJ_ORIGIN_PHYSICAL);
+	}else if(snapshot.decks[deck].loop.state != DJ_LOOP_INACTIVE){
+		session->loopDisengage(deck, DJ_ORIGIN_PHYSICAL);
+	}else{
+		const DjLoopLength length = slot == 0 ? DJ_LOOP_BEAT_1 : DJ_LOOP_BEAT_4;
+		session->loopEngage(deck, length, DJ_ORIGIN_PHYSICAL);
+	}
+
+	drawQueued = true;
 }

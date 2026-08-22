@@ -29,6 +29,12 @@ public:
 	DjSubmitResult setEffectType(uint8_t deck, uint8_t slot, uint8_t type, DjCommandOrigin origin);
 	DjSubmitResult setEffectIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjCommandOrigin origin);
 	DjSubmitResult setRecording(bool recording, DjCommandOrigin origin);
+	DjSubmitResult setQuantize(uint8_t deck, DjQuantizeResolution resolution, DjCommandOrigin origin);
+	DjSubmitResult loopEngage(uint8_t deck, DjLoopLength length, DjCommandOrigin origin);
+	DjSubmitResult loopDisengage(uint8_t deck, DjCommandOrigin origin);
+	DjSubmitResult loopReloop(uint8_t deck, DjCommandOrigin origin);
+	// masterDeck: -1 requests auto-master (the other deck); otherwise an explicit deck index.
+	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin);
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -85,9 +91,21 @@ private:
 	JaydMetadata::Track metadataTracks[DJ_DECK_COUNT] = {};
 	DjDeckMetadataState deckMetadata[DJ_DECK_COUNT];
 
+	DjBeatGrid grids[DJ_DECK_COUNT];
+	DjLoopEngine loopEngines[DJ_DECK_COUNT];
+	DjSyncController syncControllers[DJ_DECK_COUNT];
+	DjQuantizeResolution quantizeResolution[DJ_DECK_COUNT] = { DJ_QUANTIZE_OFF, DJ_QUANTIZE_OFF };
+	bool syncArmed[DJ_DECK_COUNT] = {};
+	int8_t syncMasterDeck[DJ_DECK_COUNT] = { -1, -1 }; // -1 = auto (the other deck)
+	DjCommandError syncLastError[DJ_DECK_COUNT] = {};
+
 	DjCommandError validate(const DjCommand& command) const;
-	bool apply(const DjCommand& command, DjCommandError& error);
+	bool apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics);
 	bool applyLoad(const DjCommand& command, DjCommandError& error);
+	bool buildGrid(uint8_t deck);
+	uint8_t resolveMasterDeck(uint8_t followerDeck) const;
+	void tickLoops();
+	void tickSync();
 	DjMetadataState resolveMetadata(
 		const char* path,
 		uint32_t generation,

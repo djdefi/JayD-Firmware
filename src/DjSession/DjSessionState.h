@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "DjBeatEngine.h"
 
 static constexpr uint8_t DJ_DECK_COUNT = 2;
 static constexpr uint8_t DJ_EFFECT_SLOT_COUNT = 3;
@@ -73,7 +74,12 @@ enum DjCommandType : uint8_t {
 	DJ_COMMAND_SET_MIX,
 	DJ_COMMAND_SET_EFFECT_TYPE,
 	DJ_COMMAND_SET_EFFECT_INTENSITY,
-	DJ_COMMAND_SET_RECORDING
+	DJ_COMMAND_SET_RECORDING,
+	DJ_COMMAND_SET_QUANTIZE,
+	DJ_COMMAND_LOOP_ENGAGE,
+	DJ_COMMAND_LOOP_DISENGAGE,
+	DJ_COMMAND_LOOP_RELOOP,
+	DJ_COMMAND_SET_SYNC
 };
 
 enum DjCommandStatus : uint8_t {
@@ -81,7 +87,8 @@ enum DjCommandStatus : uint8_t {
 	DJ_COMMAND_APPLIED,
 	DJ_COMMAND_FAILED,
 	DJ_COMMAND_SUPERSEDED,
-	DJ_COMMAND_REJECTED
+	DJ_COMMAND_REJECTED,
+	DJ_COMMAND_PENDING
 };
 
 enum DjCommandError : uint8_t {
@@ -95,7 +102,13 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_NO_EFFECT,
 	DJ_COMMAND_ERROR_OPEN_FAILED,
 	DJ_COMMAND_ERROR_RECORDING_FAILED,
-	DJ_COMMAND_ERROR_SESSION_ENDING
+	DJ_COMMAND_ERROR_SESSION_ENDING,
+	DJ_COMMAND_ERROR_NO_GRID,
+	DJ_COMMAND_ERROR_LOOP_OUT_OF_RANGE,
+	DJ_COMMAND_ERROR_LOOP_BUSY,
+	DJ_COMMAND_ERROR_SYNC_UNAVAILABLE,
+	DJ_COMMAND_ERROR_SYNC_CONFLICT,
+	DJ_COMMAND_ERROR_INVALID_MASTER
 };
 
 enum DjTimingQuality : uint8_t {
@@ -146,6 +159,14 @@ struct DjCommandResult {
 	DjCommandType type = DJ_COMMAND_SET_PLAYING;
 	DjCommandStatus status = DJ_COMMAND_REJECTED;
 	DjCommandError error = DJ_COMMAND_ERROR_NONE;
+	// Diagnostics for quantized/scheduled actions (play-start, loop
+	// engage/reloop): the source frame the action targeted, how many frames
+	// late it actually applied (0 if on time or not yet resolved), and
+	// whether the original boundary was missed and the action fell back to
+	// the next one. Zero/false for command types that do not schedule.
+	uint64_t targetFrame = 0;
+	int32_t lateFrames = 0;
+	bool missed = false;
 };
 
 struct DjEffectSnapshot {
@@ -231,6 +252,25 @@ private:
 	bool speedActive[DJ_DECK_COUNT] = {};
 };
 
+struct DjGridSnapshot {
+	bool valid = false;
+	uint16_t confidence = 0;
+	int64_t currentQuarterBeat = 0;
+};
+
+struct DjQuantizeSnapshot {
+	DjQuantizeResolution resolution = DJ_QUANTIZE_OFF;
+	bool pending = false;
+	uint64_t pendingTargetFrame = 0;
+};
+
+struct DjSyncSnapshot {
+	DjSyncState state = DJ_SYNC_OFF;
+	int8_t masterDeck = -1; // -1 = auto (the other deck) or unset
+	DjRate targetRate = DJ_RATE_NEUTRAL;
+	DjCommandError lastError = DJ_COMMAND_ERROR_NONE;
+};
+
 struct DjDeckSnapshot {
 	bool loaded = false;
 	bool playing = false;
@@ -241,6 +281,10 @@ struct DjDeckSnapshot {
 	char path[DJ_PATH_CAPACITY] = {};
 	DjEffectSnapshot effects[DJ_EFFECT_SLOT_COUNT] = {};
 	DjTrackMetadataSnapshot metadata = {};
+	DjGridSnapshot grid = {};
+	DjQuantizeSnapshot quantize = {};
+	DjLoopSnapshot loop = {};
+	DjSyncSnapshot sync = {};
 };
 
 struct DjSnapshot {
@@ -347,7 +391,9 @@ private:
 		return type == DJ_COMMAND_SET_GAIN ||
 			   type == DJ_COMMAND_SET_MIX ||
 			   type == DJ_COMMAND_SET_EFFECT_TYPE ||
-			   type == DJ_COMMAND_SET_EFFECT_INTENSITY;
+			   type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+			   type == DJ_COMMAND_SET_QUANTIZE ||
+			   type == DJ_COMMAND_SET_SYNC;
 	}
 
 	static bool sameTarget(const DjCommand& first, const DjCommand& second){
@@ -384,6 +430,22 @@ public:
 			if(result.id != id) continue;
 			result.status = status;
 			result.error = error;
+			return;
+		}
+	}
+
+	// Overload for commands with scheduling diagnostics (quantized play-start,
+	// loop engage/reloop). Leaves id/origin/type untouched; only updates the
+	// status/error/diagnostics fields, mirroring finish() above.
+	void finishWithDiagnostics(uint32_t id, DjCommandStatus status, DjCommandError error,
+							   uint64_t targetFrame, int32_t lateFrames, bool missed){
+		for(auto& result : results){
+			if(result.id != id) continue;
+			result.status = status;
+			result.error = error;
+			result.targetFrame = targetFrame;
+			result.lateFrames = lateFrames;
+			result.missed = missed;
 			return;
 		}
 	}
