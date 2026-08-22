@@ -83,6 +83,19 @@ struct CardIdentity {
 	uint64_t volumeSize;
 };
 
+struct VerifiedIdentity {
+	CardIdentity card;
+	uint32_t generation;
+	uint32_t payloadCrc;
+	bool valid;
+};
+
+enum class IdentityAction : uint8_t {
+	Preserve,
+	Refresh,
+	Invalidate
+};
+
 struct Limits {
 	uint32_t maxRecords;
 	uint32_t maxPayloadLength;
@@ -138,6 +151,13 @@ uint32_t crc32Finish(uint32_t crc);
 uint32_t headerCrc(const Header& header);
 void initializeHeader(Header& header);
 bool matchesCard(const Header& header, const CardIdentity& identity);
+IdentityAction updateVerifiedIdentity(
+	VerifiedIdentity& verified,
+	const CardIdentity& currentCard,
+	bool attemptVerified,
+	uint32_t generation,
+	uint32_t payloadCrc
+);
 bool isSupportedPath(const char* path, size_t length);
 bool matchesFile(const Record& record, const FileEvidence& evidence);
 State stateAfterRecovery(State recoveredState, bool recovered);

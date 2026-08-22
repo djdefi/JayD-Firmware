@@ -138,5 +138,75 @@ int main(){
 	assert(copy.seq == 1);
 	assert(strcmp(copy.decks[0].path, "/track.aac") == 0);
 	assert(copy.decks[0].metadata.bpmMilli == 128000);
+
+	// --- Quantize/Loop/Sync command supersede + lifecycle -----------------
+	// DJ_COMMAND_SET_QUANTIZE and DJ_COMMAND_SET_SYNC are supersedable (rapid
+	// dial changes on the same deck coalesce instead of queuing up), while
+	// loop engage/reloop/disengage are not (each is a distinct action).
+	assert(queue.push(command(40, DJ_COMMAND_SET_QUANTIZE, 0)));
+	uint32_t supersededQuantize = 0;
+	assert(queue.supersede(command(41, DJ_COMMAND_SET_QUANTIZE, 0), supersededQuantize));
+	assert(supersededQuantize == 40);
+	assert(queue.pop(popped) && popped.id == 41);
+
+	assert(queue.push(command(42, DJ_COMMAND_SET_SYNC, 1)));
+	uint32_t supersededSync = 0;
+	assert(queue.supersede(command(43, DJ_COMMAND_SET_SYNC, 1), supersededSync));
+	assert(supersededSync == 42);
+	assert(queue.pop(popped) && popped.id == 43);
+
+	assert(queue.push(command(44, DJ_COMMAND_LOOP_ENGAGE, 0)));
+	uint32_t supersededLoop = 0;
+	assert(!queue.supersede(command(45, DJ_COMMAND_LOOP_ENGAGE, 0), supersededLoop));
+	assert(queue.push(command(45, DJ_COMMAND_LOOP_ENGAGE, 0)));
+	assert(queue.pop(popped) && popped.id == 44);
+	assert(queue.pop(popped) && popped.id == 45);
+
+	// Command lifecycle with scheduling diagnostics: a loop engage is
+	// recorded ACCEPTED, transitions to PENDING while the boundary seek is
+	// outstanding, then to a terminal APPLIED with the resolved target frame
+	// and lateness -- mirroring DjSession::loop()/tickLoops() exactly.
+	DjCommand loopEngageCmd = command(50, DJ_COMMAND_LOOP_ENGAGE, 0);
+	results.record(loopEngageCmd, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	results.finishWithDiagnostics(loopEngageCmd.id, DJ_COMMAND_PENDING, DJ_COMMAND_ERROR_NONE,
+								  4096, 0, false);
+	results.copyTo(recent);
+	assert(recent[0].status == DJ_COMMAND_PENDING);
+	assert(recent[0].targetFrame == 4096);
+	results.finishWithDiagnostics(loopEngageCmd.id, DJ_COMMAND_APPLIED, DJ_COMMAND_ERROR_NONE,
+								  4096, 12, false);
+	results.copyTo(recent);
+	assert(recent[0].status == DJ_COMMAND_APPLIED);
+	assert(recent[0].targetFrame == 4096);
+	assert(recent[0].lateFrames == 12);
+	assert(!recent[0].missed);
+
+	// A loop whose seek retries are exhausted resolves FAILED/missed instead
+	// of silently vanishing (DjSession::tickLoops()'s terminal-outcome path).
+	DjCommand loopFailCmd = command(51, DJ_COMMAND_LOOP_ENGAGE, 1);
+	results.record(loopFailCmd, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	results.finishWithDiagnostics(loopFailCmd.id, DJ_COMMAND_FAILED, DJ_COMMAND_ERROR_LOOP_OUT_OF_RANGE,
+								  8192, 200, true);
+	results.copyTo(recent);
+	assert(recent[0].status == DJ_COMMAND_FAILED);
+	assert(recent[0].error == DJ_COMMAND_ERROR_LOOP_OUT_OF_RANGE);
+	assert(recent[0].missed);
+
+	// --- Capability-disabled default snapshot state ------------------------
+	// A deck with no grid/quantize/loop/sync capability yet (or one where
+	// buildGrid() rejected the metadata) must default-report as disabled,
+	// not as a stale/ambiguous "on" state, so an API consumer never mistakes
+	// an absent capability for an active one.
+	DjSnapshot disabledSnapshot = {};
+	assert(!disabledSnapshot.decks[0].grid.valid);
+	assert(disabledSnapshot.decks[0].grid.currentQuarterBeat == 0);
+	assert(disabledSnapshot.decks[0].quantize.resolution == DJ_QUANTIZE_OFF);
+	assert(!disabledSnapshot.decks[0].quantize.pending);
+	assert(disabledSnapshot.decks[0].loop.state == DJ_LOOP_INACTIVE);
+	assert(disabledSnapshot.decks[0].loop.validLengthMask == 0);
+	assert(disabledSnapshot.decks[0].sync.state == DJ_SYNC_OFF);
+	assert(disabledSnapshot.decks[0].sync.masterDeck == -1);
+	assert(disabledSnapshot.decks[0].sync.lastError == DJ_COMMAND_ERROR_NONE);
+
 	return 0;
 }

@@ -85,6 +85,7 @@ namespace SongList {
 		uint32_t indexProgressTotal = 0;
 		LibraryIndex::IdentityStrength identityStrength =
 			LibraryIndex::IdentityStrength::Unknown;
+		LibraryIndex::VerifiedIdentity verifiedIndexIdentity = {};
 
 		static const size_t maxTrackCount = 4096;
 		static const size_t maxPathLength = 255;
