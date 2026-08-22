@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "../DjSession/DjSession.h"
+#include "../DjAssist/DjAssistScoring.h"
 #include "WirelessApiCore.h"
 #include "WirelessUiAsset.h"
 
@@ -352,9 +353,101 @@ const char* commandErrorName(DjCommandError error){
 		case DJ_COMMAND_ERROR_SESSION_ENDING: return "session_ending";
 		case DJ_COMMAND_ERROR_STALE_IDENTITY: return "stale_identity";
 		case DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED: return "client_id_required";
+		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "assist_rejected";
 		default: return "invalid_value";
 	}
 }
+
+// Coach/one-shot-transition wire names - short, stable, snake_case tokens
+// (matching commandErrorName()'s convention) so the browser UI maps them to
+// its own accessible text/labels; the firmware never emits pre-rendered
+// prose over the API, only these compact reason codes and the raw
+// already-computed facts alongside them (tempo delta, rate, confidence,
+// etc.) - never re-derived/invented on the browser side.
+const char* assistModeName(DjAssistMode mode){
+	switch(mode){
+		case DJ_ASSIST_MODE_OFF: return "off";
+		case DJ_ASSIST_MODE_COACH: return "coach";
+		case DJ_ASSIST_MODE_TRANSITION_ARMED: return "armed";
+		case DJ_ASSIST_MODE_TRANSITION_RUNNING: return "running";
+		case DJ_ASSIST_MODE_TRANSITION_COMPLETE: return "complete";
+		case DJ_ASSIST_MODE_TRANSITION_FAILED: return "failed";
+		default: return "off";
+	}
+}
+
+const char* assistKeyRelationshipName(DjAssistKeyRelationship relationship){
+	switch(relationship){
+		case DJ_ASSIST_KEY_UNKNOWN: return "unknown";
+		case DJ_ASSIST_KEY_INCOMPATIBLE: return "incompatible";
+		case DJ_ASSIST_KEY_RELATIVE: return "relative";
+		case DJ_ASSIST_KEY_ADJACENT: return "adjacent";
+		case DJ_ASSIST_KEY_SAME: return "same";
+		default: return "unknown";
+	}
+}
+
+const char* assistExcludeReasonName(DjAssistExcludeReason reason){
+	switch(reason){
+		case DJ_ASSIST_EXCLUDE_NONE: return "none";
+		case DJ_ASSIST_EXCLUDE_LOADED: return "loaded";
+		case DJ_ASSIST_EXCLUDE_RECENT: return "recent";
+		case DJ_ASSIST_EXCLUDE_UNSUPPORTED_METADATA: return "unsupported_metadata";
+		default: return "none";
+	}
+}
+
+const char* assistTransitionActionName(DjAssistTransitionAction action){
+	switch(action){
+		case DJ_ASSIST_ACTION_WAIT_BOUNDARY: return "wait_boundary";
+		case DJ_ASSIST_ACTION_START_DECK: return "start_deck";
+		case DJ_ASSIST_ACTION_LOCK_TEMPO: return "lock_tempo";
+		case DJ_ASSIST_ACTION_ENABLE_SYNC: return "enable_sync";
+		case DJ_ASSIST_ACTION_CROSSFADE: return "crossfade";
+		case DJ_ASSIST_ACTION_STOP_DECK: return "stop_deck";
+		case DJ_ASSIST_ACTION_RELEASE_SYNC: return "release_sync";
+		default: return "wait_boundary";
+	}
+}
+
+const char* assistTransitionFailureName(DjAssistTransitionFailure failure){
+	switch(failure){
+		case DJ_ASSIST_FAIL_NONE: return "none";
+		case DJ_ASSIST_FAIL_METADATA_LOST: return "metadata_lost";
+		case DJ_ASSIST_FAIL_COMMAND_REJECTED: return "command_rejected";
+		case DJ_ASSIST_FAIL_MEDIA_REMOVED: return "media_removed";
+		case DJ_ASSIST_FAIL_END_OF_TRACK: return "end_of_track";
+		case DJ_ASSIST_FAIL_MANUAL_OVERRIDE: return "manual_override";
+		case DJ_ASSIST_FAIL_CONFLICT: return "conflict";
+		case DJ_ASSIST_FAIL_TARGET_NOT_LOADED: return "target_not_loaded";
+		case DJ_ASSIST_FAIL_TARGET_CHANGED: return "target_changed";
+		case DJ_ASSIST_FAIL_CANCELLED: return "cancelled";
+		default: return "none";
+	}
+}
+
+// Appends the advice warning flags as an array of accessible text reason
+// codes (never a bare bitmask, never color-only) - at most 6 bits, so this
+// is always bounded and cheap.
+bool appendAssistWarnings(JsonWriter& writer, uint16_t warningFlags){
+	static const struct { uint16_t flag; const char* name; } kWarnings[] = {
+		{DJ_ASSIST_WARN_OUT_OF_RANGE, "out_of_range"},
+		{DJ_ASSIST_WARN_NO_GRID, "no_grid"},
+		{DJ_ASSIST_WARN_ENDING_SOON, "ending_soon"},
+		{DJ_ASSIST_WARN_RECORDING_ACTIVE, "recording_active"},
+		{DJ_ASSIST_WARN_LOOP_ACTIVE, "loop_active"},
+		{DJ_ASSIST_WARN_NO_METADATA, "no_metadata"}
+	};
+	if(!writer.append("[")) return false;
+	bool first = true;
+	for(const auto& warning : kWarnings){
+		if(!(warningFlags & warning.flag)) continue;
+		if(!writer.append(first ? "\"%s\"" : ",\"%s\"", warning.name)) return false;
+		first = false;
+	}
+	return writer.append("]");
+}
+
 
 void sendJson(int status, const char* body){
 	server.sendHeader("Cache-Control", "no-store");
@@ -418,6 +511,12 @@ bool copySnapshot(DjSnapshot& snapshot){
 	if(!session) return false;
 	session->copySnapshot(snapshot);
 	return true;
+}
+
+bool copyAssistSnapshot(DjAssistSnapshot& snapshot){
+	DjSession* session = DjSession::get();
+	if(!session) return false;
+	return session->copyAssistSnapshot(snapshot);
 }
 
 void sendCommandResult(const DjSubmitResult& result, const char* clientCommandId){
@@ -569,7 +668,8 @@ void handleCapabilities(){
 	sendJson(200,
 		"{\"api\":\"v2\",\"transport\":\"http_serial\","
 		"\"actions\":[\"set_playing\",\"seek\",\"set_gain\",\"set_mix\","
-		"\"set_effect_type\",\"set_effect_intensity\",\"set_recording\"],"
+		"\"set_effect_type\",\"set_effect_intensity\",\"set_recording\","
+		"\"assist_set_mode\",\"assist_arm_transition\",\"assist_cancel_transition\"],"
 		"\"load_by_path\":false,\"writer_lease_ms\":15000,\"pairing_window_ms\":60000,"
 		"\"request_body_max\":512,\"response_max\":3072,\"handler_budget_ms\":50,"
 		"\"poll\":{\"active_ms\":1000,\"idle_ms\":3000,\"hidden_ms\":5000},"
@@ -604,6 +704,62 @@ void handleHealth(){
 	sendJson(200, responseBuffer);
 }
 
+// Appends the bounded Coach/one-shot-transition block to the /api/v2/state
+// payload. Every value here is a copy already produced by DjAssistController
+// (via DjSession::copyAssistSnapshot) - no re-scoring, no file reads, no
+// pointers. Suggestions/advice/plan are always all emitted (mirrors the
+// underlying DjAssistSnapshot POD shape exactly); the browser gates which
+// section is meaningful by "mode", same as the physical Assist bank does.
+void appendAssistState(JsonWriter& writer){
+	DjAssistSnapshot assist;
+	if(!copyAssistSnapshot(assist)){
+		writer.append("\"assist\":{\"mode\":\"off\"}");
+		return;
+	}
+	writer.append("\"assist\":{\"mode\":\"%s\",\"advice\":{", assistModeName(assist.mode));
+	const DjAssistCoachAdvice& advice = assist.advice;
+	const bool hasBoundary = !(advice.warningFlags & DJ_ASSIST_WARN_NO_GRID);
+	writer.append(
+		"\"valid\":%s,\"suggested_deck\":%u,\"boundary\":\"%s\",\"target_rate\":%lu,\"crossfade_dir\":%d,\"warnings\":",
+		advice.valid ? "true" : "false",
+		static_cast<unsigned>(advice.suggestedDeck),
+		hasBoundary ? (advice.boundaryIsPhrase ? "phrase" : "beat") : "none",
+		static_cast<unsigned long>(advice.targetRateMilli),
+		static_cast<int>(advice.crossfaderDirection)
+	);
+	appendAssistWarnings(writer, advice.warningFlags);
+	writer.append("},\"suggestions\":[");
+	for(uint8_t i = 0; i < assist.suggestionCount && i < DJ_ASSIST_MAX_SUGGESTIONS; i++){
+		const DjAssistSuggestion& suggestion = assist.suggestions[i];
+		writer.append(
+			"%s{\"index\":%u,\"library_index\":%lu,\"tempo_delta\":%ld,\"key\":\"%s\","
+			"\"rating\":%u,\"confidence\":%u,\"exclude\":\"%s\",\"reason_flags\":%u}",
+			i == 0 ? "" : ",",
+			static_cast<unsigned>(i),
+			static_cast<unsigned long>(suggestion.libraryIndex),
+			static_cast<long>(suggestion.tempoDeltaMilli),
+			assistKeyRelationshipName(suggestion.keyRelationship),
+			static_cast<unsigned>(suggestion.rating),
+			static_cast<unsigned>(suggestion.confidence),
+			assistExcludeReasonName(suggestion.excludeReason),
+			static_cast<unsigned>(suggestion.reasonFlags)
+		);
+	}
+	const DjAssistTransitionPlan& plan = assist.plan;
+	const bool planDone = plan.currentStep >= plan.stepCount;
+	writer.append(
+		"],\"plan\":{\"from_deck\":%u,\"to_deck\":%u,\"crossfade_beats\":%u,"
+		"\"step\":%u,\"steps\":%u,\"action\":\"%s\",\"failure\":\"%s\"}}",
+		static_cast<unsigned>(plan.fromDeck),
+		static_cast<unsigned>(plan.toDeck),
+		static_cast<unsigned>(plan.crossfadeBeats),
+		static_cast<unsigned>(plan.currentStep),
+		static_cast<unsigned>(plan.stepCount),
+		planDone ? "done" : assistTransitionActionName(plan.steps[plan.currentStep].action),
+		assistTransitionFailureName(plan.failure)
+	);
+}
+
 void handleState(){
 	char clientId[WirelessApi::CLIENT_ID_CAPACITY] = {};
 	if(!authorize(false, clientId)) return;
@@ -631,7 +787,9 @@ void handleState(){
 		snapshot.sessionActive ? "true" : "false",
 		snapshot.mixerRunning ? "true" : "false",
 		snapshot.mix,
-		snapshot.recording ? "true" : "false",
+		(snapshot.recordingInfo.state == DJ_RECORDING_STARTING ||
+		 snapshot.recordingInfo.state == DJ_RECORDING_ACTIVE ||
+		 snapshot.recordingInfo.state == DJ_RECORDING_STOPPING) ? "true" : "false",
 		snapshot.queueDepth
 	);
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
@@ -676,7 +834,9 @@ void handleState(){
 		first = false;
 		if(++resultCount == 8) break;
 	}
-	writer.append("]}");
+	writer.append("],");
+	appendAssistState(writer);
+	writer.append("}");
 	if(!writer.valid()){
 		sendError(500, "response_too_large");
 		return;
@@ -771,7 +931,8 @@ void handleCommand(){
 	WirelessApi::JsonObject object;
 	if(!requireJsonBody(object)) return;
 	static const char* allowed[] = {
-		"boot_id", "session_id", "client_command_id", "action", "deck", "slot", "value"
+		"boot_id", "session_id", "client_command_id", "action", "deck", "slot", "value",
+		"to_deck", "crossfade_beats", "start_at_boundary", "tempo_lock"
 	};
 	if(!object.hasOnly(allowed, sizeof(allowed) / sizeof(allowed[0]))){
 		sendError(400, "invalid_fields");
@@ -812,6 +973,61 @@ void handleCommand(){
 		command.type = DJ_COMMAND_SET_RECORDING;
 		if(!object.getBool("value", value)) expectedFields = 0;
 		command.value = value;
+	}else if(strcmp(action, "assist_set_mode") == 0){
+		bool value = false;
+		command.type = DJ_COMMAND_ASSIST_SET_MODE;
+		if(!object.getBool("value", value)) expectedFields = 0;
+		command.value = value;
+	}else if(strcmp(action, "assist_cancel_transition") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_ASSIST_CANCEL_TRANSITION;
+	}else if(strcmp(action, "assist_arm_transition") == 0){
+		// Confirms and arms a one-shot transition. The client only ever
+		// names which loaded deck ("to_deck") it wants as the target - it
+		// never supplies a raw DjTrackIdentity/path over JSON. The server
+		// resolves the identity itself from the authoritative snapshot
+		// (mirrors the physical Assist bank's assistArmFromSelected()),
+		// so an armed transition can never target an arbitrary/unloaded
+		// track. libraryIndex is a best-effort cosmetic lookup against the
+		// current suggestion list only, never required for correctness -
+		// the guard/actuator re-verifies the identity every tick.
+		expectedFields = 9;
+		uint8_t toDeck = 0;
+		uint16_t crossfadeBeats = 0;
+		bool startAtBoundary = false;
+		bool tempoLock = false;
+		if(!parseUint8(object, "deck", command.deck) ||
+		   !parseUint8(object, "to_deck", toDeck) ||
+		   !parseUint16(object, "crossfade_beats", crossfadeBeats) ||
+		   !object.getBool("start_at_boundary", startAtBoundary) ||
+		   !object.getBool("tempo_lock", tempoLock) ||
+		   toDeck >= DJ_DECK_COUNT){
+			expectedFields = 0;
+		}else{
+			DjSnapshot snapshot = {};
+			if(!copySnapshot(snapshot)){
+				expectedFields = 0;
+			}else{
+				command.type = DJ_COMMAND_ASSIST_ARM_TRANSITION;
+				command.slot = toDeck;
+				command.value = static_cast<uint16_t>(
+					(crossfadeBeats & 0xFF) |
+					(startAtBoundary ? (1 << 8) : 0) |
+					(tempoLock ? (1 << 9) : 0)
+				);
+				command.trackIdentity = snapshot.decks[toDeck].identity;
+				command.libraryIndex = 0;
+				DjAssistSnapshot assist;
+				if(copyAssistSnapshot(assist)){
+					for(uint8_t i = 0; i < assist.suggestionCount && i < DJ_ASSIST_MAX_SUGGESTIONS; i++){
+						if(DjAssistScoring::identityMatches(assist.suggestions[i].identity, command.trackIdentity)){
+							command.libraryIndex = assist.suggestions[i].libraryIndex;
+							break;
+						}
+					}
+				}
+			}
+		}
 	}else{
 		expectedFields = 6;
 		if(!parseUint8(object, "deck", command.deck)) expectedFields = 0;
