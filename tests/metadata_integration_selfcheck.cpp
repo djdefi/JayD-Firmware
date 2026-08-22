@@ -1,5 +1,6 @@
 #include <assert.h>
 #include "../src/DjSession/DjSessionState.h"
+#include "../src/Screens/SongList/LibraryIndex.h"
 
 static DjTrackMetadataSnapshot metadata(uint32_t generation, uint32_t bpm){
 	DjTrackMetadataSnapshot value = {};
@@ -58,5 +59,60 @@ int main(){
 	playback.decks[1].playing = false;
 	playback.recording = true;
 	assert(!djAllowsLibraryWork(playback));
+
+	LibraryIndex::VerifiedIdentity identity = {};
+	const LibraryIndex::CardIdentity card{
+		LibraryIndex::IdentityStrength::Weak,
+		3,
+		32ULL * 1024 * 1024 * 1024,
+		31914983424ULL
+	};
+	assert(LibraryIndex::updateVerifiedIdentity(
+		identity,
+		card,
+		true,
+		7,
+		0x11111111
+	) == LibraryIndex::IdentityAction::Refresh);
+	DjDeckMetadataState playingDeck;
+	assert(playingDeck.commitIfLoaded(first, true, true));
+
+	assert(LibraryIndex::updateVerifiedIdentity(
+		identity,
+		card,
+		false,
+		0,
+		0
+	) == LibraryIndex::IdentityAction::Preserve);
+	assert(identity.generation == 7);
+	assert(identity.payloadCrc == 0x11111111);
+	assert(playingDeck.attached());
+
+	const LibraryIndex::CardIdentity replacementCard{
+		LibraryIndex::IdentityStrength::Weak,
+		4,
+		card.cardSize,
+		card.volumeSize
+	};
+	LibraryIndex::VerifiedIdentity changedCardIdentity = identity;
+	assert(LibraryIndex::updateVerifiedIdentity(
+		changedCardIdentity,
+		replacementCard,
+		false,
+		0,
+		0
+	) == LibraryIndex::IdentityAction::Invalidate);
+	assert(!changedCardIdentity.valid);
+
+	assert(LibraryIndex::updateVerifiedIdentity(
+		identity,
+		card,
+		true,
+		8,
+		0x22222222
+	) == LibraryIndex::IdentityAction::Refresh);
+	playingDeck.invalidate(DJ_METADATA_STALE, identity.generation);
+	assert(!playingDeck.attached());
+	assert(playingDeck.snapshot().libraryGeneration == 8);
 	return 0;
 }

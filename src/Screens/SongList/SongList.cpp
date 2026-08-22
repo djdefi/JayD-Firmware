@@ -551,8 +551,6 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	scanStoppedAtLimit = false;
 	allocationFailed = false;
 	indexState = IndexState::Absent;
-	indexGeneration = 0;
-	indexPayloadCrc = 0;
 	indexProgress = 0;
 	indexProgressTotal = 0;
 	identityStrength = LibraryIndex::IdentityStrength::Unknown;
@@ -563,6 +561,9 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	}
 
 	if(!insertedSD){
+		verifiedIndexIdentity = {};
+		indexGeneration = 0;
+		indexPayloadCrc = 0;
 		if(DjSession::get()) DjSession::get()->invalidateLibraryMetadata();
 		waiting = false;
 		draw();
@@ -578,6 +579,9 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	insertedSD = root;
 	if(!insertedSD){
 		root.close();
+		verifiedIndexIdentity = {};
+		indexGeneration = 0;
+		indexPayloadCrc = 0;
 		if(DjSession::get()) DjSession::get()->invalidateLibraryMetadata();
 		waiting = false;
 		draw();
@@ -587,16 +591,22 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	root.close();
 
 	const bool indexed = loadBestIndex();
+	bool identityVerified = indexed;
 	DjSession* session = DjSession::get();
 	const bool rebuildRequested = forceRebuild || !indexed;
 	const bool rebuildAllowed = !session || session->libraryWorkAllowed();
-	if(rebuildRequested && rebuildAllowed && !buildIndex()){
-		const bool memoryFailure = allocationFailed;
-		clearSongs();
-		allocationFailed = false;
-		const bool recovered = loadBestIndex();
-		if(!recovered && memoryFailure) allocationFailed = true;
-		indexState = LibraryIndex::stateAfterRecovery(indexState, recovered);
+	if(rebuildRequested && rebuildAllowed){
+		if(buildIndex()){
+			identityVerified = true;
+		}else{
+			const bool memoryFailure = allocationFailed;
+			clearSongs();
+			allocationFailed = false;
+			const bool recovered = loadBestIndex();
+			identityVerified = identityVerified || recovered;
+			if(!recovered && memoryFailure) allocationFailed = true;
+			indexState = LibraryIndex::stateAfterRecovery(indexState, recovered);
+		}
 	}else if(rebuildRequested && !rebuildAllowed){
 		indexState = IndexState::Verifying;
 	}
@@ -611,12 +621,28 @@ void SongList::SongList::checkSD(bool forceRebuild){
 
 	waiting = false;
 	empty = songCount == 0;
-	if(session){
-		const LibraryIndex::CardIdentity identity = currentCardIdentity();
-		session->refreshLibraryMetadata(
+	const LibraryIndex::CardIdentity identity = currentCardIdentity();
+	const LibraryIndex::IdentityAction identityAction =
+		LibraryIndex::updateVerifiedIdentity(
+			verifiedIndexIdentity,
+			identity,
+			identityVerified,
 			indexGeneration,
-			libraryKey(identity, indexGeneration, indexPayloadCrc)
+			indexPayloadCrc
 		);
+	indexGeneration = verifiedIndexIdentity.generation;
+	indexPayloadCrc = verifiedIndexIdentity.payloadCrc;
+	if(session && identityAction == LibraryIndex::IdentityAction::Refresh){
+		session->refreshLibraryMetadata(
+			verifiedIndexIdentity.generation,
+			libraryKey(
+				verifiedIndexIdentity.card,
+				verifiedIndexIdentity.generation,
+				verifiedIndexIdentity.payloadCrc
+			)
+		);
+	}else if(session && identityAction == LibraryIndex::IdentityAction::Invalidate){
+		session->invalidateLibraryMetadata();
 	}
 	Serial.printf(
 		"SongList: indexed %u tracks (%u path bytes)%s\n",

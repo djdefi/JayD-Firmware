@@ -81,6 +81,31 @@ bool matchesCard(const Header& header, const CardIdentity& identity){
 		   header.volumeSize == identity.volumeSize;
 }
 
+IdentityAction updateVerifiedIdentity(
+	VerifiedIdentity& verified,
+	const CardIdentity& currentCard,
+	bool attemptVerified,
+	uint32_t generation,
+	uint32_t payloadCrc
+){
+	if(attemptVerified){
+		verified.card = currentCard;
+		verified.generation = generation;
+		verified.payloadCrc = payloadCrc;
+		verified.valid = true;
+		return IdentityAction::Refresh;
+	}
+	if(!verified.valid) return IdentityAction::Preserve;
+	if(verified.card.strength == currentCard.strength &&
+	   verified.card.cardType == currentCard.cardType &&
+	   verified.card.cardSize == currentCard.cardSize &&
+	   verified.card.volumeSize == currentCard.volumeSize){
+		return IdentityAction::Preserve;
+	}
+	verified = VerifiedIdentity{};
+	return IdentityAction::Invalidate;
+}
+
 bool isSupportedPath(const char* path, size_t length){
 	if(path == nullptr || length < 5 || length > maxPathLength || path[0] != '/' ||
 	   path[length - 1] == '/' || !isAAC(path, length)){

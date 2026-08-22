@@ -90,7 +90,9 @@ set_target_properties(DjSessionSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME DjSessionSelfCheck COMMAND DjSessionSelfCheck)
 
-add_executable(MetadataIntegrationSelfCheck tests/metadata_integration_selfcheck.cpp)
+add_executable(MetadataIntegrationSelfCheck
+        tests/metadata_integration_selfcheck.cpp
+        src/Screens/SongList/LibraryIndex.cpp)
 set_target_properties(MetadataIntegrationSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME MetadataIntegrationSelfCheck COMMAND MetadataIntegrationSelfCheck)
