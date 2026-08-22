@@ -171,14 +171,64 @@ DjSubmitResult DjSession::setRecording(bool recording, DjCommandOrigin origin){
 	return submit(command);
 }
 
+DjSubmitResult DjSession::setQuantize(uint8_t deck, DjQuantizeResolution resolution, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_SET_QUANTIZE;
+	command.deck = deck;
+	command.value = resolution;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::loopEngage(uint8_t deck, DjLoopLength length, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_LOOP_ENGAGE;
+	command.deck = deck;
+	command.value = length;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::loopDisengage(uint8_t deck, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_LOOP_DISENGAGE;
+	command.deck = deck;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::loopReloop(uint8_t deck, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_LOOP_RELOOP;
+	command.deck = deck;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_SET_SYNC;
+	command.deck = deck;
+	command.value = armed;
+	// 0 = auto-master, 1..DJ_DECK_COUNT = explicit deck index + 1.
+	command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+	return submit(command);
+}
+
 DjCommandError DjSession::validate(const DjCommand& command) const{
-	if(command.type > DJ_COMMAND_SET_RECORDING) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_SET_SYNC) return DJ_COMMAND_ERROR_INVALID_VALUE;
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
 							 command.type == DJ_COMMAND_SET_PLAYING ||
 							 command.type == DJ_COMMAND_SEEK ||
 							 command.type == DJ_COMMAND_SET_GAIN ||
 							 command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
-							 command.type == DJ_COMMAND_SET_EFFECT_INTENSITY;
+							 command.type == DJ_COMMAND_SET_EFFECT_INTENSITY ||
+							 command.type == DJ_COMMAND_SET_QUANTIZE ||
+							 command.type == DJ_COMMAND_LOOP_ENGAGE ||
+							 command.type == DJ_COMMAND_LOOP_DISENGAGE ||
+							 command.type == DJ_COMMAND_LOOP_RELOOP ||
+							 command.type == DJ_COMMAND_SET_SYNC;
 	if(deckCommand && command.deck >= DJ_DECK_COUNT) return DJ_COMMAND_ERROR_INVALID_DECK;
 	if((command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
@@ -196,6 +246,17 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		if(command.path[0] == '\0' || memchr(command.path, '\0', DJ_PATH_CAPACITY) == nullptr){
 			return DJ_COMMAND_ERROR_INVALID_PATH;
 		}
+	}
+	if(command.type == DJ_COMMAND_SET_QUANTIZE && command.value >= DJ_QUANTIZE_RESOLUTION_COUNT){
+		return DJ_COMMAND_ERROR_INVALID_VALUE;
+	}
+	if(command.type == DJ_COMMAND_LOOP_ENGAGE && command.value >= DJ_LOOP_LENGTH_COUNT){
+		return DJ_COMMAND_ERROR_INVALID_VALUE;
+	}
+	if(command.type == DJ_COMMAND_SET_SYNC){
+		if(command.value > 1) return DJ_COMMAND_ERROR_INVALID_VALUE;
+		if(command.slot > DJ_DECK_COUNT) return DJ_COMMAND_ERROR_INVALID_SLOT;
+		if(command.slot != 0 && command.slot - 1 == command.deck) return DJ_COMMAND_ERROR_INVALID_MASTER;
 	}
 	return DJ_COMMAND_ERROR_NONE;
 }
@@ -449,16 +510,24 @@ void DjSession::loop(uint micros){
 	commandMutex.unlock();
 	if(available){
 		DjCommandError error = DJ_COMMAND_ERROR_NONE;
-		const bool applied = apply(command, error);
+		DjCommandStatus status = DJ_COMMAND_APPLIED;
+		DjCommandResult diagnostics = {};
+		const bool applied = apply(command, error, status, diagnostics);
+		if(!applied) status = DJ_COMMAND_FAILED;
 		commandMutex.lock();
-		commandResults.finish(command.id, applied ? DJ_COMMAND_APPLIED : DJ_COMMAND_FAILED, error);
+		commandResults.finishWithDiagnostics(command.id, status, error,
+			diagnostics.targetFrame, diagnostics.lateFrames, diagnostics.missed);
 		commandMutex.unlock();
 	}
 
+	tickLoops();
+	tickSync();
 	publishSnapshot();
 }
 
-bool DjSession::apply(const DjCommand& command, DjCommandError& error){
+bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics){
+	status = DJ_COMMAND_APPLIED;
+	diagnostics = {};
 	if(ending){
 		error = DJ_COMMAND_ERROR_SESSION_ENDING;
 		return false;
@@ -467,17 +536,42 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 	if(command.type == DJ_COMMAND_LOAD_DECK) return applyLoad(command, error);
 
 	if((command.type == DJ_COMMAND_SET_PLAYING ||
-		command.type == DJ_COMMAND_SEEK) &&
+		command.type == DJ_COMMAND_SEEK ||
+		command.type == DJ_COMMAND_SET_QUANTIZE ||
+		command.type == DJ_COMMAND_LOOP_ENGAGE ||
+		command.type == DJ_COMMAND_LOOP_DISENGAGE ||
+		command.type == DJ_COMMAND_LOOP_RELOOP ||
+		command.type == DJ_COMMAND_SET_SYNC) &&
 	   !system->hasChannel(command.deck)){
 		error = DJ_COMMAND_ERROR_NO_DECK;
 		return false;
 	}
 
 	switch(command.type){
-		case DJ_COMMAND_SET_PLAYING:
-			if(command.value) system->resumeChannel(command.deck);
-			else system->pauseChannel(command.deck);
+		case DJ_COMMAND_SET_PLAYING: {
+			if(command.value){
+				// Quantized play-start only applies to a currently paused deck;
+				// a deck that is already playing just keeps playing (no-op).
+				if(system->isChannelPaused(command.deck) &&
+				   quantizeResolution[command.deck] != DJ_QUANTIZE_OFF &&
+				   grids[command.deck].valid()){
+					const uint64_t currentFrame = system->getElapsedSourceFrames(command.deck);
+					uint64_t targetFrame;
+					if(djQuantizeTarget(grids[command.deck], currentFrame,
+										 djQuantizeQuarterBeats(quantizeResolution[command.deck]), targetFrame)){
+						if(targetFrame != currentFrame){
+							system->seekChannelSourceFrame(command.deck, targetFrame);
+						}
+						diagnostics.targetFrame = targetFrame;
+						diagnostics.lateFrames = targetFrame > currentFrame ? 0 : currentFrame - targetFrame;
+					}
+				}
+				system->resumeChannel(command.deck);
+			}else{
+				system->pauseChannel(command.deck);
+			}
 			return true;
+		}
 		case DJ_COMMAND_SEEK:
 			system->seekChannel(command.deck, command.value);
 			return true;
@@ -490,6 +584,12 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 			system->setMix(mix);
 			return true;
 		case DJ_COMMAND_SET_EFFECT_TYPE: {
+			if(command.value == DJ_EFFECT_SPEED && syncArmed[command.deck]){
+				// The Speed effect and Sync share the single per-channel rate
+				// resource; only one owner at a time.
+				error = DJ_COMMAND_ERROR_SYNC_CONFLICT;
+				return false;
+			}
 			DjEffectTransition transition;
 			if(!effectState.setType(command.deck, command.slot, command.value,
 									system->hasChannel(command.deck), transition)){
@@ -543,11 +643,98 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 				}
 			}
 			return true;
+		case DJ_COMMAND_SET_QUANTIZE:
+			if(command.value >= DJ_QUANTIZE_RESOLUTION_COUNT){
+				error = DJ_COMMAND_ERROR_INVALID_VALUE;
+				return false;
+			}
+			if(command.value != DJ_QUANTIZE_OFF && !grids[command.deck].valid()){
+				error = DJ_COMMAND_ERROR_NO_GRID;
+				return false;
+			}
+			quantizeResolution[command.deck] = static_cast<DjQuantizeResolution>(command.value);
+			return true;
+		case DJ_COMMAND_LOOP_ENGAGE: {
+			if(!grids[command.deck].valid()){
+				error = DJ_COMMAND_ERROR_NO_GRID;
+				return false;
+			}
+			if(command.value >= DJ_LOOP_LENGTH_COUNT){
+				error = DJ_COMMAND_ERROR_INVALID_VALUE;
+				return false;
+			}
+			const uint64_t currentFrame = system->getElapsedSourceFrames(command.deck);
+			const uint64_t durationFrames = system->getDurationSourceFrames(command.deck);
+			if(!loopEngines[command.deck].engage(grids[command.deck], currentFrame, durationFrames,
+												  static_cast<DjLoopLength>(command.value), command.id)){
+				error = DJ_COMMAND_ERROR_LOOP_OUT_OF_RANGE;
+				return false;
+			}
+			status = DJ_COMMAND_PENDING;
+			diagnostics.targetFrame = loopEngines[command.deck].startFrame();
+			return true;
+		}
+		case DJ_COMMAND_LOOP_RELOOP: {
+			if(!loopEngines[command.deck].reloop(command.id)){
+				error = DJ_COMMAND_ERROR_LOOP_BUSY;
+				return false;
+			}
+			status = DJ_COMMAND_PENDING;
+			diagnostics.targetFrame = loopEngines[command.deck].startFrame();
+			return true;
+		}
+		case DJ_COMMAND_LOOP_DISENGAGE:
+			loopEngines[command.deck].disengage();
+			return true;
+		case DJ_COMMAND_SET_SYNC: {
+			if(command.value){
+				if(!grids[command.deck].valid()){
+					error = DJ_COMMAND_ERROR_SYNC_UNAVAILABLE;
+					syncLastError[command.deck] = error;
+					return false;
+				}
+				if(effectState.isSpeedActive(command.deck)){
+					error = DJ_COMMAND_ERROR_SYNC_CONFLICT;
+					syncLastError[command.deck] = error;
+					return false;
+				}
+				const int8_t requestedMaster = command.slot == 0 ? int8_t(-1) : int8_t(command.slot - 1);
+				if(requestedMaster >= 0 && (requestedMaster == command.deck || requestedMaster >= DJ_DECK_COUNT)){
+					error = DJ_COMMAND_ERROR_INVALID_MASTER;
+					syncLastError[command.deck] = error;
+					return false;
+				}
+				// Deterministic anti-oscillation rule: with two decks, at most
+				// one may be armed as a follower at a time.
+				for(uint8_t other = 0; other < DJ_DECK_COUNT; ++other){
+					if(other != command.deck && syncArmed[other]){
+						error = DJ_COMMAND_ERROR_SYNC_CONFLICT;
+						syncLastError[command.deck] = error;
+						return false;
+					}
+				}
+				syncArmed[command.deck] = true;
+				syncMasterDeck[command.deck] = requestedMaster;
+				syncLastError[command.deck] = DJ_COMMAND_ERROR_NONE;
+				system->addSpeed(command.deck); // idempotent: no-ops if already present
+			}else{
+				syncArmed[command.deck] = false;
+				syncMasterDeck[command.deck] = -1;
+				syncLastError[command.deck] = DJ_COMMAND_ERROR_NONE;
+				syncControllers[command.deck].reset();
+				if(!effectState.isSpeedActive(command.deck)){
+					system->setRate(command.deck, DJ_RATE_NEUTRAL);
+					system->removeSpeed(command.deck);
+				}
+			}
+			return true;
+		}
 		default:
 			error = DJ_COMMAND_ERROR_INVALID_VALUE;
 			return false;
 	}
 }
+
 
 bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	fs::File file = SD.open(command.path);
@@ -588,6 +775,14 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 		true
 	);
 	metadataMutex.unlock();
+
+	// Successful hot-load: old loop bounds/anchors belonged to the previous
+	// track and are meaningless now, so always clear and rebuild from
+	// scratch. A failed load (handled above, before this point) leaves both
+	// untouched.
+	loopEngines[command.deck].disengage();
+	buildGrid(command.deck);
+
 	system->setVolume(command.deck, gains[command.deck]);
 	DjEffectTransition effectTransition;
 	effectState.deckLoaded(command.deck, effectTransition);
@@ -612,6 +807,155 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	return true;
 }
 
+bool DjSession::buildGrid(uint8_t deck){
+	if(deck >= DJ_DECK_COUNT) return false;
+	grids[deck].reset();
+
+	metadataMutex.lock();
+	const bool attached = deckMetadata[deck].attached() &&
+		deckMetadata[deck].snapshot().libraryGeneration == libraryGeneration;
+	if(!attached){
+		metadataMutex.unlock();
+		return false;
+	}
+	const DjTrackMetadataSnapshot metadata = deckMetadata[deck].snapshot();
+	const JaydMetadata::Track track = metadataTracks[deck];
+
+	// Fail closed: any missing/insufficient capability disables the grid
+	// entirely rather than risking a wrong quantize/loop/sync decision.
+	if(!(metadata.capabilities & DJ_METADATA_HAS_GRID) ||
+	   !(metadata.capabilities & DJ_METADATA_HAS_SOURCE_FRAMES) ||
+	   !(metadata.capabilities & DJ_METADATA_HAS_BPM) ||
+	   metadata.confidence < DJ_GRID_MIN_CONFIDENCE ||
+	   track.gridCount == 0){
+		metadataMutex.unlock();
+		return false;
+	}
+
+	// Subsample the metadata reader's ordered grid section down to the
+	// bounded anchor cache, keeping each surviving anchor's true sequential
+	// index as its quarter-beat value (never renumbered), so sparse gaps
+	// remain correct.
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY];
+	uint16_t anchorCount = 0;
+	const uint32_t stride = (track.gridCount + DJ_GRID_ANCHOR_CAPACITY - 1) / DJ_GRID_ANCHOR_CAPACITY;
+	for(uint32_t index = 0; index < track.gridCount && anchorCount < DJ_GRID_ANCHOR_CAPACITY; index += stride){
+		JaydMetadata::Grid grid;
+		if(!metadataReader.readGrid(track, index, grid)){
+			metadataMutex.unlock();
+			return false;
+		}
+		if(grid.confidence < DJ_GRID_MIN_CONFIDENCE) continue;
+		anchors[anchorCount].frame = grid.positionFrames;
+		anchors[anchorCount].quarterBeat = int64_t(index) * DJ_BEAT_QUARTER_BEATS;
+		anchorCount++;
+	}
+	metadataMutex.unlock();
+
+	if(anchorCount == 0) return false;
+	return grids[deck].build(metadata.sourceSampleRate, metadata.bpmMilli,
+							  metadata.sourceDurationFrames, anchors, anchorCount);
+}
+
+uint8_t DjSession::resolveMasterDeck(uint8_t followerDeck) const{
+	const int8_t explicitMaster = syncMasterDeck[followerDeck];
+	if(explicitMaster >= 0 && explicitMaster < DJ_DECK_COUNT) return uint8_t(explicitMaster);
+	return followerDeck == 0 ? 1 : 0; // auto-master: the other deck (DJ_DECK_COUNT == 2)
+}
+
+void DjSession::tickLoops(){
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		DjLoopEngine& engine = loopEngines[deck];
+		if(engine.state() == DJ_LOOP_INACTIVE) continue;
+		if(!system->hasChannel(deck)){
+			engine.disengage();
+			continue;
+		}
+
+		const uint64_t currentFrame = system->getElapsedSourceFrames(deck);
+		uint64_t targetFrame;
+		if(!engine.needsSeek(currentFrame, targetFrame)) continue;
+
+		// Single seek in flight, never a busy-loop of repeated attempts.
+		engine.beginSeek();
+		const bool success = system->seekChannelSourceFrame(deck, targetFrame);
+		const uint32_t commandId = engine.pendingCommandId();
+		const uint64_t lateFramesWide = currentFrame > targetFrame ? currentFrame - targetFrame : 0;
+		const int32_t lateFrames = lateFramesWide > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(lateFramesWide);
+		engine.completeSeek(success);
+
+		// Only report a terminal outcome: success (now ACTIVE), or the retry
+		// budget just got exhausted (completeSeek() disengaged us). A failed
+		// attempt that still has retries left stays PENDING and silently
+		// tries again next tick -- no result yet.
+		const bool terminal = success || engine.state() == DJ_LOOP_INACTIVE;
+		if(commandId != 0 && terminal){
+			commandMutex.lock();
+			commandResults.finishWithDiagnostics(commandId,
+				success ? DJ_COMMAND_APPLIED : DJ_COMMAND_FAILED,
+				success ? DJ_COMMAND_ERROR_NONE : DJ_COMMAND_ERROR_LOOP_OUT_OF_RANGE,
+				targetFrame, lateFrames, !success);
+			commandMutex.unlock();
+			engine.clearPendingCommandId();
+		}
+	}
+}
+
+void DjSession::tickSync(){
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		if(!syncArmed[deck]){
+			syncControllers[deck].reset();
+			continue;
+		}
+
+		DjSyncInputs inputs;
+		inputs.armed = true;
+
+		const bool followerReady = system->hasChannel(deck) && grids[deck].valid();
+		if(followerReady){
+			const uint8_t masterDeck = resolveMasterDeck(deck);
+			inputs.followerValid = true;
+			inputs.followerPlaying = !system->isChannelPaused(deck);
+			inputs.followerBpmMilli = grids[deck].bpmMilli();
+			inputs.followerSampleRate = grids[deck].sampleRate();
+
+			inputs.masterValid = system->hasChannel(masterDeck) && grids[masterDeck].valid();
+			if(inputs.masterValid){
+				inputs.masterPlaying = !system->isChannelPaused(masterDeck);
+				inputs.masterBpmMilli = grids[masterDeck].bpmMilli();
+
+				int64_t followerPhase = 0, masterPhase = 0;
+				uint64_t followerFramesPerBeat = 0, masterFramesPerBeat = 0;
+				const uint64_t followerFrame = system->getElapsedSourceFrames(deck);
+				const uint64_t masterFrame = system->getElapsedSourceFrames(masterDeck);
+				if(djBeatPhase(grids[deck], followerFrame, followerPhase, followerFramesPerBeat) &&
+				   djBeatPhase(grids[masterDeck], masterFrame, masterPhase, masterFramesPerBeat)){
+					inputs.followerPhaseFrames = followerPhase;
+					inputs.followerFramesPerBeat = followerFramesPerBeat;
+					inputs.masterPhaseFrames = masterPhase;
+					inputs.masterFramesPerBeat = masterFramesPerBeat;
+				}else{
+					// Phase not currently computable (e.g. before the first
+					// anchor): hold the rate rather than guessing.
+					inputs.masterValid = false;
+				}
+			}
+		}
+		// else: deck unloaded or metadata/grid lost since arming -- leave
+		// masterValid/followerValid false so the controller surfaces this as
+		// an observable ERROR state instead of silently doing nothing.
+
+		const DjSyncOutputs out = syncControllers[deck].tick(inputs);
+		if(out.applyRate) system->setRate(deck, out.targetRate);
+		if(out.applyNudge) system->nudgeRate(deck, out.nudgeAmount);
+		if(out.hardAlign){
+			const uint64_t followerFrame = system->getElapsedSourceFrames(deck);
+			const int64_t corrected = int64_t(followerFrame) - out.hardAlignPhaseErrorFrames;
+			if(corrected > 0) system->seekChannelSourceFrame(deck, uint64_t(corrected));
+		}
+	}
+}
+
 void DjSession::publishSnapshot(){
 	DjSnapshot snapshot = {};
 	snapshot.seq = ++snapshotSeq;
@@ -632,6 +976,33 @@ void DjSession::publishSnapshot(){
 		deckSnapshot.gain = gains[deck];
 		memcpy(deckSnapshot.path, paths[deck], DJ_PATH_CAPACITY);
 		effectState.copyDeck(deck, deckSnapshot.effects);
+
+		deckSnapshot.grid.valid = grids[deck].valid();
+		if(deckSnapshot.grid.valid){
+			deckSnapshot.grid.confidence = deckMetadata[deck].snapshot().confidence;
+			const uint64_t currentFrame = deckSnapshot.loaded ? system->getElapsedSourceFrames(deck) : 0;
+			int64_t quarterBeat = 0;
+			uint64_t boundaryFrame = 0;
+			if(grids[deck].quarterBeatAtFrame(currentFrame, quarterBeat, boundaryFrame)){
+				deckSnapshot.grid.currentQuarterBeat = quarterBeat;
+			}
+		}
+
+		deckSnapshot.quantize.resolution = quantizeResolution[deck];
+		deckSnapshot.quantize.pending = loopEngines[deck].state() == DJ_LOOP_PENDING;
+		deckSnapshot.quantize.pendingTargetFrame = deckSnapshot.quantize.pending
+			? loopEngines[deck].startFrame() : 0;
+
+		const uint64_t durationFrames = deckSnapshot.loaded ? system->getDurationSourceFrames(deck) : 0;
+		const uint64_t currentFrame = deckSnapshot.loaded ? system->getElapsedSourceFrames(deck) : 0;
+		const uint8_t validLengthMask = grids[deck].valid()
+			? djValidLoopLengthMask(grids[deck], currentFrame, durationFrames) : 0;
+		deckSnapshot.loop = loopEngines[deck].snapshot(validLengthMask);
+
+		deckSnapshot.sync.state = syncControllers[deck].state();
+		deckSnapshot.sync.masterDeck = syncMasterDeck[deck];
+		deckSnapshot.sync.targetRate = system ? system->getRate(deck) : DJ_RATE_NEUTRAL;
+		deckSnapshot.sync.lastError = syncLastError[deck];
 	}
 	metadataMutex.lock();
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
