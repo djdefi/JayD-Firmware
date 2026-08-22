@@ -8,6 +8,23 @@
 #include "../../DjSession/DjSession.h"
 #include "../MixScreen/MixControlState.h"
 
+// Out-of-class definitions (no initializer - it's already supplied in the
+// class body) for the static const integral members that are odr-used by
+// reference (e.g. min(capacity, maxPathPayload)/min(capacity, maxTrackCount)
+// in reservePaths()/reserveSongs() below). Without these, whether the build
+// links depends on the optimizer fully inlining/folding away every
+// reference - a real link failure surfaced only when a full firmware
+// compile pulled these functions in without doing so; this is the portable
+// fix rather than relying on that.
+const size_t SongList::SongList::maxTrackCount;
+const size_t SongList::SongList::maxPathLength;
+const size_t SongList::SongList::maxPathPayload;
+const size_t SongList::SongList::maxIndexPayload;
+const uint8_t SongList::SongList::maxDirectoryDepth;
+const uint8_t SongList::SongList::visibleRows;
+const uint8_t SongList::SongList::rowHeight;
+const uint32_t SongList::SongList::holdTime;
+
 namespace {
 const char* indexPathA = "/.jayd-library.a";
 const char* indexPathB = "/.jayd-library.b";
