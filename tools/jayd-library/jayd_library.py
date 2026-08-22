@@ -162,8 +162,11 @@ def _fraction(value: object, scale: int = 1) -> Fraction | None:
     if value in (None, ""):
         return None
     try:
-        return Fraction(Decimal(str(value))) * scale
-    except (InvalidOperation, ValueError, ZeroDivisionError) as exc:
+        decimal = Decimal(str(value))
+        if not decimal.is_finite():
+            raise ValueError("non-finite value")
+        return Fraction(decimal) * scale
+    except (InvalidOperation, OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FormatError(f"invalid exact time {value!r}") from exc
 
 
@@ -285,10 +288,33 @@ def _time_fields(seconds: Fraction | None, sample_rate: int) -> tuple[int | None
 
 
 def _duration_frames(seconds: Fraction | None, sample_rate: int) -> int:
-    if not seconds or not sample_rate:
+    if seconds is None:
+        return 0
+    if seconds < 0:
+        raise FormatError("duration cannot be negative")
+    if not sample_rate:
+        if seconds:
+            raise FormatError("duration requires a source sample rate")
         return 0
     frames = seconds * sample_rate
-    return int(frames) if frames.denominator == 1 else 0
+    # Exact round-half-up keeps exports deterministic without float error.
+    rounded = (2 * frames.numerator + frames.denominator) // (2 * frames.denominator)
+    if rounded > MAX_DURATION_FRAMES:
+        raise FormatError(f"duration exceeds {MAX_DURATION_FRAMES} source frames")
+    return rounded
+
+
+def _source_duration(
+    value: object,
+    sample_rate: int,
+    warnings: list[str],
+    context: str,
+) -> int:
+    try:
+        return _duration_frames(_fraction(value), sample_rate)
+    except FormatError as exc:
+        warnings.append(f"Skipped unrepresentable {context}: {exc}")
+        return 0
 
 
 def _track(path: str, native_id: object, source: str, **values: object) -> TrackData:
@@ -334,6 +360,7 @@ def import_rekordbox(path: Path, root: Path | None) -> LibraryData:
     id_to_path: dict[str, str] = {}
     playlist_stack: list[tuple[str, list[str]]] = []
     playlists: list[PlaylistData] = []
+    warnings: list[str] = []
     product_version = ""
     try:
         iterator = ET.iterparse(path, events=("start", "end"))
@@ -347,7 +374,6 @@ def import_rekordbox(path: Path, root: Path | None) -> LibraryData:
             elif event == "end" and tag == "TRACK" and element.get("Location"):
                 normalized = normalize_path(element.get("Location", ""), root)
                 sample_rate = _int(element.get("SampleRate"), maximum=MAX_SAMPLE_RATE)
-                duration = _fraction(element.get("TotalTime"))
                 track = _track(
                     normalized,
                     element.get("TrackID") or normalized,
@@ -357,7 +383,9 @@ def import_rekordbox(path: Path, root: Path | None) -> LibraryData:
                     album=_limited_text(element.get("Album"), "album"),
                     provenance=f"rekordbox XML {product_version or 'unknown'}",
                     sample_rate=sample_rate,
-                    duration_frames=_duration_frames(duration, sample_rate),
+                    duration_frames=_source_duration(
+                        element.get("TotalTime"), sample_rate, warnings, f"duration for {normalized}"
+                    ),
                     bpm_milli=_bpm(element.get("AverageBpm")),
                     key=_key(element.get("Tonality")),
                     rating=_rating(element.get("Rating"), scale_255=True),
@@ -416,6 +444,7 @@ def import_rekordbox(path: Path, root: Path | None) -> LibraryData:
         tracks,
         playlists,
         {"adapter": "rekordbox", "source_format": "DJ_PLAYLISTS XML", "source_version": product_version},
+        warnings,
     )
 
 
@@ -447,7 +476,7 @@ def import_traktor(path: Path, root: Path | None) -> LibraryData:
             album = element.find("./ALBUM")
             musical_key = element.find("./MUSICAL_KEY")
             sample_rate = _int(audio.get("SAMPLE_RATE") if audio is not None else None, maximum=MAX_SAMPLE_RATE)
-            duration = _fraction(
+            duration = (
                 (info.get("PLAYTIME_FLOAT") if info is not None else None)
                 or (info.get("PLAYTIME") if info is not None else None)
             )
@@ -464,7 +493,9 @@ def import_traktor(path: Path, root: Path | None) -> LibraryData:
                 ),
                 provenance=f"Traktor NML {nml_version or 'unknown'} (best effort)",
                 sample_rate=sample_rate,
-                duration_frames=_duration_frames(duration, sample_rate),
+                duration_frames=_source_duration(
+                    duration, sample_rate, warnings, f"duration for {normalized}"
+                ),
                 bpm_milli=_bpm(tempo.get("BPM") if tempo is not None else None),
                 key=_key(info.get("KEY") if info is not None else None),
                 rating=_rating(info.get("RANKING") if info is not None else None, scale_255=True),
@@ -547,7 +578,7 @@ def import_mixxx(path: Path, root: Path | None) -> LibraryData:
         for row in connection.execute(query):
             normalized = normalize_path(row["path"], root)
             sample_rate = _int(row["samplerate"] if "samplerate" in row.keys() else None, maximum=MAX_SAMPLE_RATE)
-            duration = _fraction(row["duration"] if "duration" in row.keys() else None)
+            duration = row["duration"] if "duration" in row.keys() else None
             track = _track(
                 normalized,
                 row["id"],
@@ -557,7 +588,9 @@ def import_mixxx(path: Path, root: Path | None) -> LibraryData:
                 album=_limited_text(row["album"] if "album" in row.keys() else None, "album"),
                 provenance="Mixxx SQLite",
                 sample_rate=sample_rate,
-                duration_frames=_duration_frames(duration, sample_rate),
+                duration_frames=_source_duration(
+                    duration, sample_rate, warnings, f"duration for {normalized}"
+                ),
                 bpm_milli=_bpm(row["bpm"] if "bpm" in row.keys() else None),
                 key=_key(row["key"] if "key" in row.keys() else None),
                 rating=_rating(row["rating"] if "rating" in row.keys() else None),

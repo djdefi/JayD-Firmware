@@ -79,7 +79,9 @@ reserved[24]
 `normalized_key` is chromatic `1=C ... 12=B`, OR `0x100` for minor; zero is
 unknown. Rating is `0..5`, or `255` unknown. BPM is fixed-point BPM times 1000.
 Durations and frame positions refer to source audio frames, not interleaved
-samples.
+samples. Exact exported duration seconds are converted to the nearest source
+frame using deterministic round-half-up arithmetic (ties toward the greater
+nonnegative frame); floating-point arithmetic is not used.
 
 `CUES` stores `track_index, kind(1 cue/2 loop), flags, slot`, frame position and
 length, exact rational position and length in seconds, label offset, and ARGB
