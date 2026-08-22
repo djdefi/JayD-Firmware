@@ -62,6 +62,22 @@ int main(int argc, char** argv){
 	assert(reader.readPhrase(track, 0, phrase));
 	assert(phrase.confidence == 8000);
 
+	assert(open(reader, argv[1], "fractional-valid.jydm") == Status::Ready);
+	assert(reader.trackByIndex(0, track) == Status::Ready);
+	assert(reader.readCue(track, 0, cue));
+	assert(cue.lengthFrames == Reader::NoFrame && cue.lengthNumerator == 3 &&
+		cue.lengthDenominator == 2);
+	assert(reader.readCue(track, 1, cue));
+	assert(cue.positionFrames == Reader::NoFrame && cue.positionNumerator == 5 &&
+		cue.positionDenominator == 2);
+	assert(open(reader, argv[1], "fractional-boundary.jydm") == Status::Ready);
+	assert(open(reader, argv[1], "fractional-denominator-zero.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "fractional-cue-over.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "fractional-loop-over.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "fractional-grid-over.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "fractional-phrase-over.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "fractional-64-bit-product-overflow.jydm") == Status::Corrupt);
+
 	assert(open(reader, argv[1], "unknown-optional.jydm") == Status::Ready);
 	assert(open(reader, argv[1], "corrupt-crc.jydm") == Status::Corrupt);
 	assert(open(reader, argv[1], "truncated.jydm") == Status::Corrupt);

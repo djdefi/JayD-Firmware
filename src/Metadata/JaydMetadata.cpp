@@ -74,17 +74,87 @@ bool validKey(uint16_t key){
 	return key == 0 || ((key & 0xff) >= 1 && (key & 0xff) <= 12 && (key & ~0x1ff) == 0);
 }
 
-bool validPosition(uint64_t frame, uint64_t numerator, uint32_t denominator, uint64_t duration){
-	if(denominator == 0 && numerator != 0) return false;
-	if(frame == Reader::NoFrame) return denominator != 0;
-	return frame <= Reader::MaxFrame && (duration == 0 || frame <= duration);
+struct Wide {
+	uint32_t words[4];
+	bool overflow;
+};
+
+Wide wide(uint64_t value){
+	Wide result = {{uint32_t(value), uint32_t(value >> 32), 0, 0}, false};
+	return result;
 }
 
-bool validOptionalLength(uint64_t frame, uint64_t numerator, uint32_t denominator, uint64_t position, uint64_t duration){
+Wide multiply(Wide value, uint32_t factor){
+	uint64_t carry = 0;
+	for(uint8_t i = 0; i < 4; ++i){
+		const uint64_t product = uint64_t(value.words[i]) * factor + carry;
+		value.words[i] = uint32_t(product);
+		carry = product >> 32;
+	}
+	value.overflow = value.overflow || carry != 0;
+	return value;
+}
+
+Wide add(Wide left, const Wide& right){
+	uint64_t carry = 0;
+	for(uint8_t i = 0; i < 4; ++i){
+		const uint64_t sum = uint64_t(left.words[i]) + right.words[i] + carry;
+		left.words[i] = uint32_t(sum);
+		carry = sum >> 32;
+	}
+	left.overflow = left.overflow || right.overflow || carry != 0;
+	return left;
+}
+
+bool lessOrEqual(const Wide& left, const Wide& right){
+	if(left.overflow || right.overflow) return false;
+	for(int8_t i = 3; i >= 0; --i){
+		if(left.words[i] != right.words[i]) return left.words[i] < right.words[i];
+	}
+	return true;
+}
+
+bool rationalWithin(uint64_t numerator, uint32_t denominator, uint32_t sampleRate, uint64_t duration){
+	return lessOrEqual(multiply(wide(numerator), sampleRate), multiply(wide(duration), denominator));
+}
+
+bool validPosition(uint64_t frame, uint64_t numerator, uint32_t denominator,
+	uint32_t sampleRate, uint64_t duration){
 	if(denominator == 0 && numerator != 0) return false;
-	if(frame == Reader::NoFrame) return denominator != 0 || numerator == 0;
-	if(frame > Reader::MaxFrame) return false;
-	return duration == 0 || position == Reader::NoFrame || (position <= duration && frame <= duration - position);
+	if(frame != Reader::NoFrame){
+		return frame <= Reader::MaxFrame && (duration == 0 || frame <= duration);
+	}
+	if(denominator == 0) return false;
+	return duration == 0 || rationalWithin(numerator, denominator, sampleRate, duration);
+}
+
+bool validOptionalLength(uint64_t frame, uint64_t numerator, uint32_t denominator,
+	uint64_t position, uint64_t positionNumerator, uint32_t positionDenominator,
+	uint32_t sampleRate, uint64_t duration){
+	if(denominator == 0 && numerator != 0) return false;
+	if(frame == Reader::NoFrame && denominator == 0) return true;
+	if(frame != Reader::NoFrame && frame > Reader::MaxFrame) return false;
+	if(duration == 0) return true;
+
+	if(position != Reader::NoFrame){
+		if(position > duration) return false;
+		if(frame != Reader::NoFrame) return frame <= duration - position;
+		return rationalWithin(numerator, denominator, sampleRate, duration - position);
+	}
+
+	if(frame != Reader::NoFrame){
+		const Wide total = add(
+			multiply(wide(positionNumerator), sampleRate),
+			multiply(wide(frame), positionDenominator)
+		);
+		return lessOrEqual(total, multiply(wide(duration), positionDenominator));
+	}
+	const Wide total = multiply(add(
+		multiply(wide(positionNumerator), denominator),
+		multiply(wide(numerator), positionDenominator)
+	), sampleRate);
+	const Wide available = multiply(multiply(wide(duration), positionDenominator), denominator);
+	return lessOrEqual(total, available);
 }
 
 int knownSection(const uint8_t kind[4]){
@@ -400,7 +470,8 @@ bool Reader::validateTrack(uint32_t index, Track* output){
 	const uint16_t key = u16(record + 92);
 	const uint8_t rating = record[94];
 	if(record[95] != 0 || !allZero(record + 104, 24) ||
-		sampleRate > MaxSampleRate || durationFrames > MaxFrame || bpmMilli > MaxBpmMilli ||
+		sampleRate > MaxSampleRate || durationFrames > MaxFrame ||
+		(durationFrames != 0 && sampleRate == 0) || bpmMilli > MaxBpmMilli ||
 		(rating > 5 && rating != 0xff) || !validKey(key) ||
 		cueCount > MaxCuesPerTrack || !spanFits(firstCue, cueCount, sections_[CueSection].count) ||
 		gridCount > MaxGridPerTrack || !spanFits(firstGrid, gridCount, sections_[GridSection].count) ||
@@ -434,7 +505,8 @@ bool Reader::validateTrack(uint32_t index, Track* output){
 	return true;
 }
 
-bool Reader::validateCue(uint32_t index, uint32_t owner, uint64_t durationFrames, Cue* output){
+bool Reader::validateCue(uint32_t index, uint32_t owner, uint32_t sampleRate,
+	uint64_t durationFrames, Cue* output){
 	const Section& section = sections_[CueSection];
 	if(index >= section.count) return false;
 	uint8_t record[64];
@@ -448,8 +520,9 @@ bool Reader::validateCue(uint32_t index, uint32_t owner, uint64_t durationFrames
 	const uint32_t lengthDenominator = u32(record + 44);
 	const uint32_t label = u32(record + 48);
 	if(u32(record) != owner || (kind != 1 && kind != 2) || !allZero(record + 56, 8) ||
-		!validPosition(position, positionNumerator, positionDenominator, durationFrames) ||
-		!validOptionalLength(length, lengthNumerator, lengthDenominator, position, durationFrames) ||
+		!validPosition(position, positionNumerator, positionDenominator, sampleRate, durationFrames) ||
+		!validOptionalLength(length, lengthNumerator, lengthDenominator,
+			position, positionNumerator, positionDenominator, sampleRate, durationFrames) ||
 		!validateStringOffset(label)) return false;
 	if(output){
 		output->kind = kind;
@@ -467,7 +540,8 @@ bool Reader::validateCue(uint32_t index, uint32_t owner, uint64_t durationFrames
 	return true;
 }
 
-bool Reader::validateGrid(uint32_t index, uint32_t owner, uint64_t durationFrames, Grid* output){
+bool Reader::validateGrid(uint32_t index, uint32_t owner, uint32_t sampleRate,
+	uint64_t durationFrames, Grid* output){
 	const Section& section = sections_[GridSection];
 	if(index >= section.count) return false;
 	uint8_t record[40];
@@ -478,7 +552,7 @@ bool Reader::validateGrid(uint32_t index, uint32_t owner, uint64_t durationFrame
 	const uint32_t bpm = u32(record + 24);
 	const uint16_t confidence = u16(record + 32);
 	if(u32(record) != owner || !allZero(record + 36, 4) || bpm > MaxBpmMilli || confidence > 10000 ||
-		!validPosition(position, numerator, denominator, durationFrames)) return false;
+		!validPosition(position, numerator, denominator, sampleRate, durationFrames)) return false;
 	if(output){
 		output->positionFrames = position;
 		output->positionNumerator = numerator;
@@ -491,7 +565,8 @@ bool Reader::validateGrid(uint32_t index, uint32_t owner, uint64_t durationFrame
 	return true;
 }
 
-bool Reader::validatePhrase(uint32_t index, uint32_t owner, uint64_t durationFrames, Phrase* output){
+bool Reader::validatePhrase(uint32_t index, uint32_t owner, uint32_t sampleRate,
+	uint64_t durationFrames, Phrase* output){
 	const Section& section = sections_[PhraseSection];
 	if(index >= section.count) return false;
 	uint8_t record[32];
@@ -502,7 +577,7 @@ bool Reader::validatePhrase(uint32_t index, uint32_t owner, uint64_t durationFra
 	const uint32_t kind = u32(record + 24);
 	const uint16_t confidence = u16(record + 28);
 	if(u32(record) != owner || confidence > 10000 ||
-		!validPosition(position, numerator, denominator, durationFrames) ||
+		!validPosition(position, numerator, denominator, sampleRate, durationFrames) ||
 		!validateStringOffset(kind)) return false;
 	if(output){
 		output->positionFrames = position;
@@ -527,13 +602,13 @@ bool Reader::validateRecords(){
 		Track track;
 		if(!validateTrack(index, &track)) return false;
 		for(uint32_t child = 0; child < track.cueCount; ++child){
-			if(!validateCue(track.firstCue + child, index, track.durationFrames, nullptr)) return false;
+			if(!validateCue(track.firstCue + child, index, track.sampleRate, track.durationFrames, nullptr)) return false;
 		}
 		for(uint32_t child = 0; child < track.gridCount; ++child){
-			if(!validateGrid(track.firstGrid + child, index, track.durationFrames, nullptr)) return false;
+			if(!validateGrid(track.firstGrid + child, index, track.sampleRate, track.durationFrames, nullptr)) return false;
 		}
 		for(uint32_t child = 0; child < track.phraseCount; ++child){
-			if(!validatePhrase(track.firstPhrase + child, index, track.durationFrames, nullptr)) return false;
+			if(!validatePhrase(track.firstPhrase + child, index, track.sampleRate, track.durationFrames, nullptr)) return false;
 		}
 	}
 	for(uint32_t index = 0; index < sections_[PlaylistSection].count; ++index){
@@ -596,17 +671,17 @@ Status Reader::trackBySourceId(const uint8_t sourceId[16], Track& track){
 
 bool Reader::readCue(const Track& track, uint32_t relativeIndex, Cue& cue){
 	return status_ == Status::Ready && relativeIndex < track.cueCount &&
-		validateCue(track.firstCue + relativeIndex, track.index, track.durationFrames, &cue);
+		validateCue(track.firstCue + relativeIndex, track.index, track.sampleRate, track.durationFrames, &cue);
 }
 
 bool Reader::readGrid(const Track& track, uint32_t relativeIndex, Grid& grid){
 	return status_ == Status::Ready && relativeIndex < track.gridCount &&
-		validateGrid(track.firstGrid + relativeIndex, track.index, track.durationFrames, &grid);
+		validateGrid(track.firstGrid + relativeIndex, track.index, track.sampleRate, track.durationFrames, &grid);
 }
 
 bool Reader::readPhrase(const Track& track, uint32_t relativeIndex, Phrase& phrase){
 	return status_ == Status::Ready && relativeIndex < track.phraseCount &&
-		validatePhrase(track.firstPhrase + relativeIndex, track.index, track.durationFrames, &phrase);
+		validatePhrase(track.firstPhrase + relativeIndex, track.index, track.sampleRate, track.durationFrames, &phrase);
 }
 
 } // namespace JaydMetadata

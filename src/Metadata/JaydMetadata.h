@@ -136,9 +136,9 @@ private:
 	bool validateStrings();
 	bool validateRecords();
 	bool validateTrack(uint32_t index, Track* output);
-	bool validateCue(uint32_t index, uint32_t owner, uint64_t durationFrames, Cue* output);
-	bool validateGrid(uint32_t index, uint32_t owner, uint64_t durationFrames, Grid* output);
-	bool validatePhrase(uint32_t index, uint32_t owner, uint64_t durationFrames, Phrase* output);
+	bool validateCue(uint32_t index, uint32_t owner, uint32_t sampleRate, uint64_t durationFrames, Cue* output);
+	bool validateGrid(uint32_t index, uint32_t owner, uint32_t sampleRate, uint64_t durationFrames, Grid* output);
+	bool validatePhrase(uint32_t index, uint32_t owner, uint32_t sampleRate, uint64_t durationFrames, Phrase* output);
 	bool validateStringOffset(uint32_t offset);
 	bool validatePath(uint32_t offset);
 	bool readSectionEntry(uint64_t directoryOffset, uint16_t directoryEntrySize, uint32_t index, uint8_t output[24]);
