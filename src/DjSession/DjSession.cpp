@@ -1,9 +1,21 @@
 #include "DjSession.h"
 #include <Arduino.h>
 #include <AudioLib/EffectType.hpp>
+#include <AudioLib/SpeedModifier.h>
 #include <Loop/LoopManager.h>
 #include <SD.h>
 #include <esp_system.h>
+
+// DjBeatEngine.h's DJ_RATE_* constants are plain values (kept dependency-free
+// for host testing) but must exactly mirror SpeedModifier's Q16.16 rate
+// range/scale, since DjSession feeds targetRate straight into
+// SpeedModifier::setRate()/nudgeRate(). Assert that at compile time so any
+// future change to either side's constants fails the build instead of
+// silently desyncing the sync controller's math from the real clamp range.
+static_assert(DJ_RATE_SCALE == SpeedModifier::RateScale, "DJ_RATE_SCALE must match SpeedModifier::RateScale");
+static_assert(DJ_RATE_MIN == SpeedModifier::MinRate, "DJ_RATE_MIN must match SpeedModifier::MinRate");
+static_assert(DJ_RATE_NEUTRAL == SpeedModifier::NeutralRate, "DJ_RATE_NEUTRAL must match SpeedModifier::NeutralRate");
+static_assert(DJ_RATE_MAX == SpeedModifier::MaxRate, "DJ_RATE_MAX must match SpeedModifier::MaxRate");
 
 DjSession* DjSession::instance = nullptr;
 uint64_t DjSession::bootId = 0;

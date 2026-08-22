@@ -562,6 +562,7 @@ public:
 	void reset(){
 		state_ = DJ_SYNC_OFF;
 		ticksSinceNudge_ = DJ_SYNC_NUDGE_COOLDOWN_TICKS;
+		hasCommandedRate_ = false;
 	}
 
 	DjSyncState state() const{ return state_; }
@@ -573,12 +574,14 @@ public:
 		if(!in.armed){
 			state_ = DJ_SYNC_OFF;
 			out.state = state_;
+			hasCommandedRate_ = false;
 			return out;
 		}
 
 		if(!in.masterValid || !in.followerValid || in.followerBpmMilli == 0){
 			state_ = DJ_SYNC_ERROR;
 			out.state = state_;
+			hasCommandedRate_ = false;
 			return out;
 		}
 
@@ -587,6 +590,7 @@ public:
 			targetRateWide > UINT32_MAX){
 			state_ = DJ_SYNC_ERROR;
 			out.state = state_;
+			hasCommandedRate_ = false;
 			return out;
 		}
 		const DjRate targetRate = DjRate(targetRateWide);
@@ -594,11 +598,22 @@ public:
 		if(targetRate < DJ_RATE_MIN || targetRate > DJ_RATE_MAX){
 			state_ = DJ_SYNC_OUT_OF_RANGE;
 			out.state = state_;
+			hasCommandedRate_ = false;
 			return out;
 		}
 
-		out.applyRate = true;
-		out.targetRate = targetRate;
+		// The real SpeedModifier::setRate() unconditionally overwrites
+		// requestedRate, which would silently erase an in-flight nudge on the
+		// very next tick if we re-commanded the same baseline every tick. Only
+		// emit applyRate when the commanded baseline genuinely changes (or has
+		// never been established since the last OFF/ERROR/OUT_OF_RANGE reset),
+		// so a bounded nudge below can persist and accumulate across ticks.
+		if(!hasCommandedRate_ || commandedRate_ != targetRate){
+			out.applyRate = true;
+			out.targetRate = targetRate;
+			hasCommandedRate_ = true;
+			commandedRate_ = targetRate;
+		}
 
 		if(!in.masterPlaying || !in.followerPlaying){
 			// Not both transports running yet: hold the rate, do not chase phase.
@@ -677,6 +692,8 @@ private:
 
 	DjSyncState state_ = DJ_SYNC_OFF;
 	uint8_t ticksSinceNudge_ = DJ_SYNC_NUDGE_COOLDOWN_TICKS;
+	bool hasCommandedRate_ = false;
+	DjRate commandedRate_ = DJ_RATE_NEUTRAL;
 };
 
 #endif
