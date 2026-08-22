@@ -87,3 +87,34 @@ g++ -std=c++11 -Wall -Wextra -Werror -g -O1 \
   physical/browser control state once those branches land.
 - No CMake/CTest wiring yet - add `AutoDjSelfCheck` alongside the other
   self-checks once `CMakeLists.txt` stabilizes post-rebase.
+
+### Coach scoring landed (isolated, also pre-final) - mapping notes
+
+As of `djdefi-dj-coach-transitions@7f768f8`, `src/DjAssist/` has an
+isolated Coach scoring/suggestion/one-shot-transition layer
+(`DjAssistTypes.h`, `DjAssistScoring.h/.cpp`, `DjAssistEngine.h/.cpp`).
+Per that branch, `DjAssistTypes.h`/`DjAssistScoring.h` are the "stable-ish"
+parts (unlikely to change shape); the transition state machine and any
+DjSession/browser wiring are still waiting on the Sync/quantize
+(`djdefi-psychic-fiesta`) and browser/API v2 branches to publish real
+SHAs, so this is *not yet the final rebase target either*. Not wiring
+anything in yet, but for whoever does the eventual rebase:
+
+- `DjAssistScoring::scoreEntry(entry, deck, isLoaded, isRecent)` +
+  `DjAssistScoring::mergeSuggestion(...)` / `scanTick(...)` are the
+  reusable "Coach scoring" `selectNext()` should call instead of its
+  current placeholder. `scoreEntry` already follows the same philosophy
+  used here (missing capabilities reduce confidence rather than reject;
+  only loaded/recent/corrupt-or-unsupported entries are excluded).
+- `DjAssistSuggestion`/`DjAssistLibraryEntry` use `bpmMilli`/`key` shapes
+  that already match `AutoDjCandidate`'s fields - low-friction to adapt.
+- Coach's stable tie-break is **ascending `libraryIndex`**
+  (`DjAssistScoring::mergeSuggestion`), not fingerprint-byte order like
+  `autoDjIdentityLess()` here. Switch to libraryIndex-based ties on
+  rebase so the whole app breaks ties the same way.
+- `DjAssistScoring::identityMatches()` is the Coach equivalent of
+  `AutoDjIdentity::sameTrack()` - same "no comparable evidence, no match"
+  philosophy, reconcile the two on rebase.
+- `DjAssistReasonFlag` / `DjAssistExcludeReason` are a richer, bit-flag
+  version of this layer's `AutoDjReason` - map ours onto theirs (or drop
+  ours) once wiring starts, rather than keeping two reason vocabularies.
