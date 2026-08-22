@@ -128,6 +128,7 @@ struct DjCommandResult {
 #if defined(JAYD_ENABLE_WIRELESS)
 	char clientId[33] = {};
 	char clientCommandId[33] = {};
+	uint64_t sequence = 0;
 #endif
 };
 
@@ -342,6 +343,8 @@ public:
 #if defined(JAYD_ENABLE_WIRELESS)
 		memcpy(result.clientId, command.clientId, sizeof(result.clientId));
 		memcpy(result.clientCommandId, command.clientCommandId, sizeof(result.clientCommandId));
+		result.sequence = ++nextSequence;
+		if(result.sequence == 0) result.sequence = ++nextSequence;
 #endif
 #if defined(JAYD_ENABLE_WIRELESS)
 		next = (selected + 1) % DJ_RECENT_RESULT_COUNT;
@@ -360,10 +363,27 @@ public:
 	}
 
 	void copyTo(DjCommandResult* destination) const{
+#if defined(JAYD_ENABLE_WIRELESS)
+		bool copied[DJ_RECENT_RESULT_COUNT] = {};
+		for(uint8_t output = 0; output < DJ_RECENT_RESULT_COUNT; output++){
+			bool found = false;
+			uint8_t selected = 0;
+			for(uint8_t candidate = 0; candidate < DJ_RECENT_RESULT_COUNT; candidate++){
+				if(copied[candidate] || results[candidate].sequence == 0) continue;
+				if(!found || results[candidate].sequence > results[selected].sequence){
+					selected = candidate;
+					found = true;
+				}
+			}
+			destination[output] = found ? results[selected] : DjCommandResult{};
+			if(found) copied[selected] = true;
+		}
+#else
 		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; i++){
 			const uint8_t index = (next + DJ_RECENT_RESULT_COUNT - 1 - i) % DJ_RECENT_RESULT_COUNT;
 			destination[i] = results[index];
 		}
+#endif
 	}
 
 #if defined(JAYD_ENABLE_WIRELESS)
@@ -383,6 +403,9 @@ public:
 private:
 	DjCommandResult results[DJ_RECENT_RESULT_COUNT] = {};
 	uint8_t next = 0;
+#if defined(JAYD_ENABLE_WIRELESS)
+	uint64_t nextSequence = 0;
+#endif
 };
 
 class DjSnapshotBuffers {

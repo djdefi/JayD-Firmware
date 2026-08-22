@@ -462,6 +462,10 @@ void handleSetupWifi(){
 		sendError(404, "not_found");
 		return;
 	}
+	if(!sameOrigin()){
+		sendError(403, "origin_rejected");
+		return;
+	}
 	if(!security.allowPairAttempt(millis())){
 		sendError(429, "rate_limited");
 		return;
@@ -984,9 +988,22 @@ void WirelessBringup::loop(){
 	if(restartAt != 0 && static_cast<int32_t>(millis() - restartAt) >= 0) ESP.restart();
 }
 
+bool WirelessBringup::copyPairingStatus(WirelessPairingStatus& status){
+	status = {};
+	const uint32_t now = millis();
+	status.remainingMs = security.pairingRemaining(now);
+	status.open = status.remainingMs != 0 && security.copyPairingCode(status.code, now);
+	if(!status.open) status.remainingMs = 0;
+	return status.open;
+}
+
 #else
 
 void WirelessBringup::begin(){}
 void WirelessBringup::loop(){}
+bool WirelessBringup::copyPairingStatus(WirelessPairingStatus& status){
+	status = {};
+	return false;
+}
 
 #endif

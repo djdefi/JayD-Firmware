@@ -171,6 +171,16 @@ void commandLifecycle(){
 		assert(results.findClientCommand("tablet", queued.clientCommandId, duplicate));
 		assert(duplicate.status == DJ_COMMAND_ACCEPTED);
 	}
+	DjCommandResult ordered[DJ_RECENT_RESULT_COUNT] = {};
+	results.copyTo(ordered);
+	for(uint32_t offset = 0; offset < 8; offset++){
+		assert(ordered[offset].id == 119 - offset);
+		assert(ordered[offset].status == DJ_COMMAND_REJECTED);
+	}
+	for(uint8_t i = 1; i < DJ_RECENT_RESULT_COUNT; i++){
+		if(ordered[i].id == 0) break;
+		assert(ordered[i - 1].sequence > ordered[i].sequence);
+	}
 	assert(strcmp(RECONNECT_DIRECTIVE, "fetch_state_and_results_never_replay") == 0);
 }
 
