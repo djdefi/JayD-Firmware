@@ -76,6 +76,25 @@ namespace DjRecordingLogic {
 		outRepaired.chunkSize = dataSize + 36; // dataSize + (sizeof(WavHeader) - 8)
 		return true;
 	}
+
+	// Distinguishes *why* a finalize attempt failed so callers can report an
+	// accurate error instead of collapsing every failure into one code.
+	enum class FinalizeOutcome : uint8_t {
+		SUCCESS,
+		ALLOC_EXHAUSTED, // bounded naming space full, directory couldn't be created, or bad input
+		RENAME_FAILED    // a free path was allocated but the rename I/O failed
+	};
+
+	// Pure decision for finalizeRecording(): given whether the temp file was
+	// present, a free permanent path was allocated, and the rename I/O
+	// succeeded, decides the outcome. Kept separate from the SD-backed I/O
+	// in DjRecordingStorage.cpp so both failure paths are host-testable
+	// without stubbing the filesystem.
+	inline FinalizeOutcome decideFinalizeOutcome(bool tempPresent, bool allocated, bool renamed){
+		if(!tempPresent || !allocated) return FinalizeOutcome::ALLOC_EXHAUSTED;
+		if(!renamed) return FinalizeOutcome::RENAME_FAILED;
+		return FinalizeOutcome::SUCCESS;
+	}
 }
 
 #endif //JAYD_FIRMWARE_DJRECORDINGLOGIC_H

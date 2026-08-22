@@ -64,7 +64,10 @@ private:
 	uint32_t sessionId = 0;
 	DjRecordingSnapshot recordingSnapshot;
 	DjRecordingState lastRecordingState = DJ_RECORDING_IDLE;
-	bool finalizeFailed = false;
+	// Set to the specific storage-layer error when finalizeRecording() fails
+	// (naming space exhausted vs. rename I/O failure); DJ_RECORDING_ERROR_NONE
+	// otherwise. Overrides a library-reported success once set.
+	DjRecordingError finalizeError = DJ_RECORDING_ERROR_NONE;
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;

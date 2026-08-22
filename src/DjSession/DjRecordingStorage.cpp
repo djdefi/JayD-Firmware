@@ -34,14 +34,15 @@ bool allocatePath(char* outPath, size_t outCapacity){
 	return true;
 }
 
-bool finalizeRecording(const char* tempPath, char* outPath, size_t outCapacity){
-	if(!tempPath || !outPath || outCapacity == 0 || !SD.exists(tempPath)) return false;
-	if(!allocatePath(outPath, outCapacity)) return false;
-	if(!SD.rename(tempPath, outPath)){
-		outPath[0] = '\0';
-		return false;
+FinalizeOutcome finalizeRecording(const char* tempPath, char* outPath, size_t outCapacity){
+	const bool tempPresent = tempPath && outPath && outCapacity > 0 && SD.exists(tempPath);
+	const bool allocated = tempPresent && allocatePath(outPath, outCapacity);
+	if(!allocated){
+		return DjRecordingLogic::decideFinalizeOutcome(tempPresent, false, false);
 	}
-	return true;
+	const bool renamed = SD.rename(tempPath, outPath);
+	if(!renamed) outPath[0] = '\0';
+	return DjRecordingLogic::decideFinalizeOutcome(tempPresent, allocated, renamed);
 }
 
 RecoveryResult recoverOrphan(const char* tempPath){
@@ -84,7 +85,7 @@ RecoveryResult recoverOrphan(const char* tempPath){
 	file.close();
 
 	char finalPath[64];
-	if(!finalizeRecording(tempPath, finalPath, sizeof(finalPath))){
+	if(finalizeRecording(tempPath, finalPath, sizeof(finalPath)) != FinalizeOutcome::SUCCESS){
 		result.failed++;
 		return result;
 	}

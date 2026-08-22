@@ -76,6 +76,21 @@ int main(){
 	for(uint16_t i = 1; i <= DjRecordingLogic::NAME_CAPACITY; i++) takenTable[i] = true;
 	assert(!DjRecordingLogic::findFreeSlot(1, isTaken, nullptr, index));
 
+	// --- Finalize outcome: allocation exhaustion (naming space full, missing
+	// temp file, or bad input) must be distinguished from a rename I/O
+	// failure -- collapsing both into one code hides which layer failed and
+	// mislabels a successful-capture/failed-move recording as "storage full"
+	// when it was really a rename error, or vice versa.
+	using DjRecordingLogic::FinalizeOutcome;
+	using DjRecordingLogic::decideFinalizeOutcome;
+	assert(decideFinalizeOutcome(/*tempPresent=*/true, /*allocated=*/true, /*renamed=*/true) == FinalizeOutcome::SUCCESS);
+	// Naming space exhausted (or temp file missing/bad input): never reaches rename.
+	assert(decideFinalizeOutcome(/*tempPresent=*/true, /*allocated=*/false, /*renamed=*/false) == FinalizeOutcome::ALLOC_EXHAUSTED);
+	assert(decideFinalizeOutcome(/*tempPresent=*/false, /*allocated=*/false, /*renamed=*/false) == FinalizeOutcome::ALLOC_EXHAUSTED);
+	// A free path *was* allocated, but the injected rename I/O failed: must be
+	// reported as RENAME_FAILED, not lumped in with naming exhaustion.
+	assert(decideFinalizeOutcome(/*tempPresent=*/true, /*allocated=*/true, /*renamed=*/false) == FinalizeOutcome::RENAME_FAILED);
+
 	// --- WAV repair: a valid Jay-D header with a truncated/extended data
 	// region gets its dataSize/chunkSize recomputed from real file length.
 	WavHeader header = validHeader(1000);

@@ -465,15 +465,18 @@ void DjSession::pollRecording(){
 			recordingSnapshot.path[0] = '\0';
 			recordingSnapshot.error = DJ_RECORDING_ERROR_NONE;
 			recordingSnapshot.valid = false;
-			finalizeFailed = false;
+			finalizeError = DJ_RECORDING_ERROR_NONE;
 		}else if(mapped == DJ_RECORDING_COMPLETE && status.fileValid){
 			// finalize exactly once, on the completion edge
 			char finalPath[DJ_PATH_CAPACITY];
-			if(DjRecordingStorage::finalizeRecording(MixSystem::recordPath, finalPath, sizeof(finalPath))){
+			const auto outcome = DjRecordingStorage::finalizeRecording(MixSystem::recordPath, finalPath, sizeof(finalPath));
+			if(outcome == DjRecordingStorage::FinalizeOutcome::SUCCESS){
 				memcpy(recordingSnapshot.path, finalPath, strlen(finalPath) + 1);
 			}else{
 				recordingSnapshot.path[0] = '\0';
-				finalizeFailed = true;
+				finalizeError = outcome == DjRecordingStorage::FinalizeOutcome::RENAME_FAILED
+					? DJ_RECORDING_ERROR_RENAME_FAILED
+					: DJ_RECORDING_ERROR_NAME_EXHAUSTED;
 			}
 		}
 		lastRecordingState = mapped;
@@ -486,8 +489,8 @@ void DjSession::pollRecording(){
 	// failed) overrides a library-reported success: the recording captured
 	// fine but could not be moved into permanent, collision-safe storage.
 	if(mapped == DJ_RECORDING_COMPLETE || mapped == DJ_RECORDING_FAILED){
-		if(finalizeFailed){
-			recordingSnapshot.error = DJ_RECORDING_ERROR_NAME_EXHAUSTED;
+		if(finalizeError != DJ_RECORDING_ERROR_NONE){
+			recordingSnapshot.error = finalizeError;
 			recordingSnapshot.valid = false;
 		}else{
 			recordingSnapshot.error = mapRecordingError(status.error);

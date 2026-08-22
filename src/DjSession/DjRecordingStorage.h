@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "DjRecordingLogic.h"
 
 // Bounded, collision-safe SD storage for finalized Jay-D recordings, and
 // conservative recovery of a WAV file left behind by an interrupted session.
@@ -24,11 +25,14 @@ namespace DjRecordingStorage {
 	// space is exhausted or the directory could not be created.
 	bool allocatePath(char* outPath, size_t outCapacity);
 
+	// Distinguishes *why* finalizeRecording() failed; see DjRecordingLogic.h
+	// for the (host-testable, filesystem-free) decision logic.
+	using FinalizeOutcome = DjRecordingLogic::FinalizeOutcome;
+
 	// Moves the just-completed temp recording at tempPath into a freshly
 	// allocated permanent path, writing the final path into outPath. Leaves
-	// the temp file in place and returns false on allocation exhaustion or
-	// rename failure.
-	bool finalizeRecording(const char* tempPath, char* outPath, size_t outCapacity);
+	// the temp file in place on any failure.
+	FinalizeOutcome finalizeRecording(const char* tempPath, char* outPath, size_t outCapacity);
 
 	struct RecoveryResult {
 		uint32_t repaired = 0;
