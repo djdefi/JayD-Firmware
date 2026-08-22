@@ -614,7 +614,16 @@ void handleState(){
 	}
 	JsonWriter writer(responseBuffer, sizeof(responseBuffer));
 	writer.append(
-		"{\"seq\":%llu,\"boot_id\":%llu,\"session_id\":%lu,\"active\":%s,"
+		// boot_id is a full-range random uint64_t and is therefore carried
+		// as an opaque quoted decimal string, not a bare JSON number: a
+		// JSON number can only be represented exactly up to 2^53-1 in a
+		// browser's IEEE-754 double, so a bare-number boot_id would get
+		// silently rounded by JSON.parse and no longer match on the next
+		// command (stale_identity), even though nothing actually changed.
+		// seq/session_id stay bare numbers - seq is monotonic and won't
+		// realistically exceed 2^53 within a boot's uptime, and
+		// session_id is a uint32_t, both safely exact as JS numbers.
+		"{\"seq\":%llu,\"boot_id\":\"%llu\",\"session_id\":%lu,\"active\":%s,"
 		"\"mixer_running\":%s,\"mix\":%u,\"recording\":%s,\"queue_depth\":%u,\"decks\":[",
 		static_cast<unsigned long long>(snapshot.seq),
 		static_cast<unsigned long long>(snapshot.bootId),
@@ -771,9 +780,16 @@ void handleCommand(){
 
 	uint64_t bootId = 0;
 	uint64_t sessionId = 0;
+	const char* bootIdText = nullptr;
 	const char* commandId = nullptr;
 	const char* action = nullptr;
-	if(!object.getNumber("boot_id", bootId) || !object.getNumber("session_id", sessionId) ||
+	// boot_id must arrive as the opaque decimal string handleState() emits
+	// (see there for why) - never as a bare JSON number, and never
+	// Number-coerced. An exact digit-by-digit parse rejects malformed or
+	// overflowing input outright rather than truncating/wrapping it into a
+	// value that could accidentally match.
+	if(!object.getString("boot_id", bootIdText) || !WirelessApi::parseUint64Decimal(bootIdText, bootId) ||
+	   !object.getNumber("session_id", sessionId) ||
 	   sessionId > UINT32_MAX || !object.getString("client_command_id", commandId) ||
 	   !WirelessApi::validClientCommandId(commandId) || !object.getString("action", action)){
 		sendError(400, "invalid_fields");

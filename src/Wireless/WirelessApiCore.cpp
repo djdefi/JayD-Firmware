@@ -98,6 +98,19 @@ bool validToken(const char* value){
 	return true;
 }
 
+bool parseUint64Decimal(const char* text, uint64_t& value){
+	if(!text || *text == '\0') return false;
+	uint64_t result = 0;
+	for(const char* cursor = text; *cursor != '\0'; cursor++){
+		if(!isdigit(static_cast<unsigned char>(*cursor))) return false;
+		const uint8_t digit = static_cast<uint8_t>(*cursor - '0');
+		if(result > (UINT64_MAX - digit) / 10) return false; // would overflow uint64_t
+		result = result * 10 + digit;
+	}
+	value = result;
+	return true;
+}
+
 void Security::initialize(TokenStore& store){
 	StoredTokens loaded = {};
 	if(!store.load(loaded) || loaded.version != 1) return;

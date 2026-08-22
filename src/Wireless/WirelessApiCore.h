@@ -140,6 +140,17 @@ bool validClientId(const char* value);
 bool validClientCommandId(const char* value);
 bool validToken(const char* value);
 
+// Strict decimal-string -> uint64_t parse for opaque wire identifiers
+// (boot_id) that must survive JSON exactly: JS Number can only represent
+// integers exactly up to 2^53-1, so a full-range random uint64 sent as a
+// bare JSON number silently loses precision in the browser. Carrying it as
+// a quoted decimal string instead means the value only ever needs an exact
+// text round trip, never numeric coercion, on either side.
+//
+// Rejects empty input, any non-digit character, and overflow (a value that
+// would not fit in 64 bits) rather than silently truncating/wrapping.
+bool parseUint64Decimal(const char* text, uint64_t& value);
+
 }
 
 #endif

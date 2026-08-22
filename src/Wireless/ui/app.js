@@ -137,6 +137,50 @@ const COMMAND_SHAPE = {
 	set_recording: (f) => ({ value: !!f.value })
 };
 
+// Pure snapshot-acceptance state machine, factored out of applySnapshot()
+// so the two hardest invariants around a device reboot are directly unit
+// tested: (1) a post-reboot snapshot is never mistaken for stale/duplicate
+// data, and (2) nothing about accepting it ever replays a command.
+//
+// `prev` is `{ bootId, sessionId, lastSeq }` - the subset of `app` this
+// decision depends on. Returns `{ accept: false }` when the snapshot must
+// be ignored outright (stale/out-of-order within the *same* identity), or
+// `{ accept: true, identityChanged, bootId, sessionId, lastSeq }` describing
+// the state to adopt.
+//
+// Identity is compared strictly before sequence. The device's monotonic
+// seq counter resets to 0 on every boot, which is numerically "stale"
+// against whatever high lastSeq the browser saw before a restart; checking
+// seq first would silently ignore every snapshot from the new boot
+// forever, freezing the UI on pre-restart state and never running the
+// lease/reconnect reset. So an identity change first resets the effective
+// lastSeq to "none seen yet", then the sequence guard is applied on top of
+// that reset baseline (still rejecting genuinely stale/duplicate snapshots
+// within the same identity).
+//
+// boot_id is compared with strict string equality only. It travels the
+// wire as an opaque decimal string (see buildCommandBody / WirelessBringup
+// handleState) specifically so it can hold the full random 64-bit range
+// without ever being Number-coerced - a bare JSON number would lose
+// precision above 2^53 in the browser and could falsely appear unchanged
+// (or falsely appear changed) after rounding.
+function reconcileSnapshot(prev, snapshot){
+	const bootChanged = prev.bootId !== null && snapshot.boot_id !== prev.bootId;
+	const sessionChanged = prev.sessionId !== null && snapshot.session_id !== prev.sessionId;
+	const identityChanged = bootChanged || sessionChanged;
+	const effectiveLastSeq = identityChanged ? -1 : prev.lastSeq;
+	const stale = typeof snapshot.seq === 'number' &&
+		effectiveLastSeq !== -1 && snapshot.seq <= effectiveLastSeq;
+	if(stale) return { accept: false, identityChanged: false };
+	return {
+		accept: true,
+		identityChanged,
+		bootId: snapshot.boot_id,
+		sessionId: snapshot.session_id,
+		lastSeq: snapshot.seq
+	};
+}
+
 function buildCommandBody(identity, action, fields, commandId){
 	const shape = COMMAND_SHAPE[action];
 	if(!shape) throw new Error('unsupported_action: ' + action);
@@ -168,6 +212,7 @@ const helpers = {
 	leaseReducer,
 	LEASE_STATES,
 	createThrottler,
+	reconcileSnapshot,
 	buildCommandBody,
 	COMMAND_SHAPE,
 	EFFECT_NAMES,
@@ -350,6 +395,7 @@ if(typeof document !== 'undefined'){
 				case 'session_unavailable': return 'The DJ session is not running on the device right now.';
 				case 'control_unavailable_in_setup_mode': return 'The device is in Wi-Fi setup mode; DJ control is unavailable until setup finishes.';
 				case 'queue_full': return 'The device is busy. Try again in a moment.';
+				case 'stale_identity': return 'Your control session is out of date \u2014 the device restarted or another browser took over. Take control again to continue.';
 				default: return code ? ('Device error: ' + code) : null;
 			}
 		}
@@ -677,15 +723,21 @@ if(typeof document !== 'undefined'){
 		}
 
 		function applySnapshot(snapshot){
-			if(typeof snapshot.seq === 'number' && snapshot.seq <= app.lastSeq && app.lastSeq !== -1){
-				return; // stale/out-of-order, ignore
-			}
-			app.lastSeq = snapshot.seq;
-			const bootChanged = app.bootId !== null && snapshot.boot_id !== app.bootId;
-			const sessionChanged = app.sessionId !== null && snapshot.session_id !== app.sessionId;
-			app.bootId = snapshot.boot_id;
-			app.sessionId = snapshot.session_id;
-			if(bootChanged || sessionChanged){
+			const decision = reconcileSnapshot(
+				{ bootId: app.bootId, sessionId: app.sessionId, lastSeq: app.lastSeq },
+				snapshot
+			);
+			if(!decision.accept) return; // stale/out-of-order within the same identity, ignore
+			app.lastSeq = decision.lastSeq;
+			app.bootId = decision.bootId;
+			app.sessionId = decision.sessionId;
+			if(decision.identityChanged){
+				// New boot/session identity: any in-flight or tracked command
+				// belongs to a session the device no longer recognizes. Reset
+				// local bookkeeping and drop to read-only rather than ever
+				// re-sending anything against the new identity.
+				app.tracker = createCommandTracker();
+				app.pollFailures = 0;
 				app.leaseState = leaseReducer(app.leaseState, { type: 'RECONNECT' });
 				setLeaseState('read_only', 'The device restarted. Take control again if needed.');
 			}

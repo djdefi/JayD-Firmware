@@ -108,6 +108,82 @@ test('lease reducer: reconnect NEVER assumes control survived', () => {
 	}
 });
 
+/* ---------------- snapshot reconciliation (reboot/reconnect) ---------------- */
+
+test('reconcileSnapshot accepts the very first snapshot without a false identity change', () => {
+	const prev = { bootId: null, sessionId: null, lastSeq: -1 };
+	const snapshot = { boot_id: '123', session_id: 7, seq: 1 };
+	const decision = helpers.reconcileSnapshot(prev, snapshot);
+	assert.equal(decision.accept, true);
+	assert.equal(decision.identityChanged, false, 'no prior identity to have changed from');
+	assert.equal(decision.bootId, '123');
+	assert.equal(decision.sessionId, 7);
+	assert.equal(decision.lastSeq, 1);
+});
+
+test('reconcileSnapshot: a reboot (new boot_id, seq reset to 0) is accepted, not dropped as stale', () => {
+	// This is the exact regression: a high pre-reboot lastSeq must not
+	// cause every post-reboot snapshot (seq starts back at 0) to be
+	// silently ignored forever.
+	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 9999 };
+	const snapshot = { boot_id: 'boot-B', session_id: 7, seq: 0 };
+	const decision = helpers.reconcileSnapshot(prev, snapshot);
+	assert.equal(decision.accept, true, 'post-reboot snapshot must be accepted, not treated as stale');
+	assert.equal(decision.identityChanged, true);
+	assert.equal(decision.bootId, 'boot-B');
+	assert.equal(decision.lastSeq, 0);
+});
+
+test('reconcileSnapshot: a session_id-only change also counts as an identity change', () => {
+	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 9999 };
+	const snapshot = { boot_id: 'boot-A', session_id: 8, seq: 0 };
+	const decision = helpers.reconcileSnapshot(prev, snapshot);
+	assert.equal(decision.accept, true);
+	assert.equal(decision.identityChanged, true, 'same boot but new session must still reset state');
+});
+
+test('reconcileSnapshot rejects genuinely stale/duplicate snapshots within the same identity', () => {
+	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 50 };
+	assert.equal(helpers.reconcileSnapshot(prev, { boot_id: 'boot-A', session_id: 7, seq: 50 }).accept,
+		false, 'seq == lastSeq must be rejected as a duplicate');
+	assert.equal(helpers.reconcileSnapshot(prev, { boot_id: 'boot-A', session_id: 7, seq: 10 }).accept,
+		false, 'seq < lastSeq must be rejected as out-of-order');
+});
+
+test('reconcileSnapshot accepts fresh in-order snapshots within the same identity', () => {
+	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 50 };
+	const decision = helpers.reconcileSnapshot(prev, { boot_id: 'boot-A', session_id: 7, seq: 51 });
+	assert.equal(decision.accept, true);
+	assert.equal(decision.identityChanged, false);
+	assert.equal(decision.lastSeq, 51);
+});
+
+test('reconcileSnapshot compares boot_id as an opaque string, never via Number coercion', () => {
+	// Number('18446744073709551615') === Number('18446744073709551614') is
+	// true (both round to 2**64), so a naive numeric comparison would
+	// wrongly treat these as the *same* identity. String comparison must
+	// correctly treat them as different.
+	const a = '18446744073709551615';
+	const b = '18446744073709551614';
+	assert.equal(Number(a), Number(b), 'sanity: both round to the same double once Number-coerced');
+	const prev = { bootId: a, sessionId: 1, lastSeq: 5 };
+	const decision = helpers.reconcileSnapshot(prev, { boot_id: b, session_id: 1, seq: 0 });
+	assert.equal(decision.identityChanged, true, 'distinct opaque boot_id strings must be seen as a new identity');
+});
+
+test('reconcileSnapshot: identity change yields a state a fresh command tracker can back safely (no replay)', () => {
+	// Architectural check: after an identity change, the tracker the
+	// runtime installs is brand new and has no memory of any
+	// pre-reboot command id, so nothing from the old identity can ever
+	// be (mis)recognized as already-sent/still-pending against the new one.
+	const prev = { bootId: 'boot-A', sessionId: 7, lastSeq: 9999 };
+	const decision = helpers.reconcileSnapshot(prev, { boot_id: 'boot-B', session_id: 7, seq: 0 });
+	assert.equal(decision.identityChanged, true);
+	const freshTracker = helpers.createCommandTracker();
+	assert.equal(freshTracker.markSent('cmd-from-old-boot'), true,
+		'a fresh tracker must not already consider any old id as sent');
+});
+
 /* ---------------- backoff / polling ---------------- */
 
 test('computeBackoff grows exponentially but stays bounded', () => {
@@ -202,6 +278,20 @@ test('buildCommandBody rejects an invalid command id before it would reach the n
 
 test('buildCommandBody rejects unsupported actions (no accidental new surface)', () => {
 	assert.throws(() => helpers.buildCommandBody({ bootId: 1, sessionId: 1 }, 'load_by_path', {}, 'cmd1'));
+});
+
+test('buildCommandBody passes boot_id through as an opaque string, never coercing to Number', () => {
+	// A pair of full-range uint64 values that collide once rounded to a
+	// JS double - if boot_id were ever coerced through Number(), these two
+	// distinct decimal strings would become indistinguishable.
+	const bootId = '18446744073709551615'; // UINT64_MAX
+	const identity = { bootId, sessionId: 12 };
+	const body = helpers.buildCommandBody(identity, 'set_mix', { value: 1 }, 'cmd1');
+	assert.equal(body.boot_id, bootId);
+	assert.equal(typeof body.boot_id, 'string');
+	// JSON.stringify must re-emit it as a quoted string, not an unquoted
+	// (and precision-losing) number literal.
+	assert.match(JSON.stringify(body), /"boot_id":"18446744073709551615"/);
 });
 
 /* ---------------- formatting ---------------- */
