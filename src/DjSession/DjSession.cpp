@@ -237,9 +237,7 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 	if(command.type == DJ_COMMAND_LOAD_DECK) return applyLoad(command, error);
 
 	if((command.type == DJ_COMMAND_SET_PLAYING ||
-		command.type == DJ_COMMAND_SEEK ||
-		command.type == DJ_COMMAND_SET_EFFECT_TYPE ||
-		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
+		command.type == DJ_COMMAND_SEEK) &&
 	   !system->hasChannel(command.deck)){
 		error = DJ_COMMAND_ERROR_NO_DECK;
 		return false;
@@ -271,14 +269,17 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 				effects[command.deck][slot].type = EffectType::NONE;
 				effects[command.deck][slot].intensity = 0;
 			}
-			if(effect.type == EffectType::SPEED && command.value != EffectType::SPEED){
+			const bool deckLoaded = system->hasChannel(command.deck);
+			if(deckLoaded && effect.type == EffectType::SPEED && command.value != EffectType::SPEED){
 				system->removeSpeed(command.deck);
 			}
 			effect.type = command.value;
 			effect.intensity = command.value == EffectType::SPEED ? 127 : 0;
 			if(command.value == EffectType::SPEED){
-				if(!hadSpeed) system->addSpeed(command.deck);
-				system->setSpeed(command.deck, effect.intensity);
+				if(deckLoaded){
+					if(!hadSpeed) system->addSpeed(command.deck);
+					system->setSpeed(command.deck, effect.intensity);
+				}
 			}else{
 				system->setEffect(command.deck, command.slot, static_cast<EffectType>(command.value));
 			}
@@ -292,7 +293,9 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 			}
 			effect.intensity = command.value;
 			if(effect.type == EffectType::SPEED){
-				system->setSpeed(command.deck, effect.intensity);
+				if(system->hasChannel(command.deck)){
+					system->setSpeed(command.deck, effect.intensity);
+				}
 			}else if(effect.type != EffectType::NONE){
 				system->setEffectIntensity(command.deck, command.slot, effect.intensity);
 			}
@@ -330,6 +333,12 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	files[command.deck] = file;
 	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
 	system->setVolume(command.deck, gains[command.deck]);
+	for(uint8_t slot = 0; slot < DJ_EFFECT_SLOT_COUNT; slot++){
+		if(effects[command.deck][slot].type != EffectType::SPEED) continue;
+		system->addSpeed(command.deck);
+		system->setSpeed(command.deck, effects[command.deck][slot].intensity);
+		break;
+	}
 
 	if(!system->isRunning()){
 		mix = command.deck == 0 ? 0 : 255;
