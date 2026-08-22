@@ -1,0 +1,619 @@
+#include <assert.h>
+#include <string.h>
+
+#include "../src/DjAssist/DjAssistEngine.h"
+#include "../src/DjAssist/DjAssistScoring.h"
+
+using namespace DjAssistScoring;
+
+namespace {
+
+DjTrackIdentity fingerprintIdentity(uint8_t seed){
+	DjTrackIdentity identity = {};
+	identity.flags = DJ_TRACK_IDENTITY_FINGERPRINT;
+	memset(identity.fingerprint, seed, sizeof(identity.fingerprint));
+	return identity;
+}
+
+DjAssistLibraryEntry fullEntry(uint32_t libraryIndex, uint32_t bpmMilli, uint16_t key, uint8_t rating){
+	DjAssistLibraryEntry entry;
+	entry.libraryIndex = libraryIndex;
+	entry.identity = fingerprintIdentity(static_cast<uint8_t>(libraryIndex + 1));
+	entry.state = DJ_METADATA_VALID;
+	entry.capabilities = DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_KEY |
+		DJ_METADATA_HAS_RATING | DJ_METADATA_HAS_GRID | DJ_METADATA_HAS_DOWNBEATS | DJ_METADATA_HAS_PHRASES;
+	entry.bpmMilli = bpmMilli;
+	entry.key = key;
+	entry.rating = rating;
+	entry.durationFrames = 44100ULL * 180ULL; // 180s
+	entry.sampleRate = 44100;
+	return entry;
+}
+
+DjAssistDeckContext deckContext(uint32_t bpmMilli, uint16_t key){
+	DjAssistDeckContext deck;
+	deck.valid = true;
+	deck.bpmMilli = bpmMilli;
+	deck.key = key;
+	deck.remainingFrames = 44100ULL * 120ULL;
+	deck.sampleRate = 44100;
+	return deck;
+}
+
+// -- key/tempo boundary checks -------------------------------------------
+
+void testKeyRelationships(){
+	assert(classifyKeyRelationship(0, 0x101) == DJ_ASSIST_KEY_UNKNOWN);
+	assert(classifyKeyRelationship(0x101, 0) == DJ_ASSIST_KEY_UNKNOWN);
+	assert(classifyKeyRelationship(5, 5) == DJ_ASSIST_KEY_SAME);          // 5B vs 5B
+	assert(classifyKeyRelationship(0x105, 0x105) == DJ_ASSIST_KEY_SAME);  // 5A vs 5A
+	assert(classifyKeyRelationship(5, 0x105) == DJ_ASSIST_KEY_RELATIVE);  // 5B vs 5A (relative)
+	assert(classifyKeyRelationship(5, 6) == DJ_ASSIST_KEY_ADJACENT);      // 5B vs 6B
+	assert(classifyKeyRelationship(5, 4) == DJ_ASSIST_KEY_ADJACENT);      // 5B vs 4B
+	// wheel wrap boundary: 12 and 1 are adjacent.
+	assert(classifyKeyRelationship(12, 1) == DJ_ASSIST_KEY_ADJACENT);
+	assert(classifyKeyRelationship(1, 12) == DJ_ASSIST_KEY_ADJACENT);
+	assert(classifyKeyRelationship(5, 8) == DJ_ASSIST_KEY_INCOMPATIBLE);
+	assert(classifyKeyRelationship(5, 0x108) == DJ_ASSIST_KEY_INCOMPATIBLE);
+}
+
+void testRequiredRateBoundaries(){
+	uint32_t rate = 0;
+	assert(requiredRateMilli(0, 128000, rate) == false);
+	assert(rate == DJ_ASSIST_RATE_UNITY_MILLI);
+	assert(requiredRateMilli(128000, 0, rate) == false);
+
+	assert(requiredRateMilli(128000, 128000, rate) == true);
+	assert(rate == 1000);
+
+	// exact narrow-band edges are inclusive.
+	assert(requiredRateMilli(920, 1000, rate) == true && rate == 920);
+	assert(requiredRateMilli(1080, 1000, rate) == true && rate == 1080);
+
+	// checked math on large values must not overflow/crash: an out-of-range
+	// ratio is rejected (false) rather than silently wrapping.
+	assert(requiredRateMilli(4000000000u, 1, rate) == false);
+	assert(rate == DJ_ASSIST_RATE_UNITY_MILLI);
+	assert(requiredRateMilli(1, 4000000000u, rate) == false); // integer division underflows to 0
+	assert(rate == DJ_ASSIST_RATE_UNITY_MILLI);
+	assert(requiredRateMilli(200000, 100000, rate) == true && rate == 2000); // sane 2x, well-formed
+}
+
+void testTempoScoreBoundaries(){
+	DjAssistDeckContext deck = deckContext(128000, 0);
+
+	// Exactly at the narrow band edge (rate 920) -> NARROW flag, full 400 tempo pts.
+	DjAssistLibraryEntry narrowEdge = fullEntry(1, 139130, 0, 255); // 128000*1000/139130 ~= 920
+	narrowEdge.capabilities &= ~(DJ_METADATA_HAS_KEY | DJ_METADATA_HAS_RATING);
+	DjAssistSuggestion narrow = scoreEntry(narrowEdge, deck, false, false);
+	assert(narrow.reasonFlags & DJ_ASSIST_REASON_TEMPO_NARROW);
+	assert(!(narrow.reasonFlags & DJ_ASSIST_REASON_TEMPO_OUT_OF_RANGE));
+
+	// Just inside full range but outside narrow band (rate ~1200) -> in-range, reduced score.
+	DjAssistLibraryEntry wideRange = fullEntry(2, 106667, 0, 255); // 128000*1000/106667 ~= 1200
+	wideRange.capabilities &= ~(DJ_METADATA_HAS_KEY | DJ_METADATA_HAS_RATING);
+	DjAssistSuggestion wide = scoreEntry(wideRange, deck, false, false);
+	assert(wide.reasonFlags & DJ_ASSIST_REASON_TEMPO_IN_RANGE);
+	assert(!(wide.reasonFlags & DJ_ASSIST_REASON_TEMPO_NARROW));
+
+	// Just outside the full 0.5x-1.5x rate window -> excluded from tempo score, flagged.
+	DjAssistLibraryEntry outOfRange = fullEntry(3, 85000, 0, 255); // 128000/85000 ~= 1.506x
+	outOfRange.capabilities &= ~(DJ_METADATA_HAS_KEY | DJ_METADATA_HAS_RATING);
+	DjAssistSuggestion out = scoreEntry(outOfRange, deck, false, false);
+	assert(out.reasonFlags & DJ_ASSIST_REASON_TEMPO_OUT_OF_RANGE);
+	assert(!(out.reasonFlags & DJ_ASSIST_REASON_TEMPO_IN_RANGE));
+	assert(out.score < narrow.score);
+}
+
+// -- missing/stale metadata reduces confidence, never blanket-rejects ----
+
+void testMissingAndStaleMetadata(){
+	DjAssistDeckContext deck = deckContext(128000, 5);
+
+	DjAssistLibraryEntry bare;
+	bare.libraryIndex = 10;
+	bare.identity = fingerprintIdentity(50);
+	bare.state = DJ_METADATA_ABSENT;
+	bare.capabilities = 0; // nothing known at all
+	DjAssistSuggestion bareSuggestion = scoreEntry(bare, deck, false, false);
+	assert(bareSuggestion.excludeReason == DJ_ASSIST_EXCLUDE_NONE);
+	assert(bareSuggestion.confidence < 400);
+	assert(bareSuggestion.reasonFlags & DJ_ASSIST_REASON_LOW_CONFIDENCE);
+	assert(bareSuggestion.reasonFlags & DJ_ASSIST_REASON_KEY_UNKNOWN);
+
+	// Stale state with fully valid capabilities is still scored on its merits -
+	// state alone does not blanket-reject, only corrupt/unsupported does.
+	DjAssistLibraryEntry stale = fullEntry(11, 128000, 5, 5);
+	stale.state = DJ_METADATA_STALE;
+	DjAssistSuggestion staleSuggestion = scoreEntry(stale, deck, false, false);
+	assert(staleSuggestion.excludeReason == DJ_ASSIST_EXCLUDE_NONE);
+	assert(staleSuggestion.score > bareSuggestion.score);
+
+	DjAssistLibraryEntry corrupt = fullEntry(12, 128000, 5, 5);
+	corrupt.state = DJ_METADATA_CORRUPT;
+	DjAssistSuggestion corruptSuggestion = scoreEntry(corrupt, deck, false, false);
+	assert(corruptSuggestion.excludeReason == DJ_ASSIST_EXCLUDE_UNSUPPORTED_METADATA);
+
+	DjAssistLibraryEntry unsupported = fullEntry(13, 128000, 5, 5);
+	unsupported.state = DJ_METADATA_UNSUPPORTED;
+	DjAssistSuggestion unsupportedSuggestion = scoreEntry(unsupported, deck, false, false);
+	assert(unsupportedSuggestion.excludeReason == DJ_ASSIST_EXCLUDE_UNSUPPORTED_METADATA);
+}
+
+// -- loaded/recent exclusion ----------------------------------------------
+
+void testExclusionByIdentity(){
+	DjTrackIdentity loadedId = fingerprintIdentity(9);
+	DjTrackIdentity recentId = fingerprintIdentity(20);
+	DjTrackIdentity unrelated = fingerprintIdentity(99);
+	DjTrackIdentity noEvidence = {}; // flags == 0, no fingerprint/source
+
+	assert(identityMatches(loadedId, loadedId));
+	assert(!identityMatches(loadedId, unrelated));
+	assert(!identityMatches(noEvidence, noEvidence)); // no evidence never claims a match
+
+	DjAssistDeckContext deck = deckContext(128000, 5);
+	DjAssistLibraryEntry loadedEntry = fullEntry(20, 128000, 5, 5);
+	loadedEntry.identity = loadedId;
+	DjAssistSuggestion loaded = scoreEntry(loadedEntry, deck, /*isLoaded=*/true, false);
+	assert(loaded.excludeReason == DJ_ASSIST_EXCLUDE_LOADED);
+
+	DjAssistLibraryEntry recentEntry = fullEntry(21, 128000, 5, 5);
+	recentEntry.identity = recentId;
+	DjAssistSuggestion recent = scoreEntry(recentEntry, deck, false, /*isRecent=*/true);
+	assert(recent.excludeReason == DJ_ASSIST_EXCLUDE_RECENT);
+}
+
+// -- deterministic ranking, ties, and scan-budget chunking ---------------
+
+void testDeterministicRankingAndScanBudget(){
+	const uint16_t total = 20;
+	DjAssistLibraryEntry entries[total];
+	for(uint16_t i = 0; i < total; i++){
+		// Two ties at the top score (indices 3 and 7 both perfect matches);
+		// ascending libraryIndex must win the tie.
+		bool topTier = (i == 3 || i == 7);
+		entries[i] = fullEntry(i, topTier ? 128000u : (128000u - (i + 1) * 5000u), 5, topTier ? 5 : 1);
+	}
+
+	DjAssistDeckContext deck = deckContext(128000, 5);
+
+	// Full single-shot ranking.
+	DjAssistSuggestion fullPass[DJ_ASSIST_MAX_SUGGESTIONS] = {};
+	uint8_t fullCount = 0;
+	uint16_t fullCursor = 0;
+	uint16_t processed = scanTick(entries, total, fullCursor, total, deck, nullptr, 0, nullptr, 0,
+		fullPass, fullCount, DJ_ASSIST_MAX_SUGGESTIONS);
+	assert(processed == total);
+	assert(fullCount == DJ_ASSIST_MAX_SUGGESTIONS);
+	assert(fullPass[0].libraryIndex == 3); // tie winner: lower libraryIndex first
+	assert(fullPass[1].libraryIndex == 7);
+	for(uint8_t i = 1; i < fullCount; i++){
+		assert(fullPass[i - 1].score >= fullPass[i].score);
+	}
+
+	// Chunked ranking (small, uneven budgets, wrapping cursor) must match exactly.
+	DjAssistSuggestion chunked[DJ_ASSIST_MAX_SUGGESTIONS] = {};
+	uint8_t chunkedCount = 0;
+	uint16_t cursor = 0;
+	uint16_t totalProcessed = 0;
+	const uint16_t budgets[] = { 3, 5, 1, 4, 7 }; // sums to exactly one full pass (20)
+	for(uint8_t b = 0; b < 5; b++){
+		totalProcessed += scanTick(entries, total, cursor, budgets[b], deck, nullptr, 0, nullptr, 0,
+			chunked, chunkedCount, DJ_ASSIST_MAX_SUGGESTIONS);
+	}
+	assert(totalProcessed == total);
+	assert(chunkedCount == fullCount);
+	for(uint8_t i = 0; i < fullCount; i++){
+		assert(chunked[i].libraryIndex == fullPass[i].libraryIndex);
+		assert(chunked[i].score == fullPass[i].score);
+	}
+
+	// Bounded work per call: a small budget never processes more than requested.
+	uint16_t smallCursor = 0;
+	uint8_t smallCount = 0;
+	DjAssistSuggestion smallOut[DJ_ASSIST_MAX_SUGGESTIONS] = {};
+	assert(scanTick(entries, total, smallCursor, 2, deck, nullptr, 0, nullptr, 0, smallOut, smallCount, DJ_ASSIST_MAX_SUGGESTIONS) == 2);
+	assert(smallCursor == 2);
+}
+
+void testMergeSuggestionCapacityBoundary(){
+	DjAssistSuggestion suggestions[3] = {};
+	uint8_t count = 0;
+	for(uint32_t i = 0; i < 5; i++){
+		DjAssistSuggestion s;
+		s.libraryIndex = i;
+		s.score = static_cast<uint16_t>(100 + i); // strictly increasing
+		mergeSuggestion(suggestions, count, 3, s);
+	}
+	assert(count == 3);
+	// Only the top 3 scores (indices 2,3,4) survive, highest first.
+	assert(suggestions[0].libraryIndex == 4);
+	assert(suggestions[1].libraryIndex == 3);
+	assert(suggestions[2].libraryIndex == 2);
+
+	// Excluded candidates never enter the ranking, regardless of score.
+	DjAssistSuggestion excluded;
+	excluded.libraryIndex = 99;
+	excluded.score = 5000;
+	excluded.excludeReason = DJ_ASSIST_EXCLUDE_LOADED;
+	mergeSuggestion(suggestions, count, 3, excluded);
+	assert(count == 3);
+	assert(suggestions[0].libraryIndex == 4);
+
+	// Re-merging the same libraryIndex again (e.g. an overlapping scan
+	// chunk) must replace its entry, never duplicate it.
+	DjAssistSuggestion rescored;
+	rescored.libraryIndex = 3;
+	rescored.score = 500; // now clearly the best
+	mergeSuggestion(suggestions, count, 3, rescored);
+	assert(count == 3);
+	assert(suggestions[0].libraryIndex == 3);
+	assert(suggestions[0].score == 500);
+	uint8_t occurrences = 0;
+	for(uint8_t i = 0; i < count; i++){
+		if(suggestions[i].libraryIndex == 3) occurrences++;
+	}
+	assert(occurrences == 1);
+}
+
+// -- crossfade curve endpoints / overflow-wrap guards ---------------------
+
+void testCrossfadeCurveAndOverflowGuards(){
+	assert(crossfadeCurve(0, 16) == 0);
+	assert(crossfadeCurve(16, 16) == 255);
+	assert(crossfadeCurve(17, 16) == 255); // past-the-end saturates, never overflows
+	assert(crossfadeCurve(8, 16) == 127);
+	assert(crossfadeCurve(0, 0) == 255); // checked divide-by-zero guard
+
+	uint8_t previous = 0;
+	for(uint16_t step = 0; step <= 32; step++){
+		uint8_t value = crossfadeCurve(step, 32);
+		assert(value >= previous); // monotonic, no wraparound
+		previous = value;
+	}
+}
+
+// -- fake actuator + full transition state machine ------------------------
+
+class FakeActuator : public DjAssistActuator {
+public:
+	bool rejectNext = false;
+	uint8_t completeAfterPolls = 1;
+	uint32_t nextId = 1;
+
+	bool submit(const DjAssistTransitionStep&, uint32_t& outCommandId) override{
+		if(rejectNext) return false;
+		outCommandId = nextId++;
+		pollCounts[outCommandId] = 0;
+		return true;
+	}
+
+	DjCommandStatus poll(uint32_t commandId) const override{
+		uint8_t& polls = const_cast<FakeActuator*>(this)->pollCounts[commandId];
+		polls++;
+		return polls >= completeAfterPolls ? DJ_COMMAND_APPLIED : DJ_COMMAND_ACCEPTED;
+	}
+
+private:
+	mutable uint8_t pollCounts[64] = {};
+};
+
+DjAssistGuardSnapshot readyGuard(uint8_t fromDeck, uint8_t toDeck){
+	DjAssistGuardSnapshot guard;
+	guard.recording = false;
+	guard.mediaPresent = true;
+	guard.mix = 127;
+	guard.deckLoaded[fromDeck] = true;
+	guard.deckLoaded[toDeck] = true;
+	guard.deckPlaying[fromDeck] = true;
+	guard.deckPlaying[toDeck] = false;
+	guard.metadataValid[fromDeck] = true;
+	guard.metadataValid[toDeck] = true;
+	guard.rateMilli[fromDeck] = DJ_ASSIST_RATE_UNITY_MILLI;
+	guard.rateMilli[toDeck] = DJ_ASSIST_RATE_UNITY_MILLI;
+	return guard;
+}
+
+void driveUntilCommandVisible(DjAssistEngine& engine, FakeActuator& actuator, const DjAssistGuardSnapshot& guard, uint16_t maxTicks = 200){
+	DjAssistBoundaryHint boundary;
+	boundary.hasDownbeat = true;
+	boundary.downbeatFrame = 1000;
+	for(uint16_t i = 0; i < maxTicks; i++){
+		if(engine.mode() != DJ_ASSIST_MODE_TRANSITION_ARMED && engine.mode() != DJ_ASSIST_MODE_TRANSITION_RUNNING) return;
+		engine.tick(actuator, guard, boundary);
+	}
+}
+
+void testArmRequiresValidPreconditions(){
+	DjAssistEngine engine;
+	DjTrackIdentity target = fingerprintIdentity(1);
+
+	DjAssistGuardSnapshot notLoaded = readyGuard(0, 1);
+	notLoaded.deckLoaded[1] = false;
+	assert(!engine.armTransition(0, 1, 5, target, 16, true, true, notLoaded));
+	assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+
+	DjAssistGuardSnapshot recording = readyGuard(0, 1);
+	recording.recording = true;
+	assert(!engine.armTransition(0, 1, 5, target, 16, true, true, recording));
+
+	DjAssistGuardSnapshot badBeats = readyGuard(0, 1);
+	assert(!engine.armTransition(0, 1, 5, target, 15, true, true, badBeats)); // must be 4/8/16/32
+
+	assert(!engine.armTransition(0, 0, 5, target, 16, true, true, badBeats)); // same deck
+}
+
+void testTransitionHappyPath(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	actuator.completeAfterPolls = 2;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+
+	assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_ARMED);
+	assert(engine.plan().stepCount > 0);
+
+	driveUntilCommandVisible(engine, actuator, guard);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_COMPLETE);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_NONE);
+	for(uint8_t i = 0; i < engine.plan().stepCount; i++){
+		assert(engine.plan().steps[i].applied);
+	}
+}
+
+void testTransitionWaitsForAppliedResult(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	actuator.completeAfterPolls = 5; // stays ACCEPTED for several polls
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 8, false, false, guard));
+
+	DjAssistBoundaryHint boundary;
+	engine.tick(actuator, guard, boundary); // submits step 0
+	assert(engine.plan().steps[0].submitted);
+	assert(!engine.plan().steps[0].applied);
+	assert(engine.plan().currentStep == 0);
+
+	for(int i = 0; i < 3; i++) engine.tick(actuator, guard, boundary);
+	assert(!engine.plan().steps[0].applied); // still waiting - not enough polls yet
+	assert(engine.plan().currentStep == 0);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_RUNNING);
+}
+
+void testTransitionCancel(){
+	DjAssistEngine engine;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, true, true, guard));
+	engine.cancelTransition();
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_CANCELLED);
+
+	// Cancelling again (or an OFF engine) is a no-op, not a crash.
+	engine.cancelTransition();
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+}
+
+void testTransitionCommandRejected(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+	actuator.rejectNext = true;
+	DjAssistBoundaryHint boundary;
+	engine.tick(actuator, guard, boundary);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_COMMAND_REJECTED);
+}
+
+void testTransitionMediaAndMetadataLoss(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+	DjAssistGuardSnapshot removed = guard;
+	removed.mediaPresent = false;
+	DjAssistBoundaryHint boundary;
+	engine.tick(actuator, removed, boundary);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_MEDIA_REMOVED);
+
+	DjAssistEngine engine2;
+	assert(engine2.armTransition(0, 1, 5, target, 4, false, false, guard));
+	DjAssistGuardSnapshot staleMeta = guard;
+	staleMeta.metadataValid[0] = false;
+	engine2.tick(actuator, staleMeta, boundary);
+	assert(engine2.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine2.plan().failure == DJ_ASSIST_FAIL_METADATA_LOST);
+}
+
+void testTransitionManualOverride(){
+	// Manual play override: source deck stops before the STOP_DECK step.
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1);
+		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+		DjAssistGuardSnapshot manualStop = guard;
+		manualStop.deckPlaying[0] = false;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, manualStop, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+
+	// Manual crossfader override before the crossfade step is reached.
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1);
+		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+		DjAssistGuardSnapshot manualMix = guard;
+		manualMix.mix = 200;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, manualMix, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+
+	// Manual rate override on the still-playing source deck.
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1);
+		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+		DjAssistGuardSnapshot manualRate = guard;
+		manualRate.rateMilli[0] = 1100;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, manualRate, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+}
+
+void testTransitionRecordingConflictDuringRun(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+	DjAssistGuardSnapshot recordingStarted = guard;
+	recordingStarted.recording = true;
+	DjAssistBoundaryHint boundary;
+	engine.tick(actuator, recordingStarted, boundary);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_CONFLICT);
+}
+
+void testTransitionWaitsForBoundaryStep(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, /*startAtBoundary=*/true, false, guard));
+	assert(engine.plan().steps[0].action == DJ_ASSIST_ACTION_WAIT_BOUNDARY);
+
+	DjAssistBoundaryHint noBoundary;
+	for(int i = 0; i < 5; i++) engine.tick(actuator, guard, noBoundary);
+	assert(engine.plan().currentStep == 0); // still waiting, no boundary hint yet
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_RUNNING);
+
+	DjAssistBoundaryHint withPhrase;
+	withPhrase.hasPhrase = true;
+	withPhrase.phraseFrame = 4410;
+	engine.tick(actuator, guard, withPhrase);
+	assert(engine.plan().currentStep == 1); // advanced past WAIT_BOUNDARY
+}
+
+// -- coach advice: phrase preferred over downbeat, warnings ----------------
+
+void testCoachAdvicePhraseWindow(){
+	DjAssistEngine engine;
+	DjAssistDeckContext playing = deckContext(128000, 5);
+	DjAssistDeckContext candidate = deckContext(128000, 5);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+
+	DjAssistBoundaryHint both;
+	both.hasDownbeat = true;
+	both.downbeatFrame = 100;
+	both.hasPhrase = true;
+	both.phraseFrame = 900;
+	DjAssistCoachAdvice adviceBoth = engine.coachAdvice(0, playing, candidate, both, guard);
+	assert(adviceBoth.valid);
+	assert(adviceBoth.boundaryIsPhrase);
+	assert(adviceBoth.boundaryFrame == 900);
+	assert(adviceBoth.suggestedDeck == 1);
+	assert(adviceBoth.crossfaderDirection == 1);
+	assert(!(adviceBoth.warningFlags & DJ_ASSIST_WARN_NO_GRID));
+
+	DjAssistBoundaryHint downbeatOnly;
+	downbeatOnly.hasDownbeat = true;
+	downbeatOnly.downbeatFrame = 200;
+	DjAssistCoachAdvice adviceDownbeat = engine.coachAdvice(1, playing, candidate, downbeatOnly, guard);
+	assert(adviceDownbeat.valid);
+	assert(!adviceDownbeat.boundaryIsPhrase);
+	assert(adviceDownbeat.boundaryFrame == 200);
+	assert(adviceDownbeat.suggestedDeck == 0);
+	assert(adviceDownbeat.crossfaderDirection == -1);
+
+	DjAssistBoundaryHint neither;
+	DjAssistCoachAdvice adviceNone = engine.coachAdvice(0, playing, candidate, neither, guard);
+	assert(adviceNone.warningFlags & DJ_ASSIST_WARN_NO_GRID);
+
+	// Coach advice never mutates engine mode - it stays whatever it was.
+	assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+}
+
+void testCoachAdviceWarnings(){
+	DjAssistEngine engine;
+	DjAssistDeckContext playing = deckContext(128000, 5);
+	playing.remainingFrames = 44100ULL * 5; // 5s left -> ending soon
+	DjAssistDeckContext outOfRangeCandidate = deckContext(60000, 5); // rate way outside 0.5-1.5x
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	guard.recording = true;
+	guard.loopActive[0] = true;
+
+	DjAssistBoundaryHint boundary;
+	boundary.hasDownbeat = true;
+	DjAssistCoachAdvice advice = engine.coachAdvice(0, playing, outOfRangeCandidate, boundary, guard);
+	assert(advice.warningFlags & DJ_ASSIST_WARN_ENDING_SOON);
+	assert(advice.warningFlags & DJ_ASSIST_WARN_OUT_OF_RANGE);
+	assert(advice.warningFlags & DJ_ASSIST_WARN_RECORDING_ACTIVE);
+	assert(advice.warningFlags & DJ_ASSIST_WARN_LOOP_ACTIVE);
+}
+
+void testModeToggle(){
+	DjAssistEngine engine;
+	assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+	engine.setCoachEnabled(true);
+	assert(engine.mode() == DJ_ASSIST_MODE_COACH);
+	engine.setCoachEnabled(false);
+	assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+
+	// setCoachEnabled must never disturb an active transition.
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1);
+	assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+	engine.setCoachEnabled(false);
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_ARMED);
+}
+
+} // namespace
+
+int main(){
+	testKeyRelationships();
+	testRequiredRateBoundaries();
+	testTempoScoreBoundaries();
+	testMissingAndStaleMetadata();
+	testExclusionByIdentity();
+	testDeterministicRankingAndScanBudget();
+	testMergeSuggestionCapacityBoundary();
+	testCrossfadeCurveAndOverflowGuards();
+	testArmRequiresValidPreconditions();
+	testTransitionHappyPath();
+	testTransitionWaitsForAppliedResult();
+	testTransitionCancel();
+	testTransitionCommandRejected();
+	testTransitionMediaAndMetadataLoss();
+	testTransitionManualOverride();
+	testTransitionRecordingConflictDuringRun();
+	testTransitionWaitsForBoundaryStep();
+	testCoachAdvicePhraseWindow();
+	testCoachAdviceWarnings();
+	testModeToggle();
+	return 0;
+}

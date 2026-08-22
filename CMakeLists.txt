@@ -94,3 +94,20 @@ add_executable(MetadataIntegrationSelfCheck tests/metadata_integration_selfcheck
 set_target_properties(MetadataIntegrationSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME MetadataIntegrationSelfCheck COMMAND MetadataIntegrationSelfCheck)
+
+# Coach/suggestions/one-shot-transition engine. Hardware-free by design (see
+# src/DjAssist/DjAssistTypes.h), so it is held to a stricter bar than the
+# other self-checks: warnings-as-errors plus ASan/UBSan on compilers that
+# support it.
+add_executable(DjAssistSelfCheck
+        tests/dj_assist_selfcheck.cpp
+        src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistEngine.cpp)
+set_target_properties(DjAssistSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjAssistSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjAssistSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjAssistSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
