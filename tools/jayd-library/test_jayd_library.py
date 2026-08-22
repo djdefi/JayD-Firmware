@@ -38,7 +38,7 @@ class JayDLibraryTests(unittest.TestCase):
   <COLLECTION Entries="1">
     <TRACK TrackID="7" Name="Song" Artist="Artist" Album="Album"
       Location="file://localhost{self.music}/song.wav" AverageBpm="128.125"
-      Tonality="8A" Rating="204" PlayCount="3" SampleRate="44100" TotalTime="10">
+      Tonality="8A" Rating="204" PlayCount="3" SampleRate="44100" TotalTime="245.348">
       <TEMPO Inizio="0" Bpm="128.125" Metro="4/4" Battito="1"/>
       <POSITION_MARK Name="Drop" Type="0" Start="1.5" Num="2" Red="255" Green="0" Blue="0"/>
     </TRACK>
@@ -48,6 +48,7 @@ class JayDLibraryTests(unittest.TestCase):
   </NODE></NODE></PLAYLISTS>
 </DJ_PLAYLISTS>""")
         library = jayd.import_rekordbox(xml, self.music)
+        self.assertEqual(library.tracks[0].duration_frames, 10819847)
         first = jayd.encode(library)
         second = jayd.encode(library)
         self.assertEqual(first, second)
@@ -118,13 +119,14 @@ CREATE TABLE cues (
 """)
         connection.execute("INSERT INTO track_locations VALUES (1, ?)", (str(self.music / "mix.aac"),))
         connection.execute(
-            "INSERT INTO library VALUES (1,1,'Mix','DJ','LP',10,124.5,48000,2,4,'9B',16711935,?,?)",
+            "INSERT INTO library VALUES (1,1,'Mix','DJ','LP',180.021333,124.5,48000,2,4,'9B',16711935,?,?)",
             (b"opaque", "BeatGrid-2.0"),
         )
         connection.execute("INSERT INTO cues VALUES (1,1,4,96000,48000,0,'Loop',255)")
         connection.commit()
         connection.close()
         library = jayd.import_mixxx(database, self.music)
+        self.assertEqual(library.tracks[0].duration_frames, 8641024)
         self.assertEqual(library.tracks[0].cues[0].position_frames, 48000)
         self.assertEqual(library.tracks[0].cues[0].length_frames, 24000)
         self.assertTrue(any("opaque Mixxx beats BLOB" in warning for warning in library.warnings))
@@ -257,6 +259,26 @@ CREATE TABLE cues (
     def test_traktor_open_key(self):
         self.assertEqual(jayd._key("1d"), jayd._key("8B"))
         self.assertEqual(jayd._key("1m"), jayd._key("8A"))
+
+    def test_duration_rounding_bounds_and_invalid_values(self):
+        self.assertEqual(jayd._duration_frames(jayd.Fraction("245.348"), 44100), 10819847)
+        self.assertEqual(jayd._duration_frames(jayd.Fraction("180.021333"), 48000), 8641024)
+        rate = 48000
+        near_bound = jayd.Fraction(2 * jayd.MAX_DURATION_FRAMES - 1, 2 * rate)
+        overflow = jayd.Fraction(2 * jayd.MAX_DURATION_FRAMES + 1, 2 * rate)
+        self.assertEqual(jayd._duration_frames(near_bound, rate), jayd.MAX_DURATION_FRAMES)
+        with self.assertRaisesRegex(jayd.FormatError, "exceeds"):
+            jayd._duration_frames(overflow, rate)
+        with self.assertRaisesRegex(jayd.FormatError, "negative"):
+            jayd._duration_frames(jayd.Fraction(-1), rate)
+        for invalid in ("NaN", "Infinity", "-Infinity", "-1"):
+            warnings = []
+            self.assertEqual(jayd._source_duration(invalid, rate, warnings, "test duration"), 0)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("unrepresentable", warnings[0])
+        warnings = []
+        self.assertEqual(jayd._source_duration("1", 0, warnings, "test duration"), 0)
+        self.assertIn("sample rate", warnings[0])
 
 
 if __name__ == "__main__":
