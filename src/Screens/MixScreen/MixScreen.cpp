@@ -7,6 +7,7 @@
 #include "../SongList/SongList.h"
 #include "../Settings/SettingsScreen.h"
 #include "../../Fonts.h"
+#include "../../DjAssist/DjAssistScoring.h"
 
 MixScreen::MixScreen* MixScreen::MixScreen::instance = nullptr;
 
@@ -277,6 +278,8 @@ void MixScreen::MixScreen::draw(){
 		drawCueBank();
 	}else if(controls.bank == MIX_BANK_LOOPSYNC){
 		drawLoopSyncBank();
+	}else if(controls.bank == MIX_BANK_ASSIST){
+		drawAssistBank();
 	}else{
 		drawBrowseBank();
 	}
@@ -419,9 +422,232 @@ void MixScreen::MixScreen::drawLoopSyncBank(){
 	canvas->setTextDatum(TL_DATUM);
 }
 
+const char* MixScreen::MixScreen::assistFailureText(DjAssistTransitionFailure failure) const{
+	switch(failure){
+		case DJ_ASSIST_FAIL_NONE: return "NONE";
+		case DJ_ASSIST_FAIL_METADATA_LOST: return "METADATA LOST";
+		case DJ_ASSIST_FAIL_COMMAND_REJECTED: return "COMMAND REJECTED";
+		case DJ_ASSIST_FAIL_MEDIA_REMOVED: return "SD REMOVED";
+		case DJ_ASSIST_FAIL_END_OF_TRACK: return "TRACK ENDED";
+		case DJ_ASSIST_FAIL_MANUAL_OVERRIDE: return "MANUAL OVERRIDE";
+		case DJ_ASSIST_FAIL_CONFLICT: return "LOOP/REC CONFLICT";
+		case DJ_ASSIST_FAIL_TARGET_NOT_LOADED: return "TARGET NOT LOADED";
+		case DJ_ASSIST_FAIL_TARGET_CHANGED: return "TARGET CHANGED";
+		case DJ_ASSIST_FAIL_CANCELLED: return "CANCELLED";
+		default: return "UNKNOWN";
+	}
+}
+
+const char* MixScreen::MixScreen::assistActionText(DjAssistTransitionAction action) const{
+	switch(action){
+		case DJ_ASSIST_ACTION_WAIT_BOUNDARY: return "WAIT FOR WINDOW";
+		case DJ_ASSIST_ACTION_START_DECK: return "START DECK";
+		case DJ_ASSIST_ACTION_LOCK_TEMPO: return "LOCK TEMPO";
+		case DJ_ASSIST_ACTION_ENABLE_SYNC: return "ENABLE SYNC";
+		case DJ_ASSIST_ACTION_CROSSFADE: return "CROSSFADE";
+		case DJ_ASSIST_ACTION_STOP_DECK: return "STOP DECK";
+		case DJ_ASSIST_ACTION_RELEASE_SYNC: return "RELEASE SYNC";
+		default: return "STEP";
+	}
+}
+
+void MixScreen::MixScreen::drawAssistBank(){
+	if(!session) return;
+	DjAssistSnapshot assist;
+	session->copyAssistSnapshot(assist);
+	DjSnapshot snapshot;
+	session->copySnapshot(snapshot);
+
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(TC_DATUM);
+
+	const char* modeText;
+	switch(assist.mode){
+		case DJ_ASSIST_MODE_OFF: modeText = "OFF"; break;
+		case DJ_ASSIST_MODE_COACH: modeText = "COACH"; break;
+		case DJ_ASSIST_MODE_TRANSITION_ARMED: modeText = "ARMED"; break;
+		case DJ_ASSIST_MODE_TRANSITION_RUNNING: modeText = "RUNNING"; break;
+		case DJ_ASSIST_MODE_TRANSITION_COMPLETE: modeText = "COMPLETE"; break;
+		case DJ_ASSIST_MODE_TRANSITION_FAILED: modeText = "FAILED"; break;
+		default: modeText = "?"; break;
+	}
+	char header[32];
+	snprintf(header, sizeof(header), "ASSIST | %s", modeText);
+	canvas->drawString(header, 80, 2);
+	canvas->setTextDatum(TL_DATUM);
+
+	if(assist.mode == DJ_ASSIST_MODE_OFF){
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("COACH ADVICE IS OFF", 80, 40);
+		canvas->drawString("ENABLE FOR SUGGESTIONS", 80, 56);
+		canvas->setTextDatum(TL_DATUM);
+	}else if(assist.mode == DJ_ASSIST_MODE_COACH){
+		const DjAssistCoachAdvice& advice = assist.advice;
+		char line[32];
+		if(advice.valid){
+			snprintf(line, sizeof(line), "ADVICE: DECK %c", advice.suggestedDeck == 0 ? 'A' : 'B');
+			canvas->drawString(line, 2, 14);
+			snprintf(line, sizeof(line), "WINDOW:%s RATE:%u%%",
+				(advice.warningFlags & DJ_ASSIST_WARN_NO_GRID) ? "NONE" : (advice.boundaryIsPhrase ? "PHRASE" : "BEAT"),
+				(unsigned) (advice.targetRateMilli / 10));
+			canvas->drawString(line, 2, 26);
+			snprintf(line, sizeof(line), "FADE: %s",
+				advice.crossfaderDirection < 0 ? "-> A" :
+				advice.crossfaderDirection > 0 ? "-> B" : "HOLD");
+			canvas->drawString(line, 2, 38);
+
+			// Accessible text reasons, never color-only: each warning bit
+			// gets its own short label so a screen reader / low-vision user
+			// gets the same information a sighted user would from color.
+			uint8_t warningCount = 0;
+			if(advice.warningFlags & DJ_ASSIST_WARN_OUT_OF_RANGE){
+				canvas->drawString("! TEMPO OUT OF RANGE", 2, 50 + warningCount++ * 10);
+			}
+			if(advice.warningFlags & DJ_ASSIST_WARN_NO_GRID){
+				canvas->drawString("! NO BEAT GRID", 2, 50 + warningCount++ * 10);
+			}
+			if(advice.warningFlags & DJ_ASSIST_WARN_ENDING_SOON){
+				canvas->drawString("! TRACK ENDING SOON", 2, 50 + warningCount++ * 10);
+			}
+			if(advice.warningFlags & DJ_ASSIST_WARN_RECORDING_ACTIVE){
+				canvas->drawString("! RECORDING ACTIVE", 2, 50 + warningCount++ * 10);
+			}
+			if(advice.warningFlags & DJ_ASSIST_WARN_LOOP_ACTIVE){
+				canvas->drawString("! LOOP ACTIVE", 2, 50 + warningCount++ * 10);
+			}
+			if(advice.warningFlags & DJ_ASSIST_WARN_NO_METADATA){
+				canvas->drawString("! NO METADATA", 2, 50 + warningCount++ * 10);
+			}
+			if(warningCount == 0) canvas->drawString("NO WARNINGS", 2, 50);
+		}else{
+			canvas->drawString("NO ADVICE YET", 2, 20);
+			canvas->drawString("LOAD + PLAY A DECK", 2, 32);
+		}
+
+		if(assist.suggestionCount > 0){
+			const uint8_t index = controls.assistSuggestion < assist.suggestionCount
+					? controls.assistSuggestion : 0;
+			const DjAssistSuggestion& suggestion = assist.suggestions[index];
+			snprintf(line, sizeof(line), "SUG %u/%u  IDX %lu", index + 1, assist.suggestionCount,
+				(unsigned long) suggestion.libraryIndex);
+			canvas->drawString(line, 2, 92);
+
+			const char* keyText;
+			switch(suggestion.keyRelationship){
+				case DJ_ASSIST_KEY_SAME: keyText = "SAME"; break;
+				case DJ_ASSIST_KEY_ADJACENT: keyText = "ADJ"; break;
+				case DJ_ASSIST_KEY_RELATIVE: keyText = "REL"; break;
+				case DJ_ASSIST_KEY_INCOMPATIBLE: keyText = "INCOMPAT"; break;
+				default: keyText = "UNKNOWN"; break;
+			}
+			char sign = suggestion.tempoDeltaMilli < 0 ? '-' : '+';
+			const long tempoWhole = labs(suggestion.tempoDeltaMilli) / 1000;
+			snprintf(line, sizeof(line), "TEMPO:%c%ld KEY:%s CONF:%u%%",
+				sign, tempoWhole, keyText, suggestion.confidence / 10);
+			canvas->drawString(line, 2, 104);
+		}else{
+			canvas->drawString("NO CANDIDATES YET", 2, 92);
+		}
+	}else if(assist.mode == DJ_ASSIST_MODE_TRANSITION_ARMED || assist.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING){
+		const DjAssistTransitionPlan& plan = assist.plan;
+		char line[32];
+		snprintf(line, sizeof(line), "DECK %c -> DECK %c",
+			plan.fromDeck == 0 ? 'A' : 'B', plan.toDeck == 0 ? 'A' : 'B');
+		canvas->drawString(line, 2, 20);
+		snprintf(line, sizeof(line), "STEP %u/%u: %s", plan.currentStep + 1, plan.stepCount,
+			plan.currentStep < plan.stepCount ? assistActionText(plan.steps[plan.currentStep].action) : "DONE");
+		canvas->drawString(line, 2, 36);
+		snprintf(line, sizeof(line), "CROSSFADE OVER %u BEATS", plan.crossfadeBeats);
+		canvas->drawString(line, 2, 52);
+	}else if(assist.mode == DJ_ASSIST_MODE_TRANSITION_COMPLETE){
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("TRANSITION COMPLETE", 80, 40);
+		canvas->drawString("HOLD L1 TO RESUME COACH", 80, 56);
+		canvas->setTextDatum(TL_DATUM);
+	}else if(assist.mode == DJ_ASSIST_MODE_TRANSITION_FAILED){
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("TRANSITION FAILED", 80, 32);
+		canvas->drawString(assistFailureText(assist.plan.failure), 80, 46);
+		canvas->drawString("HOLD L1 TO RESUME COACH", 80, 62);
+		canvas->setTextDatum(TL_DATUM);
+	}
+
+	canvas->setTextDatum(BC_DATUM);
+	if(assist.mode == DJ_ASSIST_MODE_TRANSITION_ARMED || assist.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING){
+		canvas->drawString("HOLD R1: CANCEL", 80, 116);
+	}else{
+		const uint8_t otherDeck = selectedChannel == 0 ? 1 : 0;
+		char footer[32];
+		snprintf(footer, sizeof(footer), "L1:COACH  R1:ARM->%c",
+			otherDeck == 0 ? 'A' : 'B');
+		canvas->drawString(footer, 80, 116);
+	}
+	canvas->drawString("CTR: SUGGESTION  HOLD: MENU", 80, 126);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::assistToggleCoach(){
+	if(!session) return;
+	DjAssistSnapshot assist;
+	session->copyAssistSnapshot(assist);
+	const bool wantCoach = assist.mode != DJ_ASSIST_MODE_COACH;
+	const DjSubmitResult result = session->assistSetMode(wantCoach, DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()) showCommandError(result.error);
+	drawQueued = true;
+}
+
+void MixScreen::MixScreen::assistArmFromSelected(){
+	if(!session) return;
+	DjAssistSnapshot assist;
+	session->copyAssistSnapshot(assist);
+
+	if(assist.mode == DJ_ASSIST_MODE_TRANSITION_ARMED || assist.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING){
+		const DjSubmitResult result = session->assistCancelTransition(DJ_ORIGIN_PHYSICAL);
+		if(!result.accepted()) showCommandError(result.error);
+		drawQueued = true;
+		return;
+	}
+	if(assist.mode != DJ_ASSIST_MODE_COACH) return; // OFF/COMPLETE/FAILED: use L1 to resume Coach first.
+
+	DjSnapshot snapshot;
+	if(!session->copySnapshot(snapshot)) return;
+	const uint8_t fromDeck = selectedChannel;
+	const uint8_t toDeck = fromDeck == 0 ? 1 : 0;
+	if(!snapshot.decks[toDeck].loaded || snapshot.decks[toDeck].metadata.state != DJ_METADATA_VALID){
+		showCommandError(DJ_COMMAND_ERROR_ASSIST_REJECTED);
+		return;
+	}
+
+	// The physical bank always confirms whatever is already loaded on the
+	// other deck (the "loaded target" path from the spec) - loading a
+	// candidate there first still goes through the existing Browse
+	// workflow. Best-effort match the loaded identity against the current
+	// suggestion list purely so the arm command carries a meaningful
+	// libraryIndex for display/bookkeeping; the engine itself validates the
+	// transition against the identity, not this index.
+	uint32_t libraryIndex = 0;
+	for(uint8_t i = 0; i < assist.suggestionCount; i++){
+		if(DjAssistScoring::identityMatches(assist.suggestions[i].identity, snapshot.decks[toDeck].identity)){
+			libraryIndex = assist.suggestions[i].libraryIndex;
+			break;
+		}
+	}
+
+	const DjSubmitResult result = session->assistArmTransition(
+		fromDeck, toDeck, libraryIndex, snapshot.decks[toDeck].identity,
+		16, true, true, DJ_ORIGIN_PHYSICAL
+	);
+	if(!result.accepted()) showCommandError(result.error);
+	drawQueued = true;
+}
+
 void MixScreen::MixScreen::drawPalette(){
 	static const char* items[] = {
-			"MIX", "CUES", "BROWSE", "LOOP/SYNC", "MATRIX", "RESCAN SD", "SETTINGS", "EXIT DJ"
+			"MIX", "CUES", "BROWSE", "LOOP/SYNC", "ASSIST", "MATRIX", "RESCAN SD", "SETTINGS", "EXIT DJ"
 	};
 	Sprite* canvas = screen.getSprite();
 	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
@@ -469,6 +695,7 @@ const char* MixScreen::MixScreen::commandErrorText(DjCommandError error) const{
 		case DJ_COMMAND_ERROR_RECORDING_BUSY: return "RECORDING BUSY";
 		case DJ_COMMAND_ERROR_RECORDING_FAILED: return "RECORDING FAILED";
 		case DJ_COMMAND_ERROR_SESSION_ENDING: return "DJ SESSION ENDING";
+		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "ASSIST TRANSITION REJECTED";
 		default: return "COMMAND REJECTED";
 	}
 }
@@ -682,6 +909,13 @@ void MixScreen::MixScreen::enc(uint8_t index, int8_t value){
 			drawQueued = true;
 			return;
 		}
+		if(controls.bank == MIX_BANK_ASSIST){
+			DjAssistSnapshot assist;
+			if(session) session->copyAssistSnapshot(assist);
+			controls.moveAssistSuggestion(value, assist.suggestionCount);
+			drawQueued = true;
+			return;
+		}
 		if(controls.bank != MIX_BANK_MIX) return;
 		DjSnapshot snapshot;
 		if(!session->copySnapshot(snapshot) || !snapshot.decks[selectedChannel].loaded) return;
@@ -796,6 +1030,25 @@ void MixScreen::MixScreen::encBtnHold(uint8_t i){
 		}
 
 		drawQueued = true;
+		return;
+	}
+	if(controls.bank == MIX_BANK_ASSIST){
+		// Only two visible, labelled hold-actions on this bank (both shown
+		// on screen every time - no hidden chord): L1 toggles Coach
+		// advice-only mode on/off (also the "dismiss" action once a
+		// transition finishes or fails, since setCoachEnabled() is always
+		// safe to call outside ARMED/RUNNING); R1 confirms a one-shot
+		// transition from the selected deck to whatever's already loaded on
+		// the other deck while Coach is active, or cancels an in-flight
+		// transition. Every other encoder on this bank is inert.
+		if(i == 0){
+			assistToggleCoach();
+			return;
+		}
+		if(i == 3){
+			assistArmFromSelected();
+			return;
+		}
 		return;
 	}
 	if(controls.bank == MIX_BANK_MIX){

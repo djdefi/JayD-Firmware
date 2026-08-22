@@ -58,11 +58,16 @@ namespace MixScreen {
 		void drawCueBank();
 		void drawBrowseBank();
 		void drawLoopSyncBank();
+		void drawAssistBank();
 		void drawPalette();
 		void drawStatus();
 		void showCommandError(DjCommandError error);
 		const char* commandErrorText(DjCommandError error) const;
 		const char* recordingErrorText(DjRecordingError error) const;
+		const char* assistFailureText(DjAssistTransitionFailure failure) const;
+		const char* assistActionText(DjAssistTransitionAction action) const;
+		void assistArmFromSelected();
+		void assistToggleCoach();
 
 		LinearLayout* screenLayout;
 		LinearLayout* leftLayout;
