@@ -160,6 +160,33 @@ CREATE TABLE cues (
         with self.assertRaisesRegex(jayd.FormatError, "STRS|section shape"):
             jayd.decode(data)
 
+        data = bytearray(jayd.encode(jayd.LibraryData([
+            jayd.TrackData("one.aac", "1", "test")
+        ])))
+        struct.pack_into("<H", data, jayd.HEADER.size + jayd.SECTION.size + 4, 2)
+        struct.pack_into("<I", data, 44, 0)
+        struct.pack_into("<I", data, 44, jayd.binascii.crc32(data) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(jayd.FormatError, "TRAK section version"):
+            jayd.decode(data)
+
+        data = bytearray(jayd.encode(jayd.LibraryData([
+            jayd.TrackData("one.aac", "1", "test", cues=[
+                jayd.CuePoint(position_frames=0)
+            ])
+        ])))
+        summary = jayd._decode_layout(data)
+        cue_entry = jayd.HEADER.size + 2 * jayd.SECTION.size
+        struct.pack_into("<Q", data, cue_entry + 16, summary["sections"]["TRAK"]["offset"])
+        struct.pack_into("<I", data, 44, 0)
+        struct.pack_into("<I", data, 44, jayd.binascii.crc32(data) & 0xFFFFFFFF)
+        with self.assertRaisesRegex(jayd.FormatError, "overlap"):
+            jayd.decode(data)
+
+        with self.assertRaisesRegex(jayd.FormatError, "metadata entry count"):
+            jayd.encode(jayd.LibraryData([], metadata={
+                str(index): "" for index in range(jayd.MAX_METADATA_ENTRIES + 1)
+            }))
+
     def test_path_traversal_absolute_and_limits(self):
         for invalid in ("../song.aac", "/Music/song.aac", "C:/Music/song.aac", "a/./song.aac"):
             with self.subTest(invalid=invalid), self.assertRaises(jayd.FormatError):
