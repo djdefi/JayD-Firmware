@@ -95,16 +95,31 @@ void leaseAndRateLimits(){
 
 void requestParsing(){
 	char valid[] =
-		"{\"boot_id\":42,\"session_id\":7,\"client_command_id\":\"cmd-1\","
+		"{\"boot_id\":\"42\",\"session_id\":7,\"client_command_id\":\"cmd-1\","
 		"\"action\":\"set_playing\",\"deck\":1,\"value\":true}";
 	JsonObject object;
 	assert(object.parse(valid, strlen(valid)));
 	uint64_t bootId = 0;
+	const char* bootIdText = nullptr;
 	bool playing = false;
 	const char* action = nullptr;
-	assert(object.getNumber("boot_id", bootId) && bootId == 42);
+	// boot_id crosses the wire as an opaque decimal string (see
+	// WirelessBringup::handleState/handleCommand) precisely so a
+	// full-range random uint64_t survives JSON exactly - a bare JSON
+	// number can only be represented losslessly up to 2^53-1 in a
+	// browser's double, and would otherwise get silently rounded.
+	assert(object.getString("boot_id", bootIdText));
+	assert(parseUint64Decimal(bootIdText, bootId) && bootId == 42);
 	assert(object.getString("action", action) && strcmp(action, "set_playing") == 0);
 	assert(object.getBool("value", playing) && playing);
+
+	char legacyNumber[] = "{\"boot_id\":42}";
+	assert(object.parse(legacyNumber, strlen(legacyNumber)));
+	const char* legacyText = nullptr;
+	// A legacy bare-number boot_id (pre-fix wire format) must not be
+	// silently accepted as a string field - handleCommand only recognizes
+	// the quoted-string form, so this must fail to parse as a string.
+	assert(!object.getString("boot_id", legacyText));
 
 	char escaped[] = "{\"ssid\":\"quote\\\"slash\\\\ok\"}";
 	assert(object.parse(escaped, strlen(escaped)));
@@ -124,6 +139,28 @@ void requestParsing(){
 	assert(!object.parse(oversized, sizeof(oversized) - 1));
 }
 
+void uint64DecimalParsing(){
+	uint64_t value = 12345;
+	assert(parseUint64Decimal("0", value) && value == 0);
+	assert(parseUint64Decimal("42", value) && value == 42);
+	// UINT64_MAX round trip: the entire point of carrying boot_id as a
+	// decimal string is that this exact value must survive intact.
+	assert(parseUint64Decimal("18446744073709551615", value) && value == UINT64_MAX);
+	assert(parseUint64Decimal("9223372036854775807", value) && value == 9223372036854775807ULL);
+
+	// Malformed/overflowing input must be rejected outright, not
+	// truncated or wrapped into a value that could accidentally match.
+	assert(!parseUint64Decimal(nullptr, value));
+	assert(!parseUint64Decimal("", value));
+	assert(!parseUint64Decimal("-1", value));
+	assert(!parseUint64Decimal(" 1", value));
+	assert(!parseUint64Decimal("1 ", value));
+	assert(!parseUint64Decimal("1.0", value));
+	assert(!parseUint64Decimal("0x1", value));
+	assert(!parseUint64Decimal("18446744073709551616", value)); // UINT64_MAX + 1
+	assert(!parseUint64Decimal("99999999999999999999999999", value)); // grossly overflowed
+}
+
 void commandLifecycle(){
 	DjCommand command = {};
 	command.id = 10;
@@ -135,6 +172,18 @@ void commandLifecycle(){
 	strcpy(command.clientCommandId, "cmd-10");
 	assert(djCommandIdentityMatches(command, 11, 12));
 	assert(!djCommandIdentityMatches(command, 11, 13));
+
+	// The device-side compare must be exact across the full uint64 range,
+	// not just small test values - this is the half of the boot_id fix
+	// that was already correct (only the JSON wire encoding needed to
+	// change); a naive floating-point-ish or truncated compare could
+	// falsely match/reject near the top of the range.
+	DjCommand fullRange = {};
+	fullRange.origin = DJ_ORIGIN_HTTP;
+	fullRange.requestBootId = UINT64_MAX;
+	fullRange.requestSessionId = 12;
+	assert(djCommandIdentityMatches(fullRange, UINT64_MAX, 12));
+	assert(!djCommandIdentityMatches(fullRange, UINT64_MAX - 1, 12)); // stale identity: rejected
 
 	DjCommandResults results;
 	results.record(command, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
@@ -190,6 +239,7 @@ int main(){
 	pairingAndStorage();
 	leaseAndRateLimits();
 	requestParsing();
+	uint64DecimalParsing();
 	commandLifecycle();
 	return 0;
 }

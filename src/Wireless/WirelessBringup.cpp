@@ -12,6 +12,7 @@
 #include <string.h>
 #include "../DjSession/DjSession.h"
 #include "WirelessApiCore.h"
+#include "WirelessUiAsset.h"
 
 namespace {
 
@@ -441,6 +442,27 @@ void sendCommandResult(const DjSubmitResult& result, const char* clientCommandId
 	sendJson(status, responseBuffer);
 }
 
+// Single static browser control UI, gzip-embedded from src/Wireless/ui/.
+// Served regardless of setup mode: the page itself detects setup vs. paired
+// vs. control state at runtime by calling GET /setup then the v2 API. It
+// carries no secrets, so it needs no auth/origin gate of its own.
+void handleIndex(){
+	server.sendHeader("Cache-Control", "no-store");
+	server.sendHeader("X-Content-Type-Options", "nosniff");
+	server.sendHeader(
+		"Content-Security-Policy",
+		"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+		"connect-src 'self'; base-uri 'none'; form-action 'none'"
+	);
+	server.sendHeader("Content-Encoding", "gzip");
+	server.send_P(
+		200,
+		"text/html; charset=utf-8",
+		reinterpret_cast<PGM_P>(WirelessUi::HTML_GZ),
+		WirelessUi::HTML_GZ_LEN
+	);
+}
+
 void handleSetupStatus(){
 	if(!setupMode){
 		sendError(404, "not_found");
@@ -592,7 +614,16 @@ void handleState(){
 	}
 	JsonWriter writer(responseBuffer, sizeof(responseBuffer));
 	writer.append(
-		"{\"seq\":%llu,\"boot_id\":%llu,\"session_id\":%lu,\"active\":%s,"
+		// boot_id is a full-range random uint64_t and is therefore carried
+		// as an opaque quoted decimal string, not a bare JSON number: a
+		// JSON number can only be represented exactly up to 2^53-1 in a
+		// browser's IEEE-754 double, so a bare-number boot_id would get
+		// silently rounded by JSON.parse and no longer match on the next
+		// command (stale_identity), even though nothing actually changed.
+		// seq/session_id stay bare numbers - seq is monotonic and won't
+		// realistically exceed 2^53 within a boot's uptime, and
+		// session_id is a uint32_t, both safely exact as JS numbers.
+		"{\"seq\":%llu,\"boot_id\":\"%llu\",\"session_id\":%lu,\"active\":%s,"
 		"\"mixer_running\":%s,\"mix\":%u,\"recording\":%s,\"queue_depth\":%u,\"decks\":[",
 		static_cast<unsigned long long>(snapshot.seq),
 		static_cast<unsigned long long>(snapshot.bootId),
@@ -749,9 +780,16 @@ void handleCommand(){
 
 	uint64_t bootId = 0;
 	uint64_t sessionId = 0;
+	const char* bootIdText = nullptr;
 	const char* commandId = nullptr;
 	const char* action = nullptr;
-	if(!object.getNumber("boot_id", bootId) || !object.getNumber("session_id", sessionId) ||
+	// boot_id must arrive as the opaque decimal string handleState() emits
+	// (see there for why) - never as a bare JSON number, and never
+	// Number-coerced. An exact digit-by-digit parse rejects malformed or
+	// overflowing input outright rather than truncating/wrapping it into a
+	// value that could accidentally match.
+	if(!object.getString("boot_id", bootIdText) || !WirelessApi::parseUint64Decimal(bootIdText, bootId) ||
+	   !object.getNumber("session_id", sessionId) ||
 	   sessionId > UINT32_MAX || !object.getString("client_command_id", commandId) ||
 	   !WirelessApi::validClientCommandId(commandId) || !object.getString("action", action)){
 		sendError(400, "invalid_fields");
@@ -854,7 +892,7 @@ void handleNotFound(){
 	}
 
 	static const char* known[] = {
-		"/setup", "/setup/wifi", "/api/v2/pair", "/api/v2/capabilities",
+		"/", "/setup", "/setup/wifi", "/api/v2/pair", "/api/v2/capabilities",
 		"/api/v2/health", "/api/v2/state", "/api/v2/pairing", "/api/v2/lease",
 		"/api/v2/command", "/api/v2/ota"
 	};
@@ -884,6 +922,7 @@ void startServer(){
 		"Authorization", "Content-Type", "Content-Length", "Host", "Origin", "Transfer-Encoding"
 	};
 	server.collectHeaders(headers, sizeof(headers) / sizeof(headers[0]));
+	server.on("/", HTTP_GET, handleIndex);
 	server.on("/setup", HTTP_GET, handleSetupStatus);
 	server.on("/setup/wifi", HTTP_POST, handleSetupWifi);
 	server.on("/api/v2/pair", HTTP_POST, handlePair);
