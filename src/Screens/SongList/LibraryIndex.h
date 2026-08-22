@@ -21,6 +21,15 @@ enum class IdentityStrength : uint8_t {
 	Strong = 2
 };
 
+enum class State : uint8_t {
+	Absent,
+	Building,
+	Verifying,
+	Ready,
+	Stale,
+	Error
+};
+
 enum HeaderFlags : uint16_t {
 	HeaderHasFatMtime = 1 << 0,
 	HeaderHasFingerprints = 1 << 1,
@@ -131,6 +140,7 @@ void initializeHeader(Header& header);
 bool matchesCard(const Header& header, const CardIdentity& identity);
 bool isSupportedPath(const char* path, size_t length);
 bool matchesFile(const Record& record, const FileEvidence& evidence);
+State stateAfterRecovery(State recoveredState, bool recovered);
 ValidationResult validate(ReadAt readAt, void* context, uint32_t fileSize, const Limits& limits);
 const char* validationErrorName(ValidationError error);
 

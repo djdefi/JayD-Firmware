@@ -11,14 +11,7 @@
 namespace SongList {
 	class SongList : public Context, public LoopListener, public InputListener {
 	public:
-		enum class IndexState : uint8_t {
-			Absent,
-			Building,
-			Verifying,
-			Ready,
-			Stale,
-			Error
-		};
+		using IndexState = LibraryIndex::State;
 
 		struct IndexInfo {
 			IndexState state;

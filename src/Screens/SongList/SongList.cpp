@@ -564,7 +564,7 @@ void SongList::SongList::checkSD(bool forceRebuild){
 		allocationFailed = false;
 		const bool recovered = loadBestIndex();
 		if(!recovered && memoryFailure) allocationFailed = true;
-		indexState = IndexState::Error;
+		indexState = LibraryIndex::stateAfterRecovery(indexState, recovered);
 	}
 	if(allocationFailed){
 		Serial.printf(
