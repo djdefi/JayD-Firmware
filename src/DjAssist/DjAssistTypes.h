@@ -161,6 +161,9 @@ enum DjAssistTransitionFailure : uint8_t {
 	DJ_ASSIST_FAIL_MANUAL_OVERRIDE,
 	DJ_ASSIST_FAIL_CONFLICT,
 	DJ_ASSIST_FAIL_TARGET_NOT_LOADED,
+	// Target deck reports something loaded, but it's not the identity the
+	// user confirmed at arm() time (e.g. swapped/re-loaded while waiting).
+	DJ_ASSIST_FAIL_TARGET_CHANGED,
 	DJ_ASSIST_FAIL_CANCELLED
 };
 
@@ -196,6 +199,10 @@ struct DjAssistGuardSnapshot {
 	bool loopActive[DJ_DECK_COUNT] = {};
 	bool metadataValid[DJ_DECK_COUNT] = {};
 	uint32_t rateMilli[DJ_DECK_COUNT] = {};
+	// Identity currently loaded on each deck, so a running/armed transition
+	// can detect a target-deck swap (re-load or deck-swap) before acting on
+	// an unconfirmed track. Only meaningful when deckLoaded[deck] is true.
+	DjTrackIdentity deckIdentity[DJ_DECK_COUNT] = {};
 };
 
 #endif

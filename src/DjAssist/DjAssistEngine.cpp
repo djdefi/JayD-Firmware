@@ -85,6 +85,7 @@ bool DjAssistEngine::armTransition(
 	if(crossfadeBeats != 4 && crossfadeBeats != 8 && crossfadeBeats != 16 && crossfadeBeats != 32) return false;
 	if(guard.recording) return false;
 	if(!guard.deckLoaded[toDeck]) return false;
+	if(!DjAssistScoring::identityMatches(guard.deckIdentity[toDeck], targetIdentity)) return false;
 	if(!guard.deckPlaying[fromDeck]) return false;
 	if(guard.loopActive[fromDeck] || guard.loopActive[toDeck]) return false;
 	if(!guard.metadataValid[fromDeck]) return false;
@@ -170,6 +171,10 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 	}
 	if(!guard.deckLoaded[plan_.toDeck]){
 		failure = DJ_ASSIST_FAIL_TARGET_NOT_LOADED;
+		return false;
+	}
+	if(!DjAssistScoring::identityMatches(guard.deckIdentity[plan_.toDeck], plan_.targetIdentity)){
+		failure = DJ_ASSIST_FAIL_TARGET_CHANGED;
 		return false;
 	}
 	if(guard.recording){

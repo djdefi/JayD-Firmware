@@ -257,6 +257,77 @@ void testMergeSuggestionCapacityBoundary(){
 	assert(occurrences == 1);
 }
 
+// A track that WAS ranked (e.g. because it was free/valid on an earlier
+// scan pass) but has since become excluded (loaded/recent/unsupported) must
+// be removed from the ranking, not left stale.
+void testMergeSuggestionExcludedRemovesStaleEntry(){
+	// Single-entry case: insert score 900 at index 3, then re-merge the same
+	// index as excluded - the list must end up empty.
+	{
+		DjAssistSuggestion suggestions[5] = {};
+		uint8_t count = 0;
+
+		DjAssistSuggestion first;
+		first.libraryIndex = 3;
+		first.score = 900;
+		mergeSuggestion(suggestions, count, 5, first);
+		assert(count == 1);
+		assert(suggestions[0].libraryIndex == 3);
+
+		DjAssistSuggestion nowExcluded;
+		nowExcluded.libraryIndex = 3;
+		nowExcluded.score = 900; // score is irrelevant once excluded
+		nowExcluded.excludeReason = DJ_ASSIST_EXCLUDE_LOADED;
+		mergeSuggestion(suggestions, count, 5, nowExcluded);
+		assert(count == 0);
+	}
+
+	// Full-list case: a full top-N list where a middle entry becomes
+	// excluded must shrink by exactly one, preserving the relative order of
+	// the remaining entries (no stale duplicate, no leftover slot at old
+	// score/position).
+	{
+		DjAssistSuggestion suggestions[4] = {};
+		uint8_t count = 0;
+		for(uint32_t i = 0; i < 4; i++){
+			DjAssistSuggestion s;
+			s.libraryIndex = i;
+			s.score = static_cast<uint16_t>(400 - i * 10); // 0 > 1 > 2 > 3 in score
+			mergeSuggestion(suggestions, count, 4, s);
+		}
+		assert(count == 4);
+		assert(suggestions[0].libraryIndex == 0);
+		assert(suggestions[1].libraryIndex == 1);
+		assert(suggestions[2].libraryIndex == 2);
+		assert(suggestions[3].libraryIndex == 3);
+
+		DjAssistSuggestion recentNow;
+		recentNow.libraryIndex = 2; // was ranked third, now excluded
+		recentNow.score = 999;
+		recentNow.excludeReason = DJ_ASSIST_EXCLUDE_RECENT;
+		mergeSuggestion(suggestions, count, 4, recentNow);
+		assert(count == 3);
+		assert(suggestions[0].libraryIndex == 0);
+		assert(suggestions[1].libraryIndex == 1);
+		assert(suggestions[2].libraryIndex == 3);
+		for(uint8_t i = 0; i < count; i++){
+			assert(suggestions[i].libraryIndex != 2);
+		}
+
+		// A now-freed slot must accept a fresh candidate normally afterwards.
+		DjAssistSuggestion fresh;
+		fresh.libraryIndex = 9;
+		fresh.score = 50; // lowest score, still fits since count < capacity
+		mergeSuggestion(suggestions, count, 4, fresh);
+		assert(count == 4);
+		uint8_t occurrences9 = 0;
+		for(uint8_t i = 0; i < count; i++){
+			if(suggestions[i].libraryIndex == 9) occurrences9++;
+		}
+		assert(occurrences9 == 1);
+	}
+}
+
 // -- crossfade curve endpoints / overflow-wrap guards ---------------------
 
 void testCrossfadeCurveAndOverflowGuards(){
@@ -299,7 +370,7 @@ private:
 	mutable uint8_t pollCounts[64] = {};
 };
 
-DjAssistGuardSnapshot readyGuard(uint8_t fromDeck, uint8_t toDeck){
+DjAssistGuardSnapshot readyGuard(uint8_t fromDeck, uint8_t toDeck, DjTrackIdentity targetIdentity = fingerprintIdentity(1)){
 	DjAssistGuardSnapshot guard;
 	guard.recording = false;
 	guard.mediaPresent = true;
@@ -312,6 +383,7 @@ DjAssistGuardSnapshot readyGuard(uint8_t fromDeck, uint8_t toDeck){
 	guard.metadataValid[toDeck] = true;
 	guard.rateMilli[fromDeck] = DJ_ASSIST_RATE_UNITY_MILLI;
 	guard.rateMilli[toDeck] = DJ_ASSIST_RATE_UNITY_MILLI;
+	guard.deckIdentity[toDeck] = targetIdentity;
 	return guard;
 }
 
@@ -519,6 +591,77 @@ void testTransitionWaitsForBoundaryStep(){
 	assert(engine.plan().currentStep == 1); // advanced past WAIT_BOUNDARY
 }
 
+// A target-deck swap (re-load or deck-swap) after arming - but before the
+// engine has actually acted on that deck - must be caught every tick, not
+// just at arm() time, so the transition never proceeds onto an unconfirmed
+// track.
+void testTransitionTargetSwapDetected(){
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjTrackIdentity swappedIn = fingerprintIdentity(7);
+
+	// Swap while still waiting for the boundary (before any command has
+	// been submitted at all).
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 4, /*startAtBoundary=*/true, false, guard));
+		assert(engine.plan().steps[0].action == DJ_ASSIST_ACTION_WAIT_BOUNDARY);
+		assert(engine.plan().currentStep == 0);
+
+		DjAssistGuardSnapshot swapped = guard;
+		swapped.deckIdentity[1] = swappedIn; // still "loaded", just a different track
+		DjAssistBoundaryHint withPhrase;
+		withPhrase.hasPhrase = true;
+		withPhrase.phraseFrame = 4410;
+		engine.tick(actuator, swapped, withPhrase);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_TARGET_CHANGED);
+		assert(engine.plan().currentStep == 0); // never advanced onto the swapped track
+	}
+
+	// Swap after the first (real, non-boundary) step has already been
+	// submitted - still must be caught before any further action.
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 4, /*startAtBoundary=*/false, false, guard));
+
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, guard, boundary); // submits START_DECK
+		assert(engine.plan().steps[0].submitted);
+		assert(!engine.plan().steps[0].applied);
+
+		DjAssistGuardSnapshot swapped = guard;
+		swapped.deckIdentity[1] = swappedIn;
+		engine.tick(actuator, swapped, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_TARGET_CHANGED);
+	}
+
+	// Cancel semantics still apply cleanly on top of a swapped/unconfirmed
+	// target - cancelling never crashes and always reports CANCELLED, not
+	// some other failure code racing with the guard check.
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 4, /*startAtBoundary=*/true, false, guard));
+		engine.cancelTransition();
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_CANCELLED);
+	}
+
+	// A toDeck that reports loaded=true but never matches the confirmed
+	// target identity must not even be armable.
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, swappedIn); // wrong track loaded
+		assert(!engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+		assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+	}
+}
+
 // -- coach advice: phrase preferred over downbeat, warnings ----------------
 
 void testCoachAdvicePhraseWindow(){
@@ -602,6 +745,7 @@ int main(){
 	testExclusionByIdentity();
 	testDeterministicRankingAndScanBudget();
 	testMergeSuggestionCapacityBoundary();
+	testMergeSuggestionExcludedRemovesStaleEntry();
 	testCrossfadeCurveAndOverflowGuards();
 	testArmRequiresValidPreconditions();
 	testTransitionHappyPath();
@@ -612,6 +756,7 @@ int main(){
 	testTransitionManualOverride();
 	testTransitionRecordingConflictDuringRun();
 	testTransitionWaitsForBoundaryStep();
+	testTransitionTargetSwapDetected();
 	testCoachAdvicePhraseWindow();
 	testCoachAdviceWarnings();
 	testModeToggle();

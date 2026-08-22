@@ -192,11 +192,13 @@ void mergeSuggestion(
 	uint8_t capacity,
 	const DjAssistSuggestion& candidate
 ){
-	if(candidate.excludeReason != DJ_ASSIST_EXCLUDE_NONE) return;
 	if(capacity == 0) return;
 
-	// Re-scoring an already-ranked track (e.g. overlapping scan chunks) must
-	// replace, not duplicate, its entry.
+	// Re-scoring an already-ranked track (e.g. overlapping scan chunks, or a
+	// track that has since become loaded/recent/unsupported) must replace,
+	// not duplicate or leave stale, its entry. Do this before the exclusion
+	// check below so a track that WAS ranked but is now excluded gets
+	// removed rather than left stale in the list.
 	for(uint8_t i = 0; i < count; i++){
 		if(suggestions[i].libraryIndex != candidate.libraryIndex) continue;
 		for(uint8_t j = i; static_cast<uint8_t>(j + 1) < count; j++){
@@ -205,6 +207,8 @@ void mergeSuggestion(
 		count--;
 		break;
 	}
+
+	if(candidate.excludeReason != DJ_ASSIST_EXCLUDE_NONE) return;
 
 	uint8_t insertAt = count;
 	for(uint8_t i = 0; i < count; i++){
