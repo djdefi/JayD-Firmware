@@ -242,19 +242,26 @@ void testEvaluateBoundaryArrivalMissedBeyondTolerance(){
 
 // -- phraseCacheNeedsRescan / updatePhraseCache: terminal-aware throttle -
 
+// Fixed metadata generation/state used by every call below except the
+// dedicated metadata-invalidation test - keeps the existing scenarios
+// focused on identity/frame behavior without threading a real generation
+// counter through them.
+static const uint32_t kGen = 7;
+static const DjMetadataState kMetaState = DJ_METADATA_VALID;
+
 void testPhraseCacheNeedsRescanWhenEmpty(){
 	DjAssistPhraseCacheState cache;
 	const DjTrackIdentity identity = fingerprintIdentity(1);
-	assert(phraseCacheNeedsRescan(cache, 0, 0, identity));
+	assert(phraseCacheNeedsRescan(cache, 0, 0, identity, kGen, kMetaState));
 }
 
 void testPhraseCacheDoesNotRescanBeforeFoundBoundaryPassed(){
 	DjAssistPhraseCacheState cache;
 	const DjTrackIdentity identity = fingerprintIdentity(1);
-	updatePhraseCache(cache, /*deck*/0, /*currentFrame*/100, identity, /*found*/true, /*phraseFrame*/5000);
-	assert(!phraseCacheNeedsRescan(cache, 0, 200, identity)); // still well before 5000.
-	assert(!phraseCacheNeedsRescan(cache, 0, 4999, identity));
-	assert(phraseCacheNeedsRescan(cache, 0, 5000, identity)); // reached/passed - refresh.
+	updatePhraseCache(cache, /*deck*/0, /*currentFrame*/100, identity, kGen, kMetaState, /*found*/true, /*phraseFrame*/5000);
+	assert(!phraseCacheNeedsRescan(cache, 0, 200, identity, kGen, kMetaState)); // still well before 5000.
+	assert(!phraseCacheNeedsRescan(cache, 0, 4999, identity, kGen, kMetaState));
+	assert(phraseCacheNeedsRescan(cache, 0, 5000, identity, kGen, kMetaState)); // reached/passed - refresh.
 }
 
 void testPhraseCacheDoesNotRescanTerminalJustBecauseStillTerminal(){
@@ -263,26 +270,57 @@ void testPhraseCacheDoesNotRescanTerminalJustBecauseStillTerminal(){
 	// every-tick bug the cache exists to prevent.
 	DjAssistPhraseCacheState cache;
 	const DjTrackIdentity identity = fingerprintIdentity(1);
-	updatePhraseCache(cache, 0, 1000, identity, /*found*/false, 0);
-	assert(!phraseCacheNeedsRescan(cache, 0, 1001, identity));
-	assert(!phraseCacheNeedsRescan(cache, 0, 50000, identity));
+	updatePhraseCache(cache, 0, 1000, identity, kGen, kMetaState, /*found*/false, 0);
+	assert(!phraseCacheNeedsRescan(cache, 0, 1001, identity, kGen, kMetaState));
+	assert(!phraseCacheNeedsRescan(cache, 0, 50000, identity, kGen, kMetaState));
 }
 
 void testPhraseCacheRescansOnIdentityChangeOrDeckChange(){
 	DjAssistPhraseCacheState cache;
 	const DjTrackIdentity a = fingerprintIdentity(1);
 	const DjTrackIdentity b = fingerprintIdentity(2);
-	updatePhraseCache(cache, 0, 1000, a, true, 5000);
-	assert(phraseCacheNeedsRescan(cache, 0, 1500, b)); // new track loaded on same deck.
-	assert(phraseCacheNeedsRescan(cache, 1, 1500, a)); // different deck entirely.
+	updatePhraseCache(cache, 0, 1000, a, kGen, kMetaState, true, 5000);
+	assert(phraseCacheNeedsRescan(cache, 0, 1500, b, kGen, kMetaState)); // new track loaded on same deck.
+	assert(phraseCacheNeedsRescan(cache, 1, 1500, a, kGen, kMetaState)); // different deck entirely.
 }
 
 void testPhraseCacheRescansOnBackwardSeek(){
 	DjAssistPhraseCacheState cache;
 	const DjTrackIdentity identity = fingerprintIdentity(1);
-	updatePhraseCache(cache, 0, 5000, identity, true, 9000);
-	assert(!phraseCacheNeedsRescan(cache, 0, 5500, identity)); // still forward, before cached target.
-	assert(phraseCacheNeedsRescan(cache, 0, 1000, identity)); // seeked backward.
+	updatePhraseCache(cache, 0, 5000, identity, kGen, kMetaState, true, 9000);
+	assert(!phraseCacheNeedsRescan(cache, 0, 5500, identity, kGen, kMetaState)); // still forward, before cached target.
+	assert(phraseCacheNeedsRescan(cache, 0, 1000, identity, kGen, kMetaState)); // seeked backward.
+}
+
+// A metadata refresh that leaves the same track identity loaded on the same
+// deck (e.g. re-resolved grid/phrase data, or a transient state cycle) must
+// still invalidate a cached phrase result - the identity alone is not
+// sufficient, since the underlying metadata backing that identity can
+// change without the identity itself changing.
+void testPhraseCacheRescansOnMetadataGenerationOrStateChange(){
+	DjAssistPhraseCacheState cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	updatePhraseCache(cache, 0, 1000, identity, kGen, kMetaState, true, 5000);
+	assert(!phraseCacheNeedsRescan(cache, 0, 1500, identity, kGen, kMetaState)); // unchanged - no rescan.
+	assert(phraseCacheNeedsRescan(cache, 0, 1500, identity, kGen + 1, kMetaState)); // generation bumped.
+	assert(phraseCacheNeedsRescan(cache, 0, 1500, identity, kGen, DJ_METADATA_STALE)); // state changed.
+}
+
+// -- candidateFillGenerationCurrent: closes the fillWorkerStep() self- -----
+// -- comparison gap (issue #4) where comparing loadedGeneration_ against ---
+// -- the same value it was just set from could never detect a refresh -----
+// -- that completed during the unlocked SD read/scan window. -----
+void testCandidateFillGenerationCurrentDetectsConcurrentRefresh(){
+	// Nothing changed: safe to commit.
+	assert(DjAssistBridge::candidateFillGenerationCurrent(5, 5, 5));
+	// A refresh landed and already updated loadedGeneration_ away from the
+	// value this read started against - must not commit.
+	assert(!DjAssistBridge::candidateFillGenerationCurrent(6, 5, 5));
+	// loadedGeneration_ still matches the read's starting generation, but a
+	// FRESH live read (taken just before the lock) shows a refresh has
+	// already happened - must not commit even though the stale
+	// self-comparison would have looked fine.
+	assert(!DjAssistBridge::candidateFillGenerationCurrent(5, 5, 6));
 }
 
 } // namespace
@@ -307,5 +345,7 @@ int main(){
 	testPhraseCacheDoesNotRescanTerminalJustBecauseStillTerminal();
 	testPhraseCacheRescansOnIdentityChangeOrDeckChange();
 	testPhraseCacheRescansOnBackwardSeek();
+	testPhraseCacheRescansOnMetadataGenerationOrStateChange();
+	testCandidateFillGenerationCurrentDetectsConcurrentRefresh();
 	return 0;
 }

@@ -125,10 +125,13 @@ bool phraseCacheNeedsRescan(
 	const DjAssistPhraseCacheState& cache,
 	uint8_t deck,
 	uint64_t currentFrame,
-	const DjTrackIdentity& identity
+	const DjTrackIdentity& identity,
+	uint32_t metadataGeneration,
+	DjMetadataState metadataState
 ){
 	if(!cache.valid || cache.deck != deck) return true;
 	if(!DjAssistScoring::identityMatches(cache.identity, identity)) return true;
+	if(cache.metadataGeneration != metadataGeneration || cache.metadataState != metadataState) return true;
 	if(currentFrame < cache.lastFrame) return true; // backward seek
 	if(!cache.terminal && currentFrame >= cache.frame) return true; // cached boundary passed
 	return false;
@@ -139,6 +142,8 @@ void updatePhraseCache(
 	uint8_t deck,
 	uint64_t currentFrame,
 	const DjTrackIdentity& identity,
+	uint32_t metadataGeneration,
+	DjMetadataState metadataState,
 	bool found,
 	uint64_t phraseFrame
 ){
@@ -148,6 +153,16 @@ void updatePhraseCache(
 	cache.frame = found ? phraseFrame : 0;
 	cache.lastFrame = currentFrame;
 	cache.identity = identity;
+	cache.metadataGeneration = metadataGeneration;
+	cache.metadataState = metadataState;
+}
+
+bool candidateFillGenerationCurrent(
+	uint32_t loadedGeneration,
+	uint32_t generationAtReadStart,
+	uint32_t liveGenerationAtCommit
+){
+	return loadedGeneration == generationAtReadStart && liveGenerationAtCommit == generationAtReadStart;
 }
 
 } // namespace DjAssistBridge

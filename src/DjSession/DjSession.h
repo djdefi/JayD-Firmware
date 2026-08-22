@@ -173,16 +173,14 @@ private:
 
 	// Durable single-slot command-outcome tracker for DjAssist (see
 	// assistTrackCommand()/assistTrackedStatus()) - deliberately separate
-	// from commandResults' bounded/evictable ring.
-	struct DjAssistTrackedCommand {
-		uint32_t id = 0;
-		bool tracked = false;
-		DjCommandStatus status = DJ_COMMAND_PENDING;
-	};
+	// from commandResults' bounded/evictable ring. Struct definition lives
+	// in DjSessionState.h (top-level, host-includable) so admitAssistCommand()
+	// there can update it at admission time, not only when a command later
+	// pops/finishes in loop().
 	DjAssistTrackedCommand assistTracked;
-	// Incremented in apply()'s DJ_COMMAND_SET_MIX case whenever the
-	// command's origin is not DJ_ORIGIN_SYSTEM (see
-	// assistNonSystemMixGeneration()).
+	// Bumped by admitAssistCommand() (called from submit()) the instant a
+	// non-system-origin SET_MIX is admitted - supersede-replace or fresh
+	// push - not when it later applies (see assistNonSystemMixGeneration()).
 	uint32_t nonSystemMixGeneration = 0;
 
 	DjAssistController assistController;

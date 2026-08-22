@@ -131,7 +131,14 @@ enum DjCommandError : uint8_t {
 	// Coach/one-shot-transition arm rejected: target not loaded, source deck
 	// not playing, recording/loop conflict, or invalid plan arguments. See
 	// DjAssistEngine::armTransition() for the exact guard rules.
-	DJ_COMMAND_ERROR_ASSIST_REJECTED
+	DJ_COMMAND_ERROR_ASSIST_REJECTED,
+	// A system-origin SET_MIX (Assist's own ramp/rollback) was rejected
+	// because a still-queued manual (non-system) mix command has not yet
+	// been dequeued/applied - see DjCommandQueue::supersede()'s origin
+	// policy and admitAssistCommand() below. The manual command keeps its
+	// place; the caller (the actuator's crossfade poll loop) simply retries
+	// the same submit next tick once it drains.
+	DJ_COMMAND_ERROR_MIX_OVERRIDE_PENDING
 #if defined(JAYD_ENABLE_WIRELESS)
 	,DJ_COMMAND_ERROR_STALE_IDENTITY,
 	DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED
@@ -255,6 +262,19 @@ struct DjCommandResult {
 	char clientCommandId[33] = {};
 	uint64_t sequence = 0;
 #endif
+};
+
+// Durable single-slot command-outcome tracker for DjAssist (see
+// DjSession::assistTrackCommand()/assistTrackedStatus()) - deliberately
+// separate from DjCommandResults' bounded/evictable ring, and updated the
+// instant a command is superseded at admission time (see
+// admitAssistCommand() below), not only when it later pops/finishes in
+// loop() - otherwise a command dropped from the queue before it was ever
+// dequeued would leave this slot stuck reporting ACCEPTED forever.
+struct DjAssistTrackedCommand {
+	uint32_t id = 0;
+	bool tracked = false;
+	DjCommandStatus status = DJ_COMMAND_PENDING;
 };
 
 struct DjEffectSnapshot {
@@ -503,6 +523,19 @@ inline bool djCommandIdentityMatches(const DjCommand& command, uint64_t bootId, 
 }
 #endif
 
+// Outcome of attempting to admit a supersedable command against whatever
+// currently occupies the queue's tail slot for the same target. NONE means
+// there is nothing to supersede (caller should push fresh); REPLACED means
+// the tail command was overwritten (its id is reported via supersededId);
+// BLOCKED means a matching tail command exists but must NOT be silently
+// overwritten - see the SET_MIX origin policy below - so the incoming
+// command must be rejected instead.
+enum DjSupersedeOutcome : uint8_t {
+	DJ_SUPERSEDE_NONE,
+	DJ_SUPERSEDE_REPLACED,
+	DJ_SUPERSEDE_BLOCKED
+};
+
 class DjCommandQueue {
 public:
 	bool push(const DjCommand& command){
@@ -521,13 +554,25 @@ public:
 		return true;
 	}
 
-	bool supersede(const DjCommand& command, uint32_t& supersededId){
-		if(count == 0 || !isSupersedable(command.type)) return false;
+	// SET_MIX origin policy: a still-queued manual (non-system) mix must
+	// never be silently replaced by a later system-origin mix (e.g. the
+	// next Assist/crossfade ramp tick) - that would erase the user's
+	// queued intent with no trace. A further manual mix, or the original
+	// one actually draining via pop(), may still replace/clear it. Every
+	// other supersedable command type keeps the prior last-write-wins
+	// behavior (rapid dial changes on the same target coalesce).
+	DjSupersedeOutcome supersede(const DjCommand& command, uint32_t& supersededId){
+		if(count == 0 || !isSupersedable(command.type)) return DJ_SUPERSEDE_NONE;
 		const uint8_t index = (tail + DJ_COMMAND_CAPACITY - 1) % DJ_COMMAND_CAPACITY;
-		if(!sameTarget(commands[index], command)) return false;
+		if(!sameTarget(commands[index], command)) return DJ_SUPERSEDE_NONE;
+		if(command.type == DJ_COMMAND_SET_MIX &&
+		   command.origin == DJ_ORIGIN_SYSTEM &&
+		   commands[index].origin != DJ_ORIGIN_SYSTEM){
+			return DJ_SUPERSEDE_BLOCKED;
+		}
 		supersededId = commands[index].id;
 		commands[index] = command;
-		return true;
+		return DJ_SUPERSEDE_REPLACED;
 	}
 
 	void clear(){
@@ -682,6 +727,58 @@ private:
 	uint64_t nextSequence = 0;
 #endif
 };
+
+// Single choke point for admitting an already-validated, already-ID-assigned
+// command into the queue, used by DjSession::submit() for every command
+// (including the setMix()/setPlaying()/etc. wrappers). Kept as a free
+// function operating only on these primitive, host-testable types so the
+// exact admission/bookkeeping semantics can be exercised directly by host
+// tests without any Arduino/CircuitOS dependencies - see
+// tests/dj_session_self_test.cpp. Three related fixes live here:
+//
+//  - a command superseded before it ever reaches the front of the queue
+//    must mark BOTH the bounded/evictable presentation ring (results) and,
+//    if it is the one the Coach transition/rollback state machine is
+//    durably watching (tracked), the never-evictable tracked slot too -
+//    otherwise that slot could report ACCEPTED forever for a command that
+//    will never run.
+//  - a manual (non-system) SET_MIX must never be silently replaced by a
+//    later system-origin SET_MIX while still queued (see
+//    DjCommandQueue::supersede()'s origin policy); such an attempt is
+//    rejected outright, preserving the user's queued intent.
+//  - nonSystemMixGeneration is bumped the instant a manual mix is itself
+//    admitted (supersede-replace or fresh push), not when it later applies,
+//    so anything gated on "a manual mix is in flight" (guard snapshots,
+//    Assist's own arm-time baseline) sees it immediately rather than racing
+//    apply().
+inline DjSubmitResult admitAssistCommand(
+	const DjCommand& command,
+	DjCommandQueue& queue,
+	DjCommandResults& results,
+	DjAssistTrackedCommand& tracked,
+	uint32_t& nonSystemMixGeneration
+){
+	uint32_t supersededId = 0;
+	const DjSupersedeOutcome outcome = queue.supersede(command, supersededId);
+	if(outcome == DJ_SUPERSEDE_BLOCKED){
+		results.record(command, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_MIX_OVERRIDE_PENDING);
+		return DjSubmitResult(command.id, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_MIX_OVERRIDE_PENDING);
+	}
+	if(outcome == DJ_SUPERSEDE_REPLACED){
+		results.finish(supersededId, DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+		if(tracked.tracked && tracked.id == supersededId) tracked.status = DJ_COMMAND_SUPERSEDED;
+		results.record(command, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+		if(command.type == DJ_COMMAND_SET_MIX && command.origin != DJ_ORIGIN_SYSTEM) nonSystemMixGeneration++;
+		return DjSubmitResult(command.id, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	}
+	if(!queue.push(command)){
+		results.record(command, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_QUEUE_FULL);
+		return DjSubmitResult(command.id, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_QUEUE_FULL);
+	}
+	results.record(command, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	if(command.type == DJ_COMMAND_SET_MIX && command.origin != DJ_ORIGIN_SYSTEM) nonSystemMixGeneration++;
+	return DjSubmitResult(command.id, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+}
 
 class DjSnapshotBuffers {
 public:

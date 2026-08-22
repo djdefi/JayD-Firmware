@@ -1,6 +1,7 @@
 #include "DjAssistEngine.h"
 
 #include "DjAssistScoring.h"
+#include "DjAssistSessionBridge.h"
 
 namespace {
 
@@ -89,6 +90,14 @@ bool DjAssistEngine::armTransition(
 	if(!guard.deckPlaying[fromDeck]) return false;
 	if(guard.loopActive[fromDeck] || guard.loopActive[toDeck]) return false;
 	if(!guard.metadataValid[fromDeck]) return false;
+	// Target deck must be stopped and sync-off at arm time: this is what
+	// makes rollback's applied-mutation ownership tracking safe below. If
+	// the target were already playing/synced, the plan's START_DECK/
+	// ENABLE_SYNC steps would be idempotent no-ops against pre-existing
+	// user state that a rollback must never touch - simplest safe contract
+	// is to just refuse to arm until the user (or a prior plan) returns the
+	// target deck to that baseline.
+	if(guard.deckPlaying[toDeck] || guard.syncActive[toDeck]) return false;
 
 	plan_ = DjAssistTransitionPlan();
 	plan_.fromDeck = fromDeck;
@@ -101,8 +110,6 @@ bool DjAssistEngine::armTransition(
 	plan_.armedMix = guard.mix;
 	plan_.armedFromPlaying = guard.deckPlaying[fromDeck];
 	plan_.armedFromRateMilli = guard.rateMilli[fromDeck];
-	plan_.armedToPlaying = guard.deckPlaying[toDeck];
-	plan_.armedToSynced = guard.syncActive[toDeck];
 
 	buildSteps(plan_);
 	mode_ = DJ_ASSIST_MODE_TRANSITION_ARMED;
@@ -190,6 +197,25 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 
 	const bool stopSubmitted = stepSubmitted(DJ_ASSIST_ACTION_STOP_DECK);
 	const bool crossfadeSubmitted = stepSubmitted(DJ_ASSIST_ACTION_CROSSFADE);
+	const bool startDeckSubmitted = stepSubmitted(DJ_ASSIST_ACTION_START_DECK);
+	const bool syncSubmitted = stepSubmitted(DJ_ASSIST_ACTION_ENABLE_SYNC);
+
+	// armTransition() requires the target deck stopped and sync-off at arm
+	// time (see DjAssistTransitionPlan::toDeckStartOwnedByPlan/
+	// toDeckSyncOwnedByPlan). If the user starts playback or engages sync
+	// on the target deck before the plan's own START_DECK/ENABLE_SYNC step
+	// has been submitted, that divergence must abort the transition rather
+	// than let the later idempotent system command silently be credited as
+	// plan-owned (which would make rollback stop/release state the user,
+	// not the plan, introduced).
+	if(!startDeckSubmitted && guard.deckPlaying[plan_.toDeck]){
+		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
+		return false;
+	}
+	if(!syncSubmitted && guard.syncActive[plan_.toDeck]){
+		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
+		return false;
+	}
 
 	if(!stopSubmitted && guard.deckPlaying[plan_.fromDeck] != plan_.armedFromPlaying){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
@@ -264,17 +290,34 @@ void DjAssistEngine::tick(DjAssistActuator& actuator, const DjAssistGuardSnapsho
 	}
 
 	const DjCommandStatus status = actuator.poll(step.commandId);
-	if(status == DJ_COMMAND_APPLIED){
-		step.applied = true;
-		plan_.currentStep++;
-		if(plan_.currentStep >= plan_.stepCount) mode_ = DJ_ASSIST_MODE_TRANSITION_COMPLETE;
-		return;
+	switch(DjAssistBridge::evaluateCommandOutcome(status)){
+		case DjAssistBridge::DJ_ASSIST_COMMAND_DONE:
+			step.applied = true;
+			// Ownership is recorded from the exact applied mutation, never
+			// inferred from a baseline+submitted heuristic - a manual
+			// play/sync between arm and this step's submit is already
+			// caught by guardOk()'s divergence checks above, so reaching
+			// APPLIED here means this system command is what produced the
+			// current playing/synced state.
+			if(step.action == DJ_ASSIST_ACTION_START_DECK) plan_.toDeckStartOwnedByPlan = true;
+			if(step.action == DJ_ASSIST_ACTION_ENABLE_SYNC) plan_.toDeckSyncOwnedByPlan = true;
+			plan_.currentStep++;
+			if(plan_.currentStep >= plan_.stepCount) mode_ = DJ_ASSIST_MODE_TRANSITION_COMPLETE;
+			return;
+		case DjAssistBridge::DJ_ASSIST_COMMAND_FAILED:
+		case DjAssistBridge::DJ_ASSIST_COMMAND_RESUBMIT:
+			// SUPERSEDED (RESUBMIT) is only a bounded, same-plan retry
+			// policy for the crossfade actuator's own final-mix command,
+			// which never surfaces raw SUPERSEDED here (pollCrossfade()
+			// maps it internally to PENDING). For every normal step, a
+			// command that was superseded before it ever ran will never
+			// apply - waiting on it forever would strand the transition.
+			fail(DJ_ASSIST_FAIL_COMMAND_REJECTED);
+			return;
+		case DjAssistBridge::DJ_ASSIST_COMMAND_WAIT:
+		default:
+			return; // still in flight, keep waiting.
 	}
-	if(status == DJ_COMMAND_FAILED || status == DJ_COMMAND_REJECTED){
-		fail(DJ_ASSIST_FAIL_COMMAND_REJECTED);
-		return;
-	}
-	// DJ_COMMAND_ACCEPTED / DJ_COMMAND_SUPERSEDED: still in flight, keep waiting.
 }
 
 void DjAssistEngine::cancelTransition(){

@@ -98,24 +98,11 @@ DjSubmitResult DjSession::submit(DjCommand command){
 		return { command.id, DJ_COMMAND_REJECTED, error };
 	}
 
-	uint32_t supersededId = 0;
-	if(commandQueue.supersede(command, supersededId)){
-		commandResults.finish(supersededId, DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
-		commandResults.record(command, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
-		commandMutex.unlock();
-		return { command.id, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
-	}
-
-	if(!commandQueue.push(command)){
-		queueDrops++;
-		commandResults.record(command, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_QUEUE_FULL);
-		commandMutex.unlock();
-		return { command.id, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_QUEUE_FULL };
-	}
-
-	commandResults.record(command, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	const DjSubmitResult result = admitAssistCommand(
+		command, commandQueue, commandResults, assistTracked, nonSystemMixGeneration);
+	if(result.error == DJ_COMMAND_ERROR_QUEUE_FULL) queueDrops++;
 	commandMutex.unlock();
-	return { command.id, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
+	return result;
 }
 
 DjSubmitResult DjSession::loadDeck(
@@ -853,13 +840,14 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			system->setVolume(command.deck, gains[command.deck]);
 			return true;
 		case DJ_COMMAND_SET_MIX:
+			// nonSystemMixGeneration is bumped at admission time in
+			// admitAssistCommand() (called from submit()), not here - a
+			// manual mix that is later superseded before ever applying
+			// still needs to have registered so a system-origin mix
+			// attempted while it was in flight sees the origin-priority
+			// rejection instead of racing this apply.
 			mix = command.value;
 			system->setMix(mix);
-			if(command.origin != DJ_ORIGIN_SYSTEM){
-				commandMutex.lock();
-				++nonSystemMixGeneration;
-				commandMutex.unlock();
-			}
 			return true;
 		case DJ_COMMAND_SET_EFFECT_TYPE: {
 			if(command.value == DJ_EFFECT_SPEED && syncArmed[command.deck]){

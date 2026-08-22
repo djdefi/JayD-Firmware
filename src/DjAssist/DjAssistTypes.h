@@ -207,13 +207,17 @@ struct DjAssistTransitionPlan {
 	uint8_t armedMix = 127;
 	bool armedFromPlaying = false;
 	uint32_t armedFromRateMilli = DJ_ASSIST_RATE_UNITY_MILLI;
-	// toDeck's own baseline at arm() time - a rollback must only undo a
-	// mutation THIS plan actually introduced. If the target deck was
-	// already playing/sync-armed before the transition armed, the plan's
-	// START_DECK/ENABLE_SYNC steps are idempotent no-ops against
-	// pre-existing user state, and rollback must never stop/release it.
-	bool armedToPlaying = false;
-	bool armedToSynced = false;
+	// Rollback must only undo a mutation THIS plan actually applied, never
+	// a pre-existing or independently-user-introduced state. armTransition()
+	// requires the target deck to be stopped and sync-off at arm time (see
+	// DjAssistEngine::armTransition()), so these start false and are set to
+	// true ONLY at the instant the engine observes the corresponding step
+	// (START_DECK / LOCK_TEMPO or ENABLE_SYNC) reach DJ_COMMAND_APPLIED -
+	// i.e. derived from the exact applied mutation, never inferred from a
+	// baseline-plus-submitted heuristic that a post-arm, pre-step manual
+	// play/sync could fool.
+	bool toDeckStartOwnedByPlan = false;
+	bool toDeckSyncOwnedByPlan = false;
 };
 
 // Bounded snapshot supplied every tick so the state machine can detect
@@ -229,9 +233,11 @@ struct DjAssistGuardSnapshot {
 	bool metadataValid[DJ_DECK_COUNT] = {};
 	uint32_t rateMilli[DJ_DECK_COUNT] = {};
 	// True when the deck's sync state is anything other than off (armed,
-	// locked, out-of-range, or error), used to capture whether a deck was
-	// already sync-active *before* a transition armed - see
-	// DjAssistTransitionPlan::armedToSynced.
+	// locked, out-of-range, or error). armTransition() requires this to be
+	// false for the target deck at arm time (see
+	// DjAssistTransitionPlan::toDeckSyncOwnedByPlan); guardOk() also checks
+	// it every tick before the plan's own ENABLE_SYNC step has been
+	// submitted, to catch a manual sync-on in the gap between arm and step.
 	bool syncActive[DJ_DECK_COUNT] = {};
 	// Identity currently loaded on each deck, so a running/armed transition
 	// can detect a target-deck swap (re-load or deck-swap) before acting on

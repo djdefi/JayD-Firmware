@@ -227,10 +227,15 @@ void DjAssistController::fillWorkerStep(){
 	const uint16_t cappedTotal = rawTotal > entryCapacity_ ? entryCapacity_ : uint16_t(rawTotal);
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
 	if(cursor >= cappedTotal){
+		// Re-read the generation counter fresh, immediately before the
+		// lock, rather than reusing currentGeneration (captured at the top
+		// of this call, before cappedTotal/rawTotal were even read) - a
+		// refresh landing in that window would otherwise go undetected by
+		// a self-comparison against loadedGeneration_, which was itself
+		// just set from currentGeneration above.
+		const uint32_t liveGeneration = session_->assistLibraryGeneration();
 		candidateMutex_.lock();
-		// Only finalize if the generation this cursor belongs to is still
-		// current (a fresh generation may have started concurrently).
-		if(loadedGeneration_ == currentGeneration){
+		if(DjAssistBridge::candidateFillGenerationCurrent(loadedGeneration_, currentGeneration, liveGeneration)){
 			entryTotal_ = cappedTotal;
 			fillComplete_ = true;
 		}
@@ -248,11 +253,16 @@ void DjAssistController::fillWorkerStep(){
 		entry.libraryIndex = cursor;
 	}
 
+	// Same fresh re-read rationale as above: the generation may have
+	// changed while assistTrackEntry() above was in flight (e.g. a library
+	// refresh landed mid-read) - discard this record rather than writing
+	// stale data into the new generation's table. Comparing only against
+	// currentGeneration (captured before the read even started) would miss
+	// a refresh that both starts and finishes entirely within this read.
+	const uint32_t liveGeneration = session_->assistLibraryGeneration();
 	candidateMutex_.lock();
-	// The generation may have changed while the read above was in flight
-	// (e.g. a library refresh landed mid-read) - discard this record
-	// rather than writing stale data into the new generation's table.
-	if(loadedGeneration_ == currentGeneration && fillCursor_ == cursor){
+	if(DjAssistBridge::candidateFillGenerationCurrent(loadedGeneration_, currentGeneration, liveGeneration) &&
+	   fillCursor_ == cursor){
 		entries_[cursor] = entry;
 		++fillCursor_;
 		if(fillCursor_ >= cappedTotal){
@@ -265,9 +275,14 @@ void DjAssistController::fillWorkerStep(){
 
 // Bounded, lock-protected readiness check for the main thread - never
 // blocks on I/O (the fill task never holds candidateMutex_ across a read).
+// The live generation is re-read fresh (outside the lock, then compared
+// inside it) so a refresh that completes between fillWorkerStep() finishing
+// and this call still atomically invalidates readiness, rather than
+// reporting a table that is stale by the time the caller acts on it.
 bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
+	const uint32_t liveGeneration = session_ ? session_->assistLibraryGeneration() : 0;
 	candidateMutex_.lock();
-	const bool ready = fillComplete_;
+	const bool ready = fillComplete_ && loadedGeneration_ == liveGeneration;
 	outGeneration = loadedGeneration_;
 	candidateMutex_.unlock();
 	return ready;
@@ -365,10 +380,13 @@ bool DjAssistController::resolveBoundary(const DjSnapshot& snapshot, uint8_t dec
 	// nearing its end would trigger a full phrase-table rescan on every
 	// single Coach/transition tick.
 	const DjTrackIdentity& identity = snapshot.decks[deck].identity;
-	if(DjAssistBridge::phraseCacheNeedsRescan(phraseCache_, deck, currentFrame, identity)){
+	const uint32_t metadataGeneration = snapshot.decks[deck].metadata.libraryGeneration;
+	const DjMetadataState metadataState = snapshot.decks[deck].metadata.state;
+	if(DjAssistBridge::phraseCacheNeedsRescan(phraseCache_, deck, currentFrame, identity, metadataGeneration, metadataState)){
 		uint64_t phraseFrame = 0;
 		const bool found = session_->nextPhraseFrame(deck, currentFrame, phraseFrame);
-		DjAssistBridge::updatePhraseCache(phraseCache_, deck, currentFrame, identity, found, phraseFrame);
+		DjAssistBridge::updatePhraseCache(
+			phraseCache_, deck, currentFrame, identity, metadataGeneration, metadataState, found, phraseFrame);
 	}
 	if(phraseCache_.valid && !phraseCache_.terminal){
 		hint.hasPhrase = true;
@@ -511,13 +529,14 @@ bool planStepSubmitted(const DjAssistTransitionPlan& plan, DjAssistTransitionAct
 // transition is essentially complete and un-stopping the new deck would be
 // more disruptive than leaving it playing.
 //
-// Ownership is computed fresh every tick from the plan's arm-time baseline
-// (armedToPlaying/armedToSynced) and the durable mix-generation counter,
-// never merely from "was this step type submitted": a step submitted
-// against a target deck that was already playing/synced before the
-// transition armed is an idempotent no-op the plan did not actually
-// introduce, and must not be undone; a manual mix change at any point
-// after arming means the MIX phase must never restore armedMix over it.
+// Sync/start-deck ownership is read directly from the plan's
+// toDeckSyncOwnedByPlan/toDeckStartOwnedByPlan fields, which the engine set
+// only at the instant it observed the corresponding step's command reach
+// DJ_COMMAND_APPLIED (see DjAssistEngine::tick()) - never recomputed here
+// from "was this step type submitted", since a step can be submitted and
+// still be in flight (or have failed) without ever having actually mutated
+// target-deck state. A manual mix change at any point after arming means
+// the MIX phase must never restore armedMix over it.
 void DjAssistController::tickRollback(){
 	if(!actuator_) return;
 	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return;
@@ -525,16 +544,12 @@ void DjAssistController::tickRollback(){
 
 	const DjAssistTransitionPlan& p = engine_.plan();
 	const bool crossfadeSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_CROSSFADE);
-	const bool syncSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_LOCK_TEMPO) ||
-		planStepSubmitted(p, DJ_ASSIST_ACTION_ENABLE_SYNC);
-	const bool startDeckSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_START_DECK);
 	const bool manualMixOccurred = session_ &&
 		session_->assistNonSystemMixGeneration() != armedMixGeneration_;
-	const bool syncOwnedByPlan = syncSubmitted && !p.armedToSynced;
-	const bool startDeckOwnedByPlan = startDeckSubmitted && !p.armedToPlaying;
 
 	rollbackPhase_ = DjAssistBridge::nextRollbackPhase(
-		rollbackPhase_, crossfadeSubmitted, manualMixOccurred, syncOwnedByPlan, startDeckOwnedByPlan
+		rollbackPhase_, crossfadeSubmitted, manualMixOccurred,
+		p.toDeckSyncOwnedByPlan, p.toDeckStartOwnedByPlan
 	);
 	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
 

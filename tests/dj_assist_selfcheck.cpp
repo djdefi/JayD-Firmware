@@ -352,6 +352,12 @@ public:
 	bool rejectNext = false;
 	uint8_t completeAfterPolls = 1;
 	uint32_t nextId = 1;
+	// When set, poll() returns this status unconditionally instead of the
+	// normal poll-count-driven ACCEPTED/APPLIED progression - used to
+	// exercise terminal statuses (SUPERSEDED/FAILED/REJECTED) a real
+	// command could reach without needing that many fake polls.
+	bool forceStatusEnabled = false;
+	DjCommandStatus forceStatus = DJ_COMMAND_ACCEPTED;
 
 	bool submit(const DjAssistTransitionStep&, uint32_t& outCommandId) override{
 		if(rejectNext) return false;
@@ -361,6 +367,7 @@ public:
 	}
 
 	DjCommandStatus poll(uint32_t commandId) const override{
+		if(forceStatusEnabled) return forceStatus;
 		uint8_t& polls = const_cast<FakeActuator*>(this)->pollCounts[commandId];
 		polls++;
 		return polls >= completeAfterPolls ? DJ_COMMAND_APPLIED : DJ_COMMAND_ACCEPTED;
@@ -421,33 +428,133 @@ void testArmRequiresValidPreconditions(){
 	assert(!engine.armTransition(0, 0, 5, target, 16, true, true, badBeats)); // same deck
 }
 
-// arm() must capture the toDeck's playing/sync baseline *at arm time* so
-// rollback can later tell an idempotent no-op (target already
-// playing/synced before this plan armed) apart from a mutation the plan
-// itself introduced - see DjAssistTransitionPlan::armedToPlaying/armedToSynced.
-void testArmTransitionCapturesToDeckBaseline(){
+// armTransition() requires the target deck to be stopped and sync-off at
+// arm time (simplest safe contract - see DjAssistTransitionPlan::
+// toDeckStartOwnedByPlan/toDeckSyncOwnedByPlan): if the target were already
+// playing/synced, the plan's START_DECK/ENABLE_SYNC steps would be
+// idempotent no-ops against pre-existing user state that a rollback must
+// never touch, so arming is refused outright rather than trying to infer
+// ownership from a baseline later.
+void testArmRejectsAlreadyPlayingOrSyncedTarget(){
 	DjTrackIdentity target = fingerprintIdentity(1);
 
-	// Target deck idle/not synced at arm time: baseline false/false.
-	{
-		DjAssistEngine engine;
-		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
-		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
-		assert(!engine.plan().armedToPlaying);
-		assert(!engine.plan().armedToSynced);
-	}
-
-	// Target deck already playing and already sync-active at arm time:
-	// baseline must reflect both true/true.
 	{
 		DjAssistEngine engine;
 		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
 		guard.deckPlaying[1] = true;
-		guard.syncActive[1] = true;
-		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
-		assert(engine.plan().armedToPlaying);
-		assert(engine.plan().armedToSynced);
+		assert(!engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+		assert(engine.mode() == DJ_ASSIST_MODE_OFF);
 	}
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		guard.syncActive[1] = true;
+		assert(!engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+		assert(engine.mode() == DJ_ASSIST_MODE_OFF);
+	}
+	// Idle/not-synced target at arm time: arm succeeds, and neither
+	// ownership flag is set yet (only set once the corresponding step is
+	// observed applied - see testTransitionOwnershipTrackedFromAppliedStep).
+	{
+		DjAssistEngine engine;
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+		assert(!engine.plan().toDeckStartOwnedByPlan);
+		assert(!engine.plan().toDeckSyncOwnedByPlan);
+	}
+}
+
+// Ownership must be recorded from the exact applied mutation, not merely
+// from "this step type was submitted" - it starts false and flips to true
+// only once the engine observes the corresponding command reach
+// DJ_COMMAND_APPLIED.
+void testTransitionOwnershipTrackedFromAppliedStep(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	actuator.completeAfterPolls = 1;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+	assert(engine.armTransition(0, 1, 5, target, 16, false, true, guard));
+
+	DjAssistBoundaryHint boundary;
+	// Step 0 is START_DECK (startAtBoundary=false, tempoLock=true): submit,
+	// then poll to APPLIED.
+	engine.tick(actuator, guard, boundary); // submit START_DECK
+	assert(!engine.plan().toDeckStartOwnedByPlan);
+	guard.deckPlaying[1] = true; // reflects the just-applied START_DECK
+	engine.tick(actuator, guard, boundary); // poll -> APPLIED
+	assert(engine.plan().toDeckStartOwnedByPlan);
+	assert(!engine.plan().toDeckSyncOwnedByPlan);
+
+	// Step 1 is LOCK_TEMPO (a plain SET_EFFECT-style step; ownership flags
+	// only apply to START_DECK/ENABLE_SYNC).
+	engine.tick(actuator, guard, boundary); // submit LOCK_TEMPO
+	engine.tick(actuator, guard, boundary); // poll -> APPLIED
+
+	// Step 2 is ENABLE_SYNC.
+	engine.tick(actuator, guard, boundary); // submit ENABLE_SYNC
+	assert(!engine.plan().toDeckSyncOwnedByPlan);
+	guard.syncActive[1] = true;
+	engine.tick(actuator, guard, boundary); // poll -> APPLIED
+	assert(engine.plan().toDeckSyncOwnedByPlan);
+}
+
+// A manual play/sync on the target deck after arm but before the plan's own
+// START_DECK/ENABLE_SYNC step has been submitted must abort the transition
+// with MANUAL_OVERRIDE rather than let the later idempotent system command
+// be silently credited as plan-owned.
+void testTransitionAbortsOnTargetDivergenceBeforeOwnStep(){
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+
+		// User starts the target deck manually while still waiting on the
+		// WAIT_BOUNDARY step (before START_DECK is ever submitted).
+		DjAssistGuardSnapshot diverged = guard;
+		diverged.deckPlaying[1] = true;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, diverged, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
+
+		DjAssistGuardSnapshot diverged = guard;
+		diverged.syncActive[1] = true;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, diverged, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+}
+
+// A command superseded before it ever applies must fail the transition
+// rather than let the generic step-poll loop wait on it forever - only the
+// crossfade actuator's own internal resubmit policy may treat SUPERSEDED as
+// anything other than terminal (see DjAssistSessionActuator::pollCrossfade,
+// exercised only by the real controller/actuator, not this pure engine).
+void testTransitionFailsOnSupersededNormalStep(){
+	DjAssistEngine engine;
+	FakeActuator actuator;
+	DjTrackIdentity target = fingerprintIdentity(1);
+	DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+	assert(engine.armTransition(0, 1, 4, target, 4, false, false, guard));
+
+	DjAssistBoundaryHint boundary;
+	engine.tick(actuator, guard, boundary); // submit first step
+	actuator.forceStatus = DJ_COMMAND_SUPERSEDED;
+	actuator.forceStatusEnabled = true;
+	engine.tick(actuator, guard, boundary); // poll -> SUPERSEDED
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(engine.plan().failure == DJ_ASSIST_FAIL_COMMAND_REJECTED);
 }
 
 void testTransitionHappyPath(){
@@ -819,7 +926,10 @@ int main(){
 	testMergeSuggestionExcludedRemovesStaleEntry();
 	testCrossfadeCurveAndOverflowGuards();
 	testArmRequiresValidPreconditions();
-	testArmTransitionCapturesToDeckBaseline();
+	testArmRejectsAlreadyPlayingOrSyncedTarget();
+	testTransitionOwnershipTrackedFromAppliedStep();
+	testTransitionAbortsOnTargetDivergenceBeforeOwnStep();
+	testTransitionFailsOnSupersededNormalStep();
 	testTransitionHappyPath();
 	testTransitionWaitsForAppliedResult();
 	testTransitionCancel();

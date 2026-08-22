@@ -68,13 +68,14 @@ enum DjAssistRollbackPhase : uint8_t {
 
 // Given the current rollback phase, whether a manual (non-system) mix
 // change has occurred since arm, and whether the sync/start-deck steps were
-// both submitted AND actually plan-owned (i.e. the target deck was NOT
-// already in that state when the transition armed - see
-// DjAssistTransitionPlan::armedToPlaying/armedToSynced), returns the next
-// phase to attempt - skipping any phase with nothing to undo, or that would
-// clobber state the plan never introduced. Pure and deterministic; the
-// caller does the actual actuator submit/poll for whichever phase this
-// returns and re-normalizes after each completed phase.
+// both submitted AND actually plan-owned (i.e. the engine observed the
+// corresponding command reach DJ_COMMAND_APPLIED while armed - see
+// DjAssistTransitionPlan::toDeckStartOwnedByPlan/toDeckSyncOwnedByPlan),
+// returns the next phase to attempt - skipping any phase with nothing to
+// undo, or that would clobber state the plan never introduced. Pure and
+// deterministic; the caller does the actual actuator submit/poll for
+// whichever phase this returns and re-normalizes after each completed
+// phase.
 //
 // The MIX phase is unconditionally skipped once a manual mix change has
 // occurred: restoring armedMix over a user's own subsequent action would
@@ -130,7 +131,12 @@ DjAssistBoundaryArrival evaluateBoundaryArrival(uint64_t currentFrame, uint64_t 
 // records a confirmed "no future phrase exists for this identity/position"
 // result so that case is cached too, not just a found boundary - without
 // this, a track nearing its end (no phrase left ahead) would trigger a
-// full rescan every single tick.
+// full rescan every single tick. metadataGeneration/metadataState mirror
+// DjTrackMetadataSnapshot's own revision fields so a metadata refresh that
+// leaves the same track *identity* loaded (e.g. re-resolved grid/phrase
+// data, or a transient VALID->PENDING->VALID cycle) still invalidates a
+// cached result instead of silently reusing phrase data computed against
+// the prior metadata state.
 struct DjAssistPhraseCacheState {
 	uint8_t deck = 0xFF; // 0xFF = unset/never cached
 	bool valid = false;
@@ -138,22 +144,28 @@ struct DjAssistPhraseCacheState {
 	uint64_t frame = 0;       // cached phrase frame, only meaningful if valid && !terminal
 	uint64_t lastFrame = 0;   // playback position at last (re)cache, to detect backward seeks
 	DjTrackIdentity identity = {};
+	uint32_t metadataGeneration = 0;
+	DjMetadataState metadataState = DJ_METADATA_ABSENT;
 };
 
 // True when the cache must be refreshed via a real lookup rather than
-// reused: no cache yet for this deck, the loaded identity changed, playback
-// seeked backward (lastFrame > currentFrame), or a previously *found*
-// cached boundary has now been passed (currentFrame >= cached frame). A
-// cached *terminal* ("no future phrase") result is deliberately NOT
-// rescanned just because it is still terminal, and is not invalidated by
-// forward playback alone - only by an identity change or a backward seek.
-// The caller performs the actual lookup and calls updatePhraseCache() with
-// the result whenever this returns true.
+// reused: no cache yet for this deck, the loaded identity changed, the
+// metadata generation/state for this deck's slot changed (a refresh
+// re-resolved the same identity's metadata), playback seeked backward
+// (lastFrame > currentFrame), or a previously *found* cached boundary has
+// now been passed (currentFrame >= cached frame). A cached *terminal* ("no
+// future phrase") result is deliberately NOT rescanned just because it is
+// still terminal, and is not invalidated by forward playback alone - only
+// by an identity/metadata change or a backward seek. The caller performs
+// the actual lookup and calls updatePhraseCache() with the result whenever
+// this returns true.
 bool phraseCacheNeedsRescan(
 	const DjAssistPhraseCacheState& cache,
 	uint8_t deck,
 	uint64_t currentFrame,
-	const DjTrackIdentity& identity
+	const DjTrackIdentity& identity,
+	uint32_t metadataGeneration,
+	DjMetadataState metadataState
 );
 
 // Records the outcome of a (possibly skipped) phrase lookup into the cache.
@@ -163,8 +175,27 @@ void updatePhraseCache(
 	uint8_t deck,
 	uint64_t currentFrame,
 	const DjTrackIdentity& identity,
+	uint32_t metadataGeneration,
+	DjMetadataState metadataState,
 	bool found,
 	uint64_t phraseFrame
+);
+
+// True when a candidate-table fill write/finalize may be safely committed.
+// generationAtReadStart is the library generation observed at the top of
+// the fillWorkerStep() call that performed the (possibly slow, unlocked)
+// read; liveGenerationAtCommit is a FRESH re-read of the same counter taken
+// immediately before acquiring the table lock to commit. Both must still
+// match the table's currently-loaded generation: comparing only against a
+// value captured before the read (as a naive single check would) misses a
+// refresh that completes *during* the unlocked read/scan window, letting a
+// stale record slip into the new generation's table - re-checking a
+// freshly-read value closes that gap without needing to change the
+// metadata reader functions' locking.
+bool candidateFillGenerationCurrent(
+	uint32_t loadedGeneration,
+	uint32_t generationAtReadStart,
+	uint32_t liveGenerationAtCommit
 );
 
 } // namespace DjAssistBridge

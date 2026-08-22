@@ -117,6 +117,7 @@ add_test(NAME MetadataIntegrationSelfCheck COMMAND MetadataIntegrationSelfCheck)
 add_executable(DjAssistSelfCheck
         tests/dj_assist_selfcheck.cpp
         src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistSessionBridge.cpp
         src/DjAssist/DjAssistEngine.cpp)
 set_target_properties(DjAssistSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
