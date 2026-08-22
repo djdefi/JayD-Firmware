@@ -87,7 +87,12 @@ enum DjCommandType : uint8_t {
 	DJ_COMMAND_SET_SYNC,
 	DJ_COMMAND_SET_CUE,
 	DJ_COMMAND_TRIGGER_CUE,
-	DJ_COMMAND_CLEAR_CUE
+	DJ_COMMAND_CLEAR_CUE,
+	// Coach/one-shot-transition control surface. Always present (not gated
+	// on wireless) since the physical Assist bank uses these too.
+	DJ_COMMAND_ASSIST_SET_MODE,
+	DJ_COMMAND_ASSIST_ARM_TRANSITION,
+	DJ_COMMAND_ASSIST_CANCEL_TRANSITION
 #if defined(JAYD_ENABLE_WIRELESS)
 	,DJ_COMMAND_OPEN_PAIRING
 #endif
@@ -122,7 +127,11 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_INVALID_MASTER,
 	DJ_COMMAND_ERROR_EMPTY_CUE,
 	DJ_COMMAND_ERROR_RECORDING_ACTIVE,
-	DJ_COMMAND_ERROR_RECORDING_BUSY
+	DJ_COMMAND_ERROR_RECORDING_BUSY,
+	// Coach/one-shot-transition arm rejected: target not loaded, source deck
+	// not playing, recording/loop conflict, or invalid plan arguments. See
+	// DjAssistEngine::armTransition() for the exact guard rules.
+	DJ_COMMAND_ERROR_ASSIST_REJECTED
 #if defined(JAYD_ENABLE_WIRELESS)
 	,DJ_COMMAND_ERROR_STALE_IDENTITY,
 	DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED
@@ -366,6 +375,10 @@ struct DjDeckSnapshot {
 	DjQuantizeSnapshot quantize = {};
 	DjLoopSnapshot loop = {};
 	DjSyncSnapshot sync = {};
+	// Only meaningful when metadata.state == DJ_METADATA_VALID (see
+	// DjSession::publishSnapshot()); all-zero/unattached otherwise so an
+	// unresolved deck never falsely identity-matches another.
+	DjTrackIdentity identity = {};
 };
 
 // Authoritative recording lifecycle snapshot: accepted (STARTING/STOPPING)

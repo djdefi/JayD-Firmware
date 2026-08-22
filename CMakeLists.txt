@@ -127,6 +127,24 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif ()
 add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
 
+# Pure DjSession<->DjAssist glue (candidate-entry construction, crossfade
+# ramp math). Free of FS/Arduino dependencies by design; the ESP32-coupled
+# DjAssistController/DjAssistSessionActuator that call into these functions
+# are validated only by the real firmware build, matching how DjSession.cpp
+# itself is never host-unit-tested.
+add_executable(DjAssistBridgeSelfCheck
+        tests/dj_assist_bridge_selfcheck.cpp
+        src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistSessionBridge.cpp)
+set_target_properties(DjAssistBridgeSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjAssistBridgeSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjAssistBridgeSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjAssistBridgeSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME DjAssistBridgeSelfCheck COMMAND DjAssistBridgeSelfCheck)
+
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the
 # pinned JayD-Library headers (WavHeader.h, AudioSetup.hpp) via
