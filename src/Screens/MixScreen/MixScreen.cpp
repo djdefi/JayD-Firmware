@@ -6,7 +6,6 @@
 #include "MixScreen.h"
 #include "../SongList/SongList.h"
 #include "../Settings/SettingsScreen.h"
-#include "../TextInputScreen/TextInputScreen.h"
 #include "../../Fonts.h"
 
 MixScreen::MixScreen* MixScreen::MixScreen::instance = nullptr;
@@ -66,65 +65,10 @@ void MixScreen::MixScreen::unpack(){
 	bgFile.close();
 }
 
-void MixScreen::MixScreen::saveRecording(){
-	if(!SD.exists(MixSystem::recordPath)){
-		doneRecording = false;
-		return;
-	}
-
-	Task saveTask("MixSave", [](Task* task){
-		String saveFilename = * (String*) task->arg;
-
-		if(SD.exists(saveFilename)){
-			SD.remove(saveFilename);
-		}
-
-		File inFile = SD.open(MixSystem::recordPath);
-		File outFile = SD.open(saveFilename, "w");
-
-		SourceWAV input(inFile);
-		OutputAAC output(outFile);
-
-		output.setSource(&input);
-		output.start();
-
-		while(output.isRunning()){
-			output.loop(0);
-		}
-
-		output.stop();
-		input.close();
-
-		inFile.close();
-		outFile.close();
-	}, 8 * 1024, &saveFilename);
-
-	saveTask.start(1, 0);
-
-	while(!saveTask.isStopped()){
-		if(millis() - lastDraw >= 30){
-			lastDraw = millis();
-			drawSaveStatus();
-			screen.commit();
-		}
-
-		Sched.loop(0);
-	}
-
-	SD.remove(MixSystem::recordPath);
-	doneRecording = false;
-}
-
 void MixScreen::MixScreen::returned(void* data){
 	songListOpen = false;
 	if(data == nullptr) return;
 	String* filename = (String*) data;
-
-	if(doneRecording){
-		saveFilename = String("/") + *filename + ".aac";
-		delete filename;
-		return;
-	}
 
 	session->setGain(0, InputJayD::getInstance()->getPotValue(POT_L), DJ_ORIGIN_LOCAL_UI);
 	session->setGain(1, InputJayD::getInstance()->getPotValue(POT_R), DJ_ORIGIN_LOCAL_UI);
@@ -188,30 +132,45 @@ bool MixScreen::MixScreen::syncFromSnapshot(const DjSnapshot& snapshot, bool for
 			}
 		}
 	}
-	if(isRecording != snapshot.recording){
-		isRecording = snapshot.recording;
+	if(recordingState != snapshot.recordingInfo.state){
+		recordingState = snapshot.recordingInfo.state;
 		changed = true;
+		switch(recordingState){
+			case DJ_RECORDING_STARTING:
+				statusText = "STARTING RECORDING...";
+				statusUntil = millis() + 2500;
+				break;
+			case DJ_RECORDING_ACTIVE:
+				statusText = "RECORDING";
+				statusUntil = millis() + 1500;
+				break;
+			case DJ_RECORDING_STOPPING:
+				statusText = "FINALIZING RECORDING...";
+				statusUntil = millis() + 2500;
+				break;
+			case DJ_RECORDING_COMPLETE:
+				statusText = snapshot.recordingInfo.valid ? "RECORDING SAVED" : "RECORDING INVALID";
+				statusUntil = millis() + 3000;
+				break;
+			case DJ_RECORDING_FAILED:
+				statusText = recordingErrorText(snapshot.recordingInfo.error);
+				statusUntil = millis() + 3000;
+				break;
+			default:
+				break;
+		}
 	}
 	return changed;
 }
 
-bool MixScreen::MixScreen::processCommandResults(const DjSnapshot& snapshot){
+void MixScreen::MixScreen::processCommandResults(const DjSnapshot& snapshot){
 	for(const auto& result : snapshot.recentResults){
 		if(result.id == 0 || result.status == DJ_COMMAND_ACCEPTED || resultHandled(result.id)) continue;
 		markResultHandled(result.id);
-		if(result.id == pendingRecordingStop){
-			pendingRecordingStop = 0;
-			if(result.status == DJ_COMMAND_APPLIED){
-				doneRecording = true;
-				(new TextInputScreen::TextInputScreen(*screen.getDisplay()))->push(this);
-				return true;
-			}
-		}
 		if(result.status == DJ_COMMAND_FAILED || result.status == DJ_COMMAND_REJECTED){
 			showCommandError(result.error);
 		}
 	}
-	return false;
 }
 
 bool MixScreen::MixScreen::resultHandled(uint32_t id) const{
@@ -235,12 +194,6 @@ void MixScreen::MixScreen::openBrowse(){
 
 void MixScreen::MixScreen::start(){
 	songListOpen = false;
-	if(doneRecording){
-		lastDraw = 0;
-		draw();
-		screen.commit();
-		saveRecording();
-	}
 
 	if(!session) return;
 	DjSnapshot snapshot;
@@ -306,15 +259,14 @@ void MixScreen::MixScreen::draw(){
 		screen.getSprite()->drawIcon(selectedBackgroundBuffer, screen.getTotalX() + 81, screen.getTotalY(), 79, 128, 1, TFT_TRANSPARENT);
 	}
 
-	if(isRecording){
+	if(recordingState == DJ_RECORDING_ACTIVE){
 		screen.getSprite()->fillCircle(79, 64, 6, TFT_BLACK);
 		screen.getSprite()->fillCircle(79, 64, 4, TFT_RED);
+	}else if(recordingState == DJ_RECORDING_STARTING || recordingState == DJ_RECORDING_STOPPING){
+		screen.getSprite()->fillCircle(79, 64, 6, TFT_BLACK);
+		screen.getSprite()->fillCircle(79, 64, 4, TFT_ORANGE);
 	}
 	screen.draw();
-
-	if(doneRecording){
-		drawSaveStatus();
-	}
 
 	if(controls.bank == MIX_BANK_MIX){
 		drawMixLabels();
@@ -460,8 +412,24 @@ const char* MixScreen::MixScreen::commandErrorText(DjCommandError error) const{
 		case DJ_COMMAND_ERROR_OPEN_FAILED: return "TRACK LOAD FAILED";
 		case DJ_COMMAND_ERROR_EMPTY_CUE: return "CUE IS EMPTY";
 		case DJ_COMMAND_ERROR_RECORDING_ACTIVE: return "STOP RECORDING TO LOAD";
+		case DJ_COMMAND_ERROR_RECORDING_BUSY: return "RECORDING BUSY";
+		case DJ_COMMAND_ERROR_RECORDING_FAILED: return "RECORDING FAILED";
 		case DJ_COMMAND_ERROR_SESSION_ENDING: return "DJ SESSION ENDING";
 		default: return "COMMAND REJECTED";
+	}
+}
+
+const char* MixScreen::MixScreen::recordingErrorText(DjRecordingError error) const{
+	switch(error){
+		case DJ_RECORDING_ERROR_SD_UNAVAILABLE: return "SD CARD UNAVAILABLE";
+		case DJ_RECORDING_ERROR_OPEN_FAILED: return "RECORDING FILE ERROR";
+		case DJ_RECORDING_ERROR_WRITE_FAILED: return "RECORDING WRITE FAILED";
+		case DJ_RECORDING_ERROR_FINALIZE_FAILED: return "RECORDING SAVE FAILED";
+		case DJ_RECORDING_ERROR_BUFFER_OVERRUN: return "RECORDING OVERRUN";
+		case DJ_RECORDING_ERROR_QUEUE_FULL: return "RECORDING QUEUE FULL";
+		case DJ_RECORDING_ERROR_NAME_EXHAUSTED: return "RECORDING STORAGE FULL";
+		case DJ_RECORDING_ERROR_RENAME_FAILED: return "RECORDING SAVE FAILED";
+		default: return "RECORDING FAILED";
 	}
 }
 
@@ -469,21 +437,6 @@ void MixScreen::MixScreen::showCommandError(DjCommandError error){
 	statusText = commandErrorText(error);
 	statusUntil = millis() + 2500;
 	drawQueued = true;
-}
-
-void MixScreen::MixScreen::drawSaveStatus(){
-	Sprite* canvas = screen.getSprite();
-
-	canvas->fillRoundRect((screen.getWidth() - 80) / 2, (screen.getHeight() - 40) / 2, 80, 40, 2, C_RGB(52, 204, 235));
-	canvas->drawRoundRect((screen.getWidth() - 80) / 2, (screen.getHeight() - 40) / 2, 80, 40, 2, TFT_BLACK);
-
-	canvas->setTextColor(TFT_WHITE);
-	canvas->setFont(&u8g2_font_DigitalDisco_tf);
-	canvas->setTextDatum(BC_DATUM);
-	canvas->drawString("Saving...", screen.getWidth() / 2, (screen.getHeight() - 40) / 2 + 23);
-	canvas->setTextDatum(TL_DATUM);
-
-	canvas->fillRoundRect((screen.getWidth() - 80) / 2 + 10 + (cos((float) millis() / 200.0f)+1) / 2.0f * 45.0f, (screen.getHeight() - 40) / 2 + 30, 15, 5, 2, TFT_WHITE);
 }
 
 void MixScreen::MixScreen::buildUI(){
@@ -551,7 +504,7 @@ void MixScreen::MixScreen::loop(uint micros){
 
 	DjSnapshot snapshot;
 	if(session && session->copySnapshot(snapshot)){
-		if(processCommandResults(snapshot)) return;
+		processCommandResults(snapshot);
 		update |= syncFromSnapshot(snapshot);
 		const bool hasTarget = snapshot.decks[0].path[0] != '\0' || snapshot.decks[1].path[0] != '\0';
 		if(!hasTarget && !browseWasOpened && !songListOpen && !session->hasPendingLoad()){
@@ -571,7 +524,7 @@ void MixScreen::MixScreen::loop(uint micros){
 		statusText = "";
 		update = true;
 	}
-	if((update || drawQueued) && (currentTime - lastDraw) >= (isRecording ? 200 : 50)){
+	if((update || drawQueued) && (currentTime - lastDraw) >= (recordingState == DJ_RECORDING_ACTIVE ? 200 : 50)){
 		drawQueued = false;
 		draw();
 		screen.commit();
@@ -609,19 +562,15 @@ void MixScreen::MixScreen::stopBigVu(){
 }
 
 void MixScreen::MixScreen::btnCombination(){
-	if(isRecording){
-		const DjSubmitResult result = session->setRecording(false, DJ_ORIGIN_PHYSICAL);
-		if(!result.accepted()){
-			showCommandError(result.error);
-			return;
-		}
-		pendingRecordingStop = result.id;
-		statusText = "STOPPING RECORDING...";
-		statusUntil = millis() + 2500;
-	}else{
-		const DjSubmitResult result = session->setRecording(true, DJ_ORIGIN_PHYSICAL);
-		if(!result.accepted()) showCommandError(result.error);
+	// Guard against re-triggering while the library hasn't yet applied the
+	// previous start/stop request -- avoids duplicate toggles racing the
+	// async accepted-vs-applied recording lifecycle.
+	if(recordingState == DJ_RECORDING_STARTING || recordingState == DJ_RECORDING_STOPPING){
+		return;
 	}
+	const bool wantRecording = recordingState != DJ_RECORDING_ACTIVE;
+	const DjSubmitResult result = session->setRecording(wantRecording, DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()) showCommandError(result.error);
 }
 
 void MixScreen::MixScreen::btn(uint8_t i){

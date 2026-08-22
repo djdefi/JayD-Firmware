@@ -40,6 +40,7 @@ private:
 	static DjSession* instance;
 	static uint64_t bootId;
 	static uint32_t sessionCounter;
+	static bool orphanRecoveryDone;
 
 	MixSystem* system = nullptr;
 	fs::File files[DJ_DECK_COUNT];
@@ -61,11 +62,17 @@ private:
 	uint32_t queueDrops = 0;
 	uint64_t snapshotSeq = 0;
 	uint32_t sessionId = 0;
+	DjRecordingSnapshot recordingSnapshot;
+	DjRecordingState lastRecordingState = DJ_RECORDING_IDLE;
+	bool finalizeFailed = false;
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;
 	bool apply(const DjCommand& command, DjCommandError& error);
 	bool applyLoad(const DjCommand& command, DjCommandError& error);
+	void pollRecording();
+	static DjRecordingState mapRecordingState(RecordingState state);
+	static DjRecordingError mapRecordingError(RecordingError error);
 	void publishSnapshot();
 	void shutdown();
 };
