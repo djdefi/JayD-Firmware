@@ -477,15 +477,36 @@ static void testSyncLossOfMetadataGoesToError(){
 	assert(!out.hardAlign && !out.applyNudge);
 }
 
-// Faithful (minimal) model of JayD-Library's SpeedModifier::requestedRate
-// state machine, mirroring AudioLib/SpeedModifier.cpp's real semantics:
-// setRate() clamps to [MinRate,MaxRate] and unconditionally overwrites
-// requestedRate; nudgeRate() adds a signed delta on top of the *current*
-// requestedRate and applies it via setRate(). This is the exact interaction
-// that made the sync controller's per-tick unconditional setRate() call
-// erase an in-flight nudge before the applyRate cache fix.
+// Faithful model of JayD-Library's SpeedModifier, mirroring
+// AudioLib/SpeedModifier.cpp's real semantics exactly:
+//   - setRate() clamps to [MinRate,MaxRate] and unconditionally overwrites
+//     requestedRate; nudgeRate() adds a signed delta on top of the *current*
+//     requestedRate and applies it via setRate(). This is the exact
+//     interaction that made the sync controller's per-tick unconditional
+//     setRate() call erase an in-flight nudge before the applyRate cache fix.
+//   - nudgeRate()/setRate() only ever change requestedRate. Actual playback
+//     speed (currentRate) ramps toward it by at most RateScale/BUFFER_SAMPLES
+//     per generated output sample (SpeedModifier::advanceRate()), and the
+//     source position advances by currentRate (Q16.16 input-samples per
+//     output-sample) each sample (SpeedModifier::generate()'s
+//     sourcePosition += currentRate accumulator). Phase movement is
+//     therefore a function of *consumed source frames over elapsed output
+//     samples*, not a direct function of the commanded rate delta -- an
+//     earlier version of this test incorrectly subtracted the Q16.16
+//     nudgeAmount straight from a frame count, which does not correspond to
+//     any real unit conversion. This model reproduces the real per-sample
+//     ramp + fixed-point accumulator instead.
 struct FaithfulSpeedModifierModel {
+	// Mirrors AudioSetup.hpp's BUFFER_SAMPLES, which sets SpeedModifier's
+	// per-sample ramp step (RateScale / BUFFER_SAMPLES) and is used below as
+	// the number of output samples simulated per controller tick (i.e. one
+	// tick is modeled as one generate() call / one audio block).
+	static constexpr uint32_t kBufferSamples = 256;
+	static constexpr DjRate kRampStep = DJ_RATE_SCALE / kBufferSamples;
+
 	DjRate requestedRate = DJ_RATE_NEUTRAL;
+	DjRate currentRate = DJ_RATE_NEUTRAL;
+	uint64_t sourcePositionFrac = 0; // Q16.16 accumulator, mirrors sourcePosition
 
 	void setRate(DjRate rate){
 		if(rate < DJ_RATE_MIN) rate = DJ_RATE_MIN;
@@ -499,6 +520,30 @@ struct FaithfulSpeedModifierModel {
 		else if(nudged >= int64_t(DJ_RATE_MAX)) setRate(DJ_RATE_MAX);
 		else setRate(DjRate(nudged));
 	}
+
+	void advanceRate(){
+		if(currentRate < requestedRate){
+			DjRate remaining = requestedRate - currentRate;
+			currentRate += remaining < kRampStep ? remaining : kRampStep;
+		}else if(currentRate > requestedRate){
+			DjRate remaining = currentRate - requestedRate;
+			currentRate -= remaining < kRampStep ? remaining : kRampStep;
+		}
+	}
+
+	// Simulates one generate() call's worth of output samples: ramps
+	// currentRate toward requestedRate and accumulates source position one
+	// sample at a time, exactly as the real generate()/advanceRate() do.
+	// Returns the number of source frames actually consumed.
+	int64_t consumeSourceFrames(uint32_t outputSamples){
+		for(uint32_t i = 0; i < outputSamples; ++i){
+			advanceRate();
+			sourcePositionFrac += currentRate;
+		}
+		const int64_t consumed = int64_t(sourcePositionFrac >> 16);
+		sourcePositionFrac &= 0xffff;
+		return consumed;
+	}
 };
 
 // Regression for the applyRate/nudge persistence bug: DjSyncController used
@@ -506,9 +551,10 @@ struct FaithfulSpeedModifierModel {
 // the real SpeedModifier::setRate() unconditionally overwrites requestedRate,
 // that meant a nudge applied on tick N was silently erased by tick N+1's
 // baseline re-command, defeating phase convergence entirely. Drives the
-// controller through a faithful SpeedModifier model across multiple cooldown
-// windows and proves the correction persists/accumulates and converges
-// without oscillation or rate-command spam.
+// controller through a faithful SpeedModifier model (real ramp + fixed-point
+// accumulator, not a direct rate-to-frame subtraction) across multiple
+// cooldown windows and proves the correction persists/accumulates and
+// converges without oscillation or rate-command spam.
 static void testSyncNudgePersistsAndConverges(){
 	DjSyncController sync;
 	FaithfulSpeedModifierModel model;
@@ -528,21 +574,21 @@ static void testSyncNudgePersistsAndConverges(){
 	const DjRate baselineTarget = DJ_RATE_NEUTRAL; // equal BPM => 1.0x baseline, never changes
 	int64_t cumulativeNudge = 0;
 	uint32_t nudgeCount = 0;
+	int64_t lastNudgeMagnitude = INT64_MAX;
 
-	for(uint32_t tick = 0; tick < uint32_t(DJ_SYNC_NUDGE_COOLDOWN_TICKS) * 16; ++tick){
+	for(uint32_t tick = 0; tick < uint32_t(DJ_SYNC_NUDGE_COOLDOWN_TICKS) * 32; ++tick){
 		DjSyncOutputs out = sync.tick(in);
 		if(out.applyRate){
 			assert(out.targetRate == baselineTarget);
 			model.setRate(out.targetRate);
 		}
 		if(out.applyNudge){
+			const int64_t magnitude = out.nudgeAmount < 0 ? -int64_t(out.nudgeAmount) : int64_t(out.nudgeAmount);
+			assert(magnitude <= lastNudgeMagnitude); // strictly non-increasing: no oscillation/spam
+			lastNudgeMagnitude = magnitude;
 			model.nudgeRate(out.nudgeAmount);
 			cumulativeNudge += out.nudgeAmount;
 			++nudgeCount;
-			// Stand-in for the nudge's physical effect on playback phase; this
-			// self-check exercises the controller/rate-model interaction, not
-			// an audio-domain simulation.
-			in.followerPhaseFrames -= out.nudgeAmount;
 		}
 
 		// The critical regression check: once a baseline has been commanded,
@@ -553,6 +599,14 @@ static void testSyncNudgePersistsAndConverges(){
 			assert(int64_t(model.requestedRate) == int64_t(baselineTarget) + cumulativeNudge);
 		}
 
+		// Advance the follower's actual playback via the real ramp +
+		// fixed-point accumulator (one tick == one BUFFER_SAMPLES-sized audio
+		// block). Only the resulting extra/short source frames actually
+		// consumed relative to nominal (neutral-rate) playback are physically
+		// meaningful phase movement.
+		const int64_t consumed = model.consumeSourceFrames(FaithfulSpeedModifierModel::kBufferSamples);
+		in.followerPhaseFrames -= (consumed - int64_t(FaithfulSpeedModifierModel::kBufferSamples));
+
 		if(out.state == DJ_SYNC_LOCKED) break;
 	}
 
@@ -561,10 +615,13 @@ static void testSyncNudgePersistsAndConverges(){
 		uint64_t(in.followerPhaseFrames) <= DJ_SYNC_LOCK_TOLERANCE_FRAMES);
 	assert(sync.state() == DJ_SYNC_LOCKED); // converged, not oscillating/spamming forever
 
-	// Exact analytic result for this starting error/geometry: 13 nudges of
-	// strictly non-increasing magnitude (proving no oscillation), final
-	// phase error 49 frames (within the 64-frame lock tolerance).
-	assert(nudgeCount == 13);
+	// Exact result for this starting error/geometry, derived from the
+	// faithful ramp+accumulator model above (not a naive rate-to-frame
+	// analytic guess): 17 nudges of strictly non-increasing magnitude
+	// (proving no oscillation), final phase error 26 frames (within the
+	// 64-frame lock tolerance).
+	assert(nudgeCount == 17);
+	assert(in.followerPhaseFrames == 26);
 }
 
 int main(){
