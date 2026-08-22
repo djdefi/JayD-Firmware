@@ -391,6 +391,11 @@ void driveUntilCommandVisible(DjAssistEngine& engine, FakeActuator& actuator, co
 	DjAssistBoundaryHint boundary;
 	boundary.hasDownbeat = true;
 	boundary.downbeatFrame = 1000;
+	// This helper drives a transition all the way through, so the
+	// WAIT_BOUNDARY step must actually be allowed to advance - the specific
+	// "hasDownbeat true but not yet reached" waiting behaviour is covered
+	// separately by testTransitionWaitsForBoundaryStep().
+	boundary.reached = true;
 	for(uint16_t i = 0; i < maxTicks; i++){
 		if(engine.mode() != DJ_ASSIST_MODE_TRANSITION_ARMED && engine.mode() != DJ_ASSIST_MODE_TRANSITION_RUNNING) return;
 		engine.tick(actuator, guard, boundary);
@@ -554,6 +559,29 @@ void testTransitionManualOverride(){
 		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
 	}
+
+	// Manual mix override observed via the controller-set guard flag (a
+	// bounded scan of recent command results finding a non-system SET_MIX
+	// submitted after arming - see DjAssistBridge::detectManualMixOverride())
+	// must abort immediately. Unlike the plain mix-threshold check above,
+	// this one is NOT skipped once the crossfade step has been submitted -
+	// that is exactly the gap the review flagged (a manual override during
+	// an active programmatic ramp must not be silently overwritten by the
+	// next system tick).
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1);
+		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
+
+		DjAssistGuardSnapshot manualOverride = guard;
+		manualOverride.manualMixOverride = true;
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, manualOverride, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
 }
 
 void testTransitionRecordingConflictDuringRun(){
@@ -584,10 +612,24 @@ void testTransitionWaitsForBoundaryStep(){
 	assert(engine.plan().currentStep == 0); // still waiting, no boundary hint yet
 	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_RUNNING);
 
-	DjAssistBoundaryHint withPhrase;
-	withPhrase.hasPhrase = true;
-	withPhrase.phraseFrame = 4410;
-	engine.tick(actuator, guard, withPhrase);
+	// Regression for the review finding: a "next boundary exists" hint
+	// (hasPhrase/hasDownbeat true, as resolveBoundary() reports almost
+	// every tick once any grid exists) must NOT by itself advance the
+	// step - only `reached` (the playhead having actually arrived at the
+	// ONE captured target frame) may.
+	DjAssistBoundaryHint futureBoundaryNotReached;
+	futureBoundaryNotReached.hasPhrase = true;
+	futureBoundaryNotReached.phraseFrame = 4410;
+	futureBoundaryNotReached.reached = false;
+	for(int i = 0; i < 5; i++) engine.tick(actuator, guard, futureBoundaryNotReached);
+	assert(engine.plan().currentStep == 0); // still waiting - hasPhrase alone must not advance
+	assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_RUNNING);
+
+	DjAssistBoundaryHint reached;
+	reached.hasPhrase = true;
+	reached.phraseFrame = 4410;
+	reached.reached = true;
+	engine.tick(actuator, guard, reached);
 	assert(engine.plan().currentStep == 1); // advanced past WAIT_BOUNDARY
 }
 

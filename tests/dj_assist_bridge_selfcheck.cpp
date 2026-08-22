@@ -145,6 +145,103 @@ void testCrossfadeMixOverflowGuard(){
 	assert(computeCrossfadeMix(0, 0xFFFFFFFFFFFFFFFFULL, 32, 1) == 0);
 }
 
+// -- nextRollbackPhase: skips phases with nothing to undo, deterministic --
+
+void testNextRollbackPhaseFullSequence(){
+	// Every side effect was submitted: mix -> sync -> stop-deck -> done,
+	// never skipping a phase.
+	DjAssistRollbackPhase phase = DJ_ASSIST_ROLLBACK_IDLE;
+	phase = nextRollbackPhase(phase, /*crossfade*/true, /*sync*/true, /*startDeck*/true);
+	assert(phase == DJ_ASSIST_ROLLBACK_MIX);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, true, true);
+	assert(phase == DJ_ASSIST_ROLLBACK_SYNC);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_STOP_DECK, true, true, true);
+	assert(phase == DJ_ASSIST_ROLLBACK_STOP_DECK);
+	phase = nextRollbackPhase(DJ_ASSIST_ROLLBACK_DONE, true, true, true);
+	assert(phase == DJ_ASSIST_ROLLBACK_DONE);
+}
+
+void testNextRollbackPhaseSkipsUnsubmittedSteps(){
+	// Nothing was ever submitted (e.g. failed during WAIT_BOUNDARY, before
+	// any actuator action): every phase must be skipped straight to DONE -
+	// there is nothing to undo.
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, false) == DJ_ASSIST_ROLLBACK_DONE);
+
+	// Only the start-deck step was submitted (failed right after START_DECK,
+	// before LOCK_TEMPO/ENABLE_SYNC or CROSSFADE ever ran): mix and sync
+	// phases must both be skipped, landing directly on STOP_DECK.
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, false, false, true) == DJ_ASSIST_ROLLBACK_STOP_DECK);
+
+	// Mix (crossfade) was submitted but sync/start-deck were not (e.g. a
+	// tempoLock=false, startAtBoundary=false plan that failed mid-ramp):
+	// only the MIX phase runs, then falls straight to DONE.
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_IDLE, true, false, false) == DJ_ASSIST_ROLLBACK_MIX);
+	assert(nextRollbackPhase(DJ_ASSIST_ROLLBACK_SYNC, true, false, false) == DJ_ASSIST_ROLLBACK_DONE);
+}
+
+// -- evaluateCommandOutcome: exhaustive status -> outcome mapping ---------
+
+void testEvaluateCommandOutcomeMapping(){
+	assert(evaluateCommandOutcome(DJ_COMMAND_APPLIED) == DJ_ASSIST_COMMAND_DONE);
+	assert(evaluateCommandOutcome(DJ_COMMAND_REJECTED) == DJ_ASSIST_COMMAND_FAILED);
+	assert(evaluateCommandOutcome(DJ_COMMAND_FAILED) == DJ_ASSIST_COMMAND_FAILED);
+	assert(evaluateCommandOutcome(DJ_COMMAND_SUPERSEDED) == DJ_ASSIST_COMMAND_RESUBMIT);
+	assert(evaluateCommandOutcome(DJ_COMMAND_ACCEPTED) == DJ_ASSIST_COMMAND_WAIT);
+	assert(evaluateCommandOutcome(DJ_COMMAND_PENDING) == DJ_ASSIST_COMMAND_WAIT);
+}
+
+// -- detectManualMixOverride: bounded scan, watermark, origin/type gating -
+
+DjCommandResult makeResult(uint32_t id, DjCommandType type, DjCommandOrigin origin, DjCommandStatus status){
+	DjCommandResult result;
+	result.id = id;
+	result.type = type;
+	result.origin = origin;
+	result.status = status;
+	return result;
+}
+
+void testDetectManualMixOverrideFindsPostWatermarkNonSystemMix(){
+	DjCommandResult results[8] = {
+		makeResult(1, DJ_COMMAND_SET_MIX, DJ_ORIGIN_SYSTEM, DJ_COMMAND_APPLIED), // before watermark
+		makeResult(9, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED),   // after watermark, manual
+	};
+	assert(detectManualMixOverride(results, 2, /*watermarkId*/5));
+}
+
+void testDetectManualMixOverrideIgnoresSystemOrigin(){
+	// A system-origin SET_MIX after the watermark is the transition's own
+	// crossfade ramp, not a manual override.
+	DjCommandResult results[1] = {
+		makeResult(10, DJ_COMMAND_SET_MIX, DJ_ORIGIN_SYSTEM, DJ_COMMAND_ACCEPTED),
+	};
+	assert(!detectManualMixOverride(results, 1, 5));
+}
+
+void testDetectManualMixOverrideIgnoresPreWatermarkAndOtherTypes(){
+	DjCommandResult results[3] = {
+		makeResult(3, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // before watermark
+		makeResult(11, DJ_COMMAND_SET_PLAYING, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // wrong type
+		makeResult(0, DJ_COMMAND_SET_MIX, DJ_ORIGIN_HTTP, DJ_COMMAND_APPLIED), // id 0 == empty slot
+	};
+	assert(!detectManualMixOverride(results, 3, 5));
+}
+
+void testDetectManualMixOverrideIgnoresRejected(){
+	// A rejected manual mix command never actually took effect - it must
+	// not itself count as an override.
+	DjCommandResult results[1] = {
+		makeResult(9, DJ_COMMAND_SET_MIX, DJ_ORIGIN_PHYSICAL, DJ_COMMAND_REJECTED),
+	};
+	assert(!detectManualMixOverride(results, 1, 5));
+}
+
+void testDetectManualMixOverrideHandlesNullAndEmpty(){
+	assert(!detectManualMixOverride(nullptr, 0, 0));
+	DjCommandResult empty[8] = {};
+	assert(!detectManualMixOverride(empty, 8, 0));
+}
+
 } // namespace
 
 int main(){
@@ -154,5 +251,13 @@ int main(){
 	testCrossfadeMixEndpoints();
 	testCrossfadeMixCheckedDivideByZero();
 	testCrossfadeMixOverflowGuard();
+	testNextRollbackPhaseFullSequence();
+	testNextRollbackPhaseSkipsUnsubmittedSteps();
+	testEvaluateCommandOutcomeMapping();
+	testDetectManualMixOverrideFindsPostWatermarkNonSystemMix();
+	testDetectManualMixOverrideIgnoresSystemOrigin();
+	testDetectManualMixOverrideIgnoresPreWatermarkAndOtherTypes();
+	testDetectManualMixOverrideIgnoresRejected();
+	testDetectManualMixOverrideHandlesNullAndEmpty();
 	return 0;
 }

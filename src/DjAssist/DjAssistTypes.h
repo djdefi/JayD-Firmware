@@ -18,7 +18,17 @@ static const uint8_t DJ_ASSIST_MAX_SUGGESTIONS = 5;
 // this header free of Arduino/FS dependencies.
 static const uint16_t DJ_ASSIST_MAX_INDEX_ENTRIES = 4096;
 static const uint8_t DJ_ASSIST_MAX_RECENT_TRACKS = 16;
+// Scoring-scan budget: pure CPU comparisons over the already-cached
+// entries_[] table (no I/O), so a larger per-tick budget is cheap and
+// bounded.
 static const uint16_t DJ_ASSIST_DEFAULT_SCAN_BUDGET = 256;
+// Candidate-table FILL budget: this is a genuine, possibly-SD-backed
+// metadata read per record (DjSession::assistTrackEntry() ->
+// JaydMetadata::trackByIndex()). Must stay tiny and bounded so filling the
+// table is spread across many DjSession::loop() ticks instead of a
+// synchronous multi-hundred-record burst inside the audio/session loop
+// while decks are playing.
+static const uint16_t DJ_ASSIST_FILL_RECORDS_PER_TICK = 1;
 static const uint8_t DJ_ASSIST_MAX_TRANSITION_STEPS = 8;
 
 // Fixed-point rate, 1000 == 1.0x deck rate.
@@ -116,11 +126,26 @@ struct DjAssistDeckContext {
 // Caller-resolved boundary hint. The assist layer never reads Grid/Phrase
 // records itself; the caller resolves these once (e.g. from DjSession's
 // already-bounded copyGrid/copyPhrase) and passes the result in.
+//
+// hasDownbeat/hasPhrase/*Frame describe the NEXT upcoming boundary from the
+// current playhead position - useful for Coach's "here's the next safe
+// window" advice, but they are recomputed every tick and are therefore
+// almost always true (there is nearly always *some* future boundary). They
+// must never be read as "the boundary has arrived".
+//
+// `reached` is the only field a WAIT_BOUNDARY transition step may use to
+// decide whether to advance: it is true exactly once the playhead has
+// actually reached (or passed, within the caller's bounded tolerance) the
+// ONE specific boundary frame the caller latched when this wait began - see
+// DjAssistController::resolveWaitBoundaryReached()'s capture-once-then-
+// compare logic. It stays false for every tick before that, no matter how
+// soon a next boundary exists.
 struct DjAssistBoundaryHint {
 	bool hasDownbeat = false;
 	uint64_t downbeatFrame = 0;
 	bool hasPhrase = false;
 	uint64_t phraseFrame = 0;
+	bool reached = false;
 };
 
 struct DjAssistCoachAdvice {
@@ -140,7 +165,11 @@ enum DjAssistTransitionAction : uint8_t {
 	DJ_ASSIST_ACTION_ENABLE_SYNC,
 	DJ_ASSIST_ACTION_CROSSFADE,
 	DJ_ASSIST_ACTION_STOP_DECK,
-	DJ_ASSIST_ACTION_RELEASE_SYNC
+	DJ_ASSIST_ACTION_RELEASE_SYNC,
+	// Exact one-shot mix value (step.param = target mix, 0-255). Never part
+	// of buildSteps()'s forward plan - only used by the controller-owned
+	// rollback path to restore the pre-transition mix.
+	DJ_ASSIST_ACTION_SET_MIX
 };
 
 struct DjAssistTransitionStep {
@@ -203,6 +232,14 @@ struct DjAssistGuardSnapshot {
 	// can detect a target-deck swap (re-load or deck-swap) before acting on
 	// an unconfirmed track. Only meaningful when deckLoaded[deck] is true.
 	DjTrackIdentity deckIdentity[DJ_DECK_COUNT] = {};
+	// True when the caller's bounded scan of recent command results found a
+	// mix command from a non-system origin (physical/browser) submitted
+	// since the transition armed. Set only by the controller (see
+	// DjAssistBridge::detectManualMixOverride()); the engine never inspects
+	// command history itself. A programmatic crossfade must not silently
+	// overwrite this - guardOk() fails the transition immediately when
+	// this is true.
+	bool manualMixOverride = false;
 };
 
 #endif

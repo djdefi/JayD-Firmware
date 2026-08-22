@@ -2,6 +2,7 @@
 #define JAYD_FIRMWARE_DJASSISTCONTROLLER_H
 
 #include "DjAssistEngine.h"
+#include "DjAssistSessionBridge.h"
 
 class DjSession;
 
@@ -105,6 +106,27 @@ private:
 	uint64_t phraseHintFrame_ = 0;
 	bool phraseHintValid_ = false;
 
+	// WAIT_BOUNDARY capture-once state: the ONE target frame latched the
+	// first tick this step becomes current, compared against the live
+	// playhead every subsequent tick (see resolveWaitBoundaryReached()).
+	// Reset whenever a new transition is armed/cancelled so a later
+	// transition never reuses a stale target from a previous one.
+	bool waitBoundaryCaptured_ = false;
+	uint64_t waitBoundaryTargetFrame_ = 0;
+
+	// Highest command result id observed at the moment the current
+	// transition armed. Any SET_MIX result with id above this and a
+	// non-system origin is a manual override that happened after arming -
+	// see DjAssistBridge::detectManualMixOverride().
+	uint32_t armWatermarkId_ = 0;
+
+	// Controller-owned rollback state (see tickRollback()): advances one
+	// bounded actuator submit/poll per tick, exactly mirroring the forward
+	// step machine, restoring only side effects this plan itself applied.
+	DjAssistBridge::DjAssistRollbackPhase rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_IDLE;
+	bool rollbackSubmitted_ = false;
+	uint32_t rollbackCommandId_ = 0;
+
 	DjAssistCoachAdvice lastAdvice_ = {};
 
 	void refreshCandidateTable();
@@ -112,8 +134,10 @@ private:
 	DjAssistGuardSnapshot buildGuard(const DjSnapshot& snapshot) const;
 	DjAssistDeckContext buildDeckContext(const DjSnapshot& snapshot, uint8_t deck) const;
 	bool resolveBoundary(const DjSnapshot& snapshot, uint8_t deck, DjAssistBoundaryHint& hint);
+	bool resolveWaitBoundaryReached(const DjSnapshot& snapshot, uint8_t deck);
 	void tickSuggestions(const DjSnapshot& snapshot);
 	void tickTransition(const DjSnapshot& snapshot);
+	void tickRollback();
 };
 
 #endif

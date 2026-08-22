@@ -54,6 +54,58 @@ uint8_t computeCrossfadeMix(
 	uint32_t bpmMilli
 );
 
+// Rollback phases for a failed/cancelled one-shot transition, owned by the
+// controller (not the pure DjAssistEngine) - see
+// DjAssistController::tickRollback(). Ordered mix -> sync -> stop-deck,
+// matching the review's required undo order.
+enum DjAssistRollbackPhase : uint8_t {
+	DJ_ASSIST_ROLLBACK_IDLE,
+	DJ_ASSIST_ROLLBACK_MIX,
+	DJ_ASSIST_ROLLBACK_SYNC,
+	DJ_ASSIST_ROLLBACK_STOP_DECK,
+	DJ_ASSIST_ROLLBACK_DONE
+};
+
+// Given the current rollback phase and which of this plan's side effects
+// were actually submitted (crossfade/sync/start-deck steps), returns the
+// next phase to attempt - skipping any phase with nothing to undo. Pure and
+// deterministic; the caller does the actual actuator submit/poll for
+// whichever phase this returns and re-normalizes after each completed
+// phase.
+DjAssistRollbackPhase nextRollbackPhase(
+	DjAssistRollbackPhase phase,
+	bool crossfadeSubmitted,
+	bool syncSubmitted,
+	bool startDeckSubmitted
+);
+
+// Outcome of polling a single in-flight command's status - used by both the
+// crossfade actuator's final-mix confirmation and the rollback state
+// machine so the same status->outcome mapping isn't duplicated.
+// DJ_COMMAND_APPLIED -> DONE, REJECTED/FAILED -> FAILED, SUPERSEDED ->
+// RESUBMIT (bounded retry - e.g. a rollback mix command overtaken by
+// unrelated traffic), anything else (ACCEPTED, or not yet observed) ->
+// WAIT.
+enum DjAssistCommandOutcome : uint8_t {
+	DJ_ASSIST_COMMAND_WAIT,
+	DJ_ASSIST_COMMAND_RESUBMIT,
+	DJ_ASSIST_COMMAND_DONE,
+	DJ_ASSIST_COMMAND_FAILED
+};
+DjAssistCommandOutcome evaluateCommandOutcome(DjCommandStatus status);
+
+// True when a bounded scan of the most recent command results (the
+// existing DJ_RECENT_RESULT_COUNT ring, never a fresh history scan) finds a
+// SET_MIX command from a non-system origin (physical/browser) with an id
+// greater than `watermarkId` - i.e. submitted after the transition armed.
+// A programmatic crossfade must not silently overwrite this on its next
+// ramp tick; see DjAssistGuardSnapshot::manualMixOverride.
+bool detectManualMixOverride(
+	const DjCommandResult* recentResults,
+	uint8_t resultCount,
+	uint32_t watermarkId
+);
+
 } // namespace DjAssistBridge
 
 #endif

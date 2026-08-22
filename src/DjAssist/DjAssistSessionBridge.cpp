@@ -85,4 +85,50 @@ uint8_t computeCrossfadeMix(
 	return toDeck == 0 ? uint8_t(255 - curve) : curve;
 }
 
+DjAssistRollbackPhase nextRollbackPhase(
+	DjAssistRollbackPhase phase,
+	bool crossfadeSubmitted,
+	bool syncSubmitted,
+	bool startDeckSubmitted
+){
+	if(phase == DJ_ASSIST_ROLLBACK_IDLE) phase = DJ_ASSIST_ROLLBACK_MIX;
+	if(phase == DJ_ASSIST_ROLLBACK_MIX && !crossfadeSubmitted) phase = DJ_ASSIST_ROLLBACK_SYNC;
+	if(phase == DJ_ASSIST_ROLLBACK_SYNC && !syncSubmitted) phase = DJ_ASSIST_ROLLBACK_STOP_DECK;
+	if(phase == DJ_ASSIST_ROLLBACK_STOP_DECK && !startDeckSubmitted) phase = DJ_ASSIST_ROLLBACK_DONE;
+	return phase;
+}
+
+DjAssistCommandOutcome evaluateCommandOutcome(DjCommandStatus status){
+	switch(status){
+		case DJ_COMMAND_APPLIED:
+			return DJ_ASSIST_COMMAND_DONE;
+		case DJ_COMMAND_REJECTED:
+		case DJ_COMMAND_FAILED:
+			return DJ_ASSIST_COMMAND_FAILED;
+		case DJ_COMMAND_SUPERSEDED:
+			return DJ_ASSIST_COMMAND_RESUBMIT;
+		case DJ_COMMAND_ACCEPTED:
+		case DJ_COMMAND_PENDING:
+		default:
+			return DJ_ASSIST_COMMAND_WAIT;
+	}
+}
+
+bool detectManualMixOverride(
+	const DjCommandResult* recentResults,
+	uint8_t resultCount,
+	uint32_t watermarkId
+){
+	if(!recentResults) return false;
+	for(uint8_t i = 0; i < resultCount; ++i){
+		const DjCommandResult& result = recentResults[i];
+		if(result.id == 0 || result.id <= watermarkId) continue;
+		if(result.type != DJ_COMMAND_SET_MIX) continue;
+		if(result.origin == DJ_ORIGIN_SYSTEM) continue;
+		if(result.status == DJ_COMMAND_REJECTED) continue;
+		return true;
+	}
+	return false;
+}
+
 } // namespace DjAssistBridge

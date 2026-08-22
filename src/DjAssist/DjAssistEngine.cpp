@@ -193,6 +193,15 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
+	// Checked regardless of crossfadeSubmitted: once the ramp begins, mix
+	// legitimately moves away from armedMix, so the plain threshold check
+	// below is skipped - but a manual (non-system) mix command observed
+	// during that same window must still abort rather than let the next
+	// programmatic ramp tick silently overwrite it.
+	if(guard.manualMixOverride){
+		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
+		return false;
+	}
 	if(!crossfadeSubmitted && absDiff(guard.mix, plan_.armedMix) > MIX_OVERRIDE_THRESHOLD){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
@@ -229,7 +238,12 @@ void DjAssistEngine::tick(DjAssistActuator& actuator, const DjAssistGuardSnapsho
 	DjAssistTransitionStep& step = plan_.steps[plan_.currentStep];
 
 	if(step.action == DJ_ASSIST_ACTION_WAIT_BOUNDARY){
-		if(!boundary.hasPhrase && !boundary.hasDownbeat) return;
+		// Only `reached` (the playhead having actually arrived at the one
+		// captured target boundary) may advance this step - hasPhrase/
+		// hasDownbeat describe a perpetually-recomputed *next* boundary
+		// and are true almost every tick, which previously made this step
+		// advance immediately instead of waiting.
+		if(!boundary.reached) return;
 		step.submitted = true;
 		step.applied = true;
 		plan_.currentStep++;

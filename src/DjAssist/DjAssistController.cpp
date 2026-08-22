@@ -13,15 +13,17 @@ namespace {
 // map directly to setPlaying(); LOCK_TEMPO and ENABLE_SYNC are two separate
 // engine steps but both resolve to the same idempotent setSync(deck, true,
 // ...) call (re-arming an already-armed deck is a harmless no-op in
-// DjSession::apply()); RELEASE_SYNC maps to setSync(deck, false, ...).
-// CROSSFADE has no single DjCommand - it's a continuous ramp driven by
-// repeated, supersedable DJ_COMMAND_SET_MIX submissions each poll, tracked
-// under a locally-issued pseudo command id disjoint from real DjCommand
-// ids. Completion of the crossfade is detected from
-// DjAssistBridge::computeCrossfadeMix() itself reaching the exact target
-// endpoint (0 or 255), which it only ever returns once the ramp has fully
-// elapsed (see computeCrossfadeMix()/crossfadeCurve()'s saturation
-// behaviour) - never partway through a legitimate ramp step.
+// DjSession::apply()); RELEASE_SYNC maps to setSync(deck, false, ...);
+// SET_MIX (rollback-only) is a single exact-value setMix() tracked like any
+// other real DjCommand. CROSSFADE has no single DjCommand up front - it's a
+// continuous ramp driven by repeated, supersedable DJ_COMMAND_SET_MIX
+// submissions each poll (intermediate values are fire-and-forget; their
+// supersession by the next ramp tick is normal). Completion is NOT inferred
+// from the computed ramp value alone: once DjAssistBridge::computeCrossfadeMix()
+// reaches the target endpoint, the actuator submits that exact value as the
+// one *tracked* final command and only reports APPLIED once DjSession
+// confirms it (REJECTED/FAILED -> failed; SUPERSEDED -> resubmit once more,
+// e.g. if unrelated traffic raced it out of the queue).
 class DjAssistSessionActuator : public DjAssistActuator {
 public:
 	explicit DjAssistSessionActuator(DjSession* session) : session_(session){
@@ -44,6 +46,10 @@ public:
 				return acceptedResult(session_->setPlaying(step.deck, false, DJ_ORIGIN_SYSTEM), outCommandId);
 			case DJ_ASSIST_ACTION_RELEASE_SYNC:
 				return acceptedResult(session_->setSync(step.deck, false, -1, DJ_ORIGIN_SYSTEM), outCommandId);
+			case DJ_ASSIST_ACTION_SET_MIX: {
+				const uint8_t mixValue = step.param > 255 ? 255 : uint8_t(step.param);
+				return acceptedResult(session_->setMix(mixValue, DJ_ORIGIN_SYSTEM), outCommandId);
+			}
 			case DJ_ASSIST_ACTION_WAIT_BOUNDARY:
 				break; // engine never submits this action to the actuator.
 		}
@@ -52,7 +58,30 @@ public:
 
 	DjCommandStatus poll(uint32_t commandId) const override{
 		if(commandId >= CrossfadeIdBase) return pollCrossfade(commandId);
+		return lookupStatus(commandId);
+	}
 
+private:
+	static const uint32_t CrossfadeIdBase = 0x80000000UL;
+
+	DjSession* session_;
+	uint32_t crossfadeId_ = CrossfadeIdBase;
+	uint8_t crossfadeToDeck_ = 0;
+	uint8_t crossfadeBeats_ = 16;
+	uint64_t crossfadeStartMicros_ = 0;
+	// True once the ramp's exact endpoint value has been submitted as a
+	// single tracked command (crossfadeFinalCommandId_); before that,
+	// intermediate ramp ticks are fire-and-forget.
+	mutable bool crossfadeFinalSubmitted_ = false;
+	mutable uint32_t crossfadeFinalCommandId_ = 0;
+
+	static bool acceptedResult(const DjSubmitResult& result, uint32_t& outCommandId){
+		if(result.status == DJ_COMMAND_REJECTED) return false;
+		outCommandId = result.id;
+		return true;
+	}
+
+	DjCommandStatus lookupStatus(uint32_t commandId) const{
 		DjSnapshot snapshot;
 		session_->copySnapshot(snapshot);
 		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; ++i){
@@ -67,36 +96,39 @@ public:
 		return DJ_COMMAND_PENDING;
 	}
 
-private:
-	static const uint32_t CrossfadeIdBase = 0x80000000UL;
-
-	DjSession* session_;
-	uint32_t crossfadeId_ = CrossfadeIdBase;
-	uint8_t crossfadeToDeck_ = 0;
-	uint8_t crossfadeBeats_ = 16;
-	uint64_t crossfadeStartMicros_ = 0;
-	mutable bool crossfadeDone_ = false;
-
-	static bool acceptedResult(const DjSubmitResult& result, uint32_t& outCommandId){
-		if(result.status == DJ_COMMAND_REJECTED) return false;
-		outCommandId = result.id;
-		return true;
-	}
-
 	bool beginCrossfade(const DjAssistTransitionStep& step, uint32_t& outCommandId){
 		if(crossfadeId_ == 0xFFFFFFFFUL) crossfadeId_ = CrossfadeIdBase; // guard wrap (never reached in practice)
 		++crossfadeId_;
 		crossfadeToDeck_ = step.deck;
 		crossfadeBeats_ = (step.param > 0 && step.param <= 255) ? uint8_t(step.param) : 16;
 		crossfadeStartMicros_ = micros();
-		crossfadeDone_ = false;
+		crossfadeFinalSubmitted_ = false;
+		crossfadeFinalCommandId_ = 0;
 		outCommandId = crossfadeId_;
 		return true;
 	}
 
 	DjCommandStatus pollCrossfade(uint32_t commandId) const{
 		if(commandId != crossfadeId_) return DJ_COMMAND_FAILED;
-		if(crossfadeDone_) return DJ_COMMAND_APPLIED;
+
+		if(crossfadeFinalSubmitted_){
+			const DjCommandStatus status = lookupStatus(crossfadeFinalCommandId_);
+			switch(DjAssistBridge::evaluateCommandOutcome(status)){
+				case DjAssistBridge::DJ_ASSIST_COMMAND_DONE:
+					return DJ_COMMAND_APPLIED;
+				case DjAssistBridge::DJ_ASSIST_COMMAND_FAILED:
+					return DJ_COMMAND_FAILED;
+				case DjAssistBridge::DJ_ASSIST_COMMAND_RESUBMIT:
+					// Overtaken by unrelated mix traffic before we saw it
+					// applied - fall through and resubmit the exact
+					// endpoint value once more below.
+					crossfadeFinalSubmitted_ = false;
+					break;
+				case DjAssistBridge::DJ_ASSIST_COMMAND_WAIT:
+				default:
+					return DJ_COMMAND_PENDING;
+			}
+		}
 
 		DjSnapshot snapshot;
 		session_->copySnapshot(snapshot);
@@ -105,13 +137,20 @@ private:
 		const uint8_t mixValue = DjAssistBridge::computeCrossfadeMix(
 			crossfadeToDeck_, elapsedMicros, crossfadeBeats_, bpmMilli
 		);
-		session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
-
 		const uint8_t targetEndpoint = crossfadeToDeck_ == 0 ? 0 : 255;
+
 		if(mixValue == targetEndpoint){
-			crossfadeDone_ = true;
-			return DJ_COMMAND_APPLIED;
+			const DjSubmitResult result = session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
+			if(result.status != DJ_COMMAND_REJECTED){
+				crossfadeFinalSubmitted_ = true;
+				crossfadeFinalCommandId_ = result.id;
+			}
+			// Rejected: retry next tick without marking submitted.
+			return DJ_COMMAND_PENDING;
 		}
+
+		// Intermediate ramp value: fire-and-forget, superseded freely.
+		session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
 		return DJ_COMMAND_PENDING;
 	}
 };
@@ -163,8 +202,16 @@ void DjAssistController::refreshCandidateTable(){
 	const uint16_t cappedTotal = rawTotal > entryCapacity_ ? entryCapacity_ : uint16_t(rawTotal);
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
 
+	// DJ_ASSIST_FILL_RECORDS_PER_TICK is deliberately tiny (not
+	// DJ_ASSIST_DEFAULT_SCAN_BUDGET): each iteration is a real, possibly
+	// SD-backed metadata read (assistTrackEntry() ->
+	// JaydMetadata::trackByIndex()), unlike the scoring scan below which
+	// only touches the already-cached PSRAM entries_[] table. Populating
+	// up to DJ_ASSIST_MAX_INDEX_ENTRIES this way is spread across many
+	// DjSession::loop() ticks instead of a synchronous multi-record burst
+	// while decks are playing.
 	uint16_t filled = 0;
-	while(fillCursor_ < cappedTotal && filled < DJ_ASSIST_DEFAULT_SCAN_BUDGET){
+	while(fillCursor_ < cappedTotal && filled < DJ_ASSIST_FILL_RECORDS_PER_TICK){
 		DjAssistLibraryEntry entry;
 		if(!session_->assistTrackEntry(fillCursor_, entry)){
 			// Missing/unreadable record: still occupies a slot (so indices
@@ -241,6 +288,12 @@ DjAssistGuardSnapshot DjAssistController::buildGuard(const DjSnapshot& snapshot)
 		guard.rateMilli[d] = uint32_t((uint64_t(snapshot.decks[d].sync.targetRate) * 1000ULL) / DJ_RATE_SCALE);
 		guard.deckIdentity[d] = snapshot.decks[d].identity;
 	}
+	// Only meaningful once a transition has armed and set armWatermarkId_
+	// (see armTransition()); before that it stays 0, so this scan simply
+	// finds nothing relevant to a not-yet-existing plan.
+	guard.manualMixOverride = DjAssistBridge::detectManualMixOverride(
+		snapshot.recentResults, DJ_RECENT_RESULT_COUNT, armWatermarkId_
+	);
 	return guard;
 }
 
@@ -321,6 +374,28 @@ void DjAssistController::tickSuggestions(const DjSnapshot& snapshot){
 	}
 }
 
+// Capture-once-then-compare arrival check for the WAIT_BOUNDARY transition
+// step. The first tick this step is current, latches ONE target boundary
+// frame (prefer phrase, matching Coach's own preference, else the next
+// downbeat); every subsequent tick just compares the live playhead against
+// that fixed target - never re-derives a fresh "next" boundary, which would
+// always be some future frame and therefore never actually "arrive". No
+// SD-read cost beyond what resolveBoundary() already spends once per
+// capture (phrase lookups stay throttled by its own cache).
+bool DjAssistController::resolveWaitBoundaryReached(const DjSnapshot& snapshot, uint8_t deck){
+	if(!session_ || deck >= DJ_DECK_COUNT || !snapshot.decks[deck].loaded) return false;
+
+	if(!waitBoundaryCaptured_){
+		DjAssistBoundaryHint fresh;
+		if(!resolveBoundary(snapshot, deck, fresh)) return false; // no grid yet - retry next tick.
+		waitBoundaryTargetFrame_ = fresh.hasPhrase ? fresh.phraseFrame : fresh.downbeatFrame;
+		waitBoundaryCaptured_ = true;
+	}
+
+	const uint64_t currentFrame = session_->deckElapsedFrames(deck);
+	return currentFrame >= waitBoundaryTargetFrame_;
+}
+
 void DjAssistController::tickTransition(const DjSnapshot& snapshot){
 	if(!actuator_) return;
 	const DjAssistMode mode = engine_.mode();
@@ -335,9 +410,90 @@ void DjAssistController::tickTransition(const DjSnapshot& snapshot){
 		// deck (fromDeck), matching Coach's own "next safe window" advice;
 		// the step's `deck` field (toDeck) only tags which deck is being
 		// prepared, not which grid the wait is measured against.
-		resolveBoundary(snapshot, p.fromDeck, hint);
+		hint.reached = resolveWaitBoundaryReached(snapshot, p.fromDeck);
 	}
 	engine_.tick(*actuator_, guard, hint);
+}
+
+namespace {
+bool planStepSubmitted(const DjAssistTransitionPlan& plan, DjAssistTransitionAction action){
+	for(uint8_t i = 0; i < plan.stepCount; ++i){
+		if(plan.steps[i].action == action) return plan.steps[i].submitted;
+	}
+	return false;
+}
+} // namespace
+
+// Bounded rollback for a terminally-failed/cancelled transition: undoes
+// only the side effects THIS plan itself submitted (mix/sync/started-deck),
+// in mix -> sync -> stop-deck order, one actuator submit/poll per tick,
+// waiting for each command's real applied/failed/superseded result before
+// advancing (never assumes success from elapsed time). Deliberately never
+// attempts to restart fromDeck once STOP_DECK has run - by that point the
+// transition is essentially complete and un-stopping the new deck would be
+// more disruptive than leaving it playing.
+void DjAssistController::tickRollback(){
+	if(!actuator_) return;
+	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return;
+	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
+
+	const DjAssistTransitionPlan& p = engine_.plan();
+	const bool crossfadeSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_CROSSFADE);
+	const bool syncSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_LOCK_TEMPO) ||
+		planStepSubmitted(p, DJ_ASSIST_ACTION_ENABLE_SYNC);
+	const bool startDeckSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_START_DECK);
+
+	rollbackPhase_ = DjAssistBridge::nextRollbackPhase(
+		rollbackPhase_, crossfadeSubmitted, syncSubmitted, startDeckSubmitted
+	);
+	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
+
+	DjAssistTransitionStep step;
+	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_MIX){
+		step.action = DJ_ASSIST_ACTION_SET_MIX;
+		step.deck = p.fromDeck;
+		step.param = p.armedMix;
+	}else if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_SYNC){
+		step.action = DJ_ASSIST_ACTION_RELEASE_SYNC;
+		step.deck = p.toDeck;
+	}else{ // DJ_ASSIST_ROLLBACK_STOP_DECK
+		step.action = DJ_ASSIST_ACTION_STOP_DECK;
+		step.deck = p.toDeck;
+	}
+
+	if(!rollbackSubmitted_){
+		uint32_t commandId = 0;
+		if(actuator_->submit(step, commandId)){
+			rollbackCommandId_ = commandId;
+			rollbackSubmitted_ = true;
+		}
+		// Rejected: retry the same bounded submit next tick.
+		return;
+	}
+
+	switch(DjAssistBridge::evaluateCommandOutcome(actuator_->poll(rollbackCommandId_))){
+		case DjAssistBridge::DJ_ASSIST_COMMAND_DONE:
+			rollbackSubmitted_ = false;
+			if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_MIX){
+				rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_SYNC;
+			}else if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_SYNC){
+				rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_STOP_DECK;
+			}else{
+				rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE;
+			}
+			break;
+		case DjAssistBridge::DJ_ASSIST_COMMAND_RESUBMIT:
+			rollbackSubmitted_ = false; // retry this same phase next tick.
+			break;
+		case DjAssistBridge::DJ_ASSIST_COMMAND_FAILED:
+			// No further automated recovery is safe to attempt here (undoing
+			// an undo is out of scope); stop rather than spin forever.
+			rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE;
+			break;
+		case DjAssistBridge::DJ_ASSIST_COMMAND_WAIT:
+		default:
+			break; // keep waiting.
+	}
 }
 
 void DjAssistController::tick(){
@@ -350,6 +506,7 @@ void DjAssistController::tick(){
 	updateRecentTracks(snapshot);
 	if(fillComplete_) tickSuggestions(snapshot);
 	tickTransition(snapshot);
+	tickRollback();
 }
 
 bool DjAssistController::setCoachEnabled(bool enabled){
@@ -370,9 +527,22 @@ bool DjAssistController::armTransition(
 	DjSnapshot snapshot;
 	session_->copySnapshot(snapshot);
 	const DjAssistGuardSnapshot guard = buildGuard(snapshot);
-	return engine_.armTransition(
+	const bool armed = engine_.armTransition(
 		fromDeck, toDeck, libraryIndex, targetIdentity, crossfadeBeats, startAtBoundary, tempoLock, guard
 	);
+	// A fresh plan must never reuse a WAIT_BOUNDARY target or rollback
+	// state latched by a previous transition (cancelled/failed/completed).
+	if(armed){
+		waitBoundaryCaptured_ = false;
+		rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_IDLE;
+		rollbackSubmitted_ = false;
+		uint32_t maxId = 0;
+		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; ++i){
+			if(snapshot.recentResults[i].id > maxId) maxId = snapshot.recentResults[i].id;
+		}
+		armWatermarkId_ = maxId;
+	}
+	return armed;
 }
 
 void DjAssistController::cancelTransition(){
