@@ -93,11 +93,17 @@ public:
 	uint32_t trackCount() const;
 
 	Status trackByIndex(uint32_t index, Track& track);
-	Status trackByPath(const char* normalizedPath, Track& track, const uint8_t* expectedFingerprint = nullptr);
+	Status trackByPath(
+		const char* normalizedPath,
+		Track& track,
+		const uint8_t* expectedFingerprint = nullptr,
+		const uint8_t* expectedSourceId = nullptr
+	);
 	Status trackByFingerprint(const uint8_t fingerprint[16], Track& track);
 	Status trackBySourceId(const uint8_t sourceId[16], Track& track);
 
 	bool readString(uint32_t offset, char* output, size_t capacity);
+	bool readStringHash(uint32_t offset, uint32_t& hash);
 	bool readCue(const Track& track, uint32_t relativeIndex, Cue& cue);
 	bool readGrid(const Track& track, uint32_t relativeIndex, Grid& grid);
 	bool readPhrase(const Track& track, uint32_t relativeIndex, Phrase& phrase);

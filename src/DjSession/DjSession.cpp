@@ -8,6 +8,17 @@
 DjSession* DjSession::instance = nullptr;
 uint64_t DjSession::bootId = 0;
 uint32_t DjSession::sessionCounter = 0;
+static const char* metadataPath = "/library.jydm";
+
+static uint64_t metadataIdentity(fs::File& file){
+	if(!file) return 0;
+	uint64_t key = file.size();
+	uint8_t crc[4] = {};
+	if(file.size() >= 48 && file.seek(44) && file.read(crc, sizeof(crc)) == sizeof(crc)){
+		for(uint8_t byte : crc) key = (key ^ byte) * 1099511628211ULL;
+	}
+	return key;
+}
 
 DjSession* DjSession::begin(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix){
 	if(instance) return instance;
@@ -75,11 +86,21 @@ DjSubmitResult DjSession::submit(DjCommand command){
 	return { command.id, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
 }
 
-DjSubmitResult DjSession::loadDeck(uint8_t deck, const char* path, DjCommandOrigin origin){
+DjSubmitResult DjSession::loadDeck(
+	uint8_t deck,
+	const char* path,
+	DjCommandOrigin origin,
+	const DjTrackIdentity* identity
+){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_LOAD_DECK;
 	command.deck = deck;
+	metadataMutex.lock();
+	command.libraryGeneration = libraryGeneration;
+	command.libraryKey = libraryKey;
+	metadataMutex.unlock();
+	if(identity) command.trackIdentity = *identity;
 	if(path){
 		const size_t length = strlen(path);
 		if(length < DJ_PATH_CAPACITY) memcpy(command.path, path, length + 1);
@@ -193,6 +214,215 @@ bool DjSession::hasPendingLoad(){
 	return found;
 }
 
+bool DjSession::libraryWorkAllowed(){
+	commandMutex.lock();
+	const bool playbackChangePending =
+		commandQueue.contains(DJ_COMMAND_LOAD_DECK) ||
+		commandQueue.contains(DJ_COMMAND_SET_PLAYING) ||
+		commandQueue.contains(DJ_COMMAND_SET_RECORDING);
+	commandMutex.unlock();
+	if(playbackChangePending) return false;
+
+	DjSnapshot snapshot;
+	copySnapshot(snapshot);
+	return djAllowsLibraryWork(snapshot);
+}
+
+DjMetadataState DjSession::metadataState(JaydMetadata::Status status){
+	switch(status){
+		case JaydMetadata::Status::Ready: return DJ_METADATA_VALID;
+		case JaydMetadata::Status::Stale: return DJ_METADATA_STALE;
+		case JaydMetadata::Status::Corrupt: return DJ_METADATA_CORRUPT;
+		case JaydMetadata::Status::Unsupported: return DJ_METADATA_UNSUPPORTED;
+		case JaydMetadata::Status::Missing: return DJ_METADATA_ABSENT;
+	}
+	return DJ_METADATA_CORRUPT;
+}
+
+DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t key){
+	metadataMutex.lock();
+	fs::File file = SD.open(metadataPath);
+	const uint64_t fileKey = metadataIdentity(file);
+	if(metadataInitialized && libraryGeneration == generation &&
+	   libraryKey == key && metadataFileKey == fileKey){
+		file.close();
+		const DjMetadataState state = metadataState(metadataReaderStatus);
+		metadataMutex.unlock();
+		return state;
+	}
+	const bool hadAssociation[DJ_DECK_COUNT] = {
+		deckMetadata[0].attached(),
+		deckMetadata[1].attached()
+	};
+	metadataReader.close();
+	metadataReaderStatus = metadataReader.open(file);
+	libraryGeneration = generation;
+	libraryKey = key;
+	metadataFileKey = fileKey;
+	metadataInitialized = true;
+
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		DjMetadataState state = DJ_METADATA_ABSENT;
+		if(system && system->hasChannel(deck)){
+			state = hadAssociation[deck] || metadataReaderStatus == JaydMetadata::Status::Ready
+				? DJ_METADATA_STALE
+				: metadataState(metadataReaderStatus);
+		}
+		deckMetadata[deck].invalidate(state, generation);
+	}
+	const DjMetadataState state = metadataState(metadataReaderStatus);
+	metadataMutex.unlock();
+	publishSnapshot();
+	return state;
+}
+
+void DjSession::invalidateLibraryMetadata(){
+	metadataMutex.lock();
+	metadataReader.close();
+	metadataReaderStatus = JaydMetadata::Status::Missing;
+	libraryGeneration = 0;
+	libraryKey = 0;
+	metadataFileKey = 0;
+	metadataInitialized = false;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		deckMetadata[deck].invalidate(
+			deckMetadata[deck].attached() ? DJ_METADATA_STALE : DJ_METADATA_ABSENT,
+			0
+		);
+	}
+	metadataMutex.unlock();
+	publishSnapshot();
+}
+
+DjMetadataState DjSession::resolveMetadata(
+	const char* path,
+	uint32_t generation,
+	uint64_t key,
+	const DjTrackIdentity* identity,
+	JaydMetadata::Track& track,
+	DjTrackMetadataSnapshot& metadata
+){
+	metadata = {};
+	metadata.libraryGeneration = libraryGeneration;
+	metadata.state = metadataState(metadataReaderStatus);
+	if(metadataReaderStatus != JaydMetadata::Status::Ready) return metadata.state;
+	if(generation != libraryGeneration || key != libraryKey){
+		metadata.state = DJ_METADATA_STALE;
+		return metadata.state;
+	}
+
+	const char* normalized = path;
+	if(normalized && normalized[0] == '/') ++normalized;
+	const uint8_t* fingerprint = identity &&
+		(identity->flags & DJ_TRACK_IDENTITY_FINGERPRINT)
+		? identity->fingerprint : nullptr;
+	const uint8_t* sourceId = identity &&
+		(identity->flags & DJ_TRACK_IDENTITY_SOURCE)
+		? identity->sourceId : nullptr;
+	const JaydMetadata::Status match = metadataReader.trackByPath(
+		normalized,
+		track,
+		fingerprint,
+		sourceId
+	);
+	metadata.state = metadataState(match);
+	if(match != JaydMetadata::Status::Ready) return metadata.state;
+
+	if(!metadataReader.readStringHash(track.provenance, metadata.provenanceHash)){
+		metadata.state = DJ_METADATA_CORRUPT;
+		return metadata.state;
+	}
+	metadata.sourceSampleRate = track.sampleRate;
+	metadata.sourceDurationFrames = track.durationFrames;
+	metadata.bpmMilli = track.bpmMilli;
+	metadata.key = track.key;
+	metadata.rating = track.rating;
+	metadata.cueCount = track.cueCount;
+	metadata.gridCount = track.gridCount;
+	metadata.phraseCount = track.phraseCount;
+	if(track.sampleRate && track.durationFrames) metadata.capabilities |= DJ_METADATA_HAS_SOURCE_FRAMES;
+	if(track.bpmMilli) metadata.capabilities |= DJ_METADATA_HAS_BPM;
+	if(track.key) metadata.capabilities |= DJ_METADATA_HAS_KEY;
+	if(track.rating != 255) metadata.capabilities |= DJ_METADATA_HAS_RATING;
+	if(track.cueCount) metadata.capabilities |= DJ_METADATA_HAS_CUES;
+	if(track.gridCount) metadata.capabilities |= DJ_METADATA_HAS_GRID;
+	if(track.phraseCount) metadata.capabilities |= DJ_METADATA_HAS_PHRASES;
+
+	for(uint32_t index = 0; index < track.gridCount; ++index){
+		JaydMetadata::Grid grid;
+		if(!metadataReader.readGrid(track, index, grid)){
+			metadata = {};
+			metadata.libraryGeneration = libraryGeneration;
+			metadata.state = DJ_METADATA_CORRUPT;
+			return metadata.state;
+		}
+		if(grid.beatNumber == 1) ++metadata.downbeatCount;
+		if(grid.confidence > metadata.confidence) metadata.confidence = grid.confidence;
+	}
+	for(uint32_t index = 0; index < track.phraseCount; ++index){
+		JaydMetadata::Phrase phrase;
+		if(!metadataReader.readPhrase(track, index, phrase)){
+			metadata = {};
+			metadata.libraryGeneration = libraryGeneration;
+			metadata.state = DJ_METADATA_CORRUPT;
+			return metadata.state;
+		}
+		if(phrase.confidence > metadata.confidence) metadata.confidence = phrase.confidence;
+	}
+	if(metadata.downbeatCount) metadata.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
+	metadata.state = DJ_METADATA_VALID;
+	return metadata.state;
+}
+
+DjMetadataState DjSession::lookupTrackMetadata(
+	const char* path,
+	DjTrackMetadataSnapshot& metadata,
+	const DjTrackIdentity* identity
+){
+	metadataMutex.lock();
+	JaydMetadata::Track track{};
+	const DjMetadataState state = resolveMetadata(
+		path,
+		libraryGeneration,
+		libraryKey,
+		identity,
+		track,
+		metadata
+	);
+	metadataMutex.unlock();
+	return state;
+}
+
+bool DjSession::copyCue(uint8_t deck, uint16_t index, JaydMetadata::Cue& cue){
+	if(deck >= DJ_DECK_COUNT) return false;
+	metadataMutex.lock();
+	const bool copied = deckMetadata[deck].attached() &&
+		deckMetadata[deck].snapshot().libraryGeneration == libraryGeneration &&
+		metadataReader.readCue(metadataTracks[deck], index, cue);
+	metadataMutex.unlock();
+	return copied;
+}
+
+bool DjSession::copyGrid(uint8_t deck, uint16_t index, JaydMetadata::Grid& grid){
+	if(deck >= DJ_DECK_COUNT) return false;
+	metadataMutex.lock();
+	const bool copied = deckMetadata[deck].attached() &&
+		deckMetadata[deck].snapshot().libraryGeneration == libraryGeneration &&
+		metadataReader.readGrid(metadataTracks[deck], index, grid);
+	metadataMutex.unlock();
+	return copied;
+}
+
+bool DjSession::copyPhrase(uint8_t deck, uint16_t index, JaydMetadata::Phrase& phrase){
+	if(deck >= DJ_DECK_COUNT) return false;
+	metadataMutex.lock();
+	const bool copied = deckMetadata[deck].attached() &&
+		deckMetadata[deck].snapshot().libraryGeneration == libraryGeneration &&
+		metadataReader.readPhrase(metadataTracks[deck], index, phrase);
+	metadataMutex.unlock();
+	return copied;
+}
+
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
 	if(!system || !left || !right || !output) return;
 	if(viewAttached && viewInfo[0] == left && viewInfo[1] == right && viewInfo[2] == output) return;
@@ -297,8 +527,21 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error){
 				error = DJ_COMMAND_ERROR_NO_DECK;
 				return false;
 			}
-			if(command.value) system->startRecording();
+			recordingRequested = command.value;
+			if(recordingRequested) system->startRecording();
 			else system->stopRecording();
+			{
+				const uint32_t started = millis();
+				while(system->isRecording() != recordingRequested &&
+					  millis() - started < 250){
+					Sched.loop(0);
+				}
+				if(system->isRecording() != recordingRequested){
+					recordingRequested = system->isRecording();
+					error = DJ_COMMAND_ERROR_RECORDING_FAILED;
+					return false;
+				}
+			}
 			return true;
 		default:
 			error = DJ_COMMAND_ERROR_INVALID_VALUE;
@@ -313,9 +556,24 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 		return false;
 	}
 
+	JaydMetadata::Track candidateTrack{};
+	DjTrackMetadataSnapshot candidateMetadata{};
+	metadataMutex.lock();
+	resolveMetadata(
+		command.path,
+		command.libraryGeneration,
+		command.libraryKey,
+		&command.trackIdentity,
+		candidateTrack,
+		candidateMetadata
+	);
+
 	const bool hadLeft = system->hasChannel(0);
 	const bool hadRight = system->hasChannel(1);
-	if(!system->openChannel(command.deck, file)){
+	const bool opened = system->openChannel(command.deck, file);
+	if(!opened){
+		deckMetadata[command.deck].commitIfLoaded(candidateMetadata, false, false);
+		metadataMutex.unlock();
 		file.close();
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
 		return false;
@@ -323,6 +581,13 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 
 	files[command.deck] = file;
 	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
+	metadataTracks[command.deck] = candidateTrack;
+	deckMetadata[command.deck].commitIfLoaded(
+		candidateMetadata,
+		candidateMetadata.state == DJ_METADATA_VALID,
+		true
+	);
+	metadataMutex.unlock();
 	system->setVolume(command.deck, gains[command.deck]);
 	DjEffectTransition effectTransition;
 	effectState.deckLoaded(command.deck, effectTransition);
@@ -355,7 +620,7 @@ void DjSession::publishSnapshot(){
 	snapshot.sessionActive = !ending;
 	snapshot.mixerRunning = system && system->isRunning();
 	snapshot.mix = mix;
-	snapshot.recording = system && system->isRecording();
+	snapshot.recording = recordingRequested || (system && system->isRecording());
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
 		DjDeckSnapshot& deckSnapshot = snapshot.decks[deck];
@@ -368,6 +633,11 @@ void DjSession::publishSnapshot(){
 		memcpy(deckSnapshot.path, paths[deck], DJ_PATH_CAPACITY);
 		effectState.copyDeck(deck, deckSnapshot.effects);
 	}
+	metadataMutex.lock();
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		snapshot.decks[deck].metadata = deckMetadata[deck].snapshot();
+	}
+	metadataMutex.unlock();
 
 	commandMutex.lock();
 	snapshot.queueDepth = commandQueue.depth();
@@ -391,4 +661,7 @@ void DjSession::shutdown(){
 
 	publishSnapshot();
 	if(system) system->stop();
+	metadataMutex.lock();
+	metadataReader.close();
+	metadataMutex.unlock();
 }

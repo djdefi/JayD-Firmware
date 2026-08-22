@@ -80,6 +80,7 @@ namespace SongList {
 		bool allocationFailed = false;
 		IndexState indexState = IndexState::Absent;
 		uint32_t indexGeneration = 0;
+		uint32_t indexPayloadCrc = 0;
 		uint32_t indexProgress = 0;
 		uint32_t indexProgressTotal = 0;
 		LibraryIndex::IdentityStrength identityStrength =

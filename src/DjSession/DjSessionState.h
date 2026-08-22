@@ -11,6 +11,53 @@ static constexpr uint8_t DJ_COMMAND_CAPACITY = 16;
 static constexpr uint8_t DJ_RECENT_RESULT_COUNT = 8;
 static constexpr size_t DJ_PATH_CAPACITY = 128;
 
+enum DjMetadataState : uint8_t {
+	DJ_METADATA_ABSENT,
+	DJ_METADATA_VALID,
+	DJ_METADATA_STALE,
+	DJ_METADATA_CORRUPT,
+	DJ_METADATA_UNSUPPORTED
+};
+
+enum DjMetadataCapability : uint16_t {
+	DJ_METADATA_HAS_SOURCE_FRAMES = 1 << 0,
+	DJ_METADATA_HAS_BPM = 1 << 1,
+	DJ_METADATA_HAS_KEY = 1 << 2,
+	DJ_METADATA_HAS_RATING = 1 << 3,
+	DJ_METADATA_HAS_CUES = 1 << 4,
+	DJ_METADATA_HAS_GRID = 1 << 5,
+	DJ_METADATA_HAS_DOWNBEATS = 1 << 6,
+	DJ_METADATA_HAS_PHRASES = 1 << 7
+};
+
+enum DjTrackIdentityFlag : uint8_t {
+	DJ_TRACK_IDENTITY_FINGERPRINT = 1 << 0,
+	DJ_TRACK_IDENTITY_SOURCE = 1 << 1
+};
+
+struct DjTrackIdentity {
+	uint8_t flags = 0;
+	uint8_t fingerprint[16] = {};
+	uint8_t sourceId[16] = {};
+};
+
+struct DjTrackMetadataSnapshot {
+	DjMetadataState state = DJ_METADATA_ABSENT;
+	uint16_t capabilities = 0;
+	uint32_t libraryGeneration = 0;
+	uint32_t provenanceHash = 0;
+	uint16_t confidence = 0;
+	uint32_t sourceSampleRate = 0;
+	uint64_t sourceDurationFrames = 0;
+	uint32_t bpmMilli = 0;
+	uint16_t key = 0;
+	uint8_t rating = 255;
+	uint16_t cueCount = 0;
+	uint16_t gridCount = 0;
+	uint16_t downbeatCount = 0;
+	uint16_t phraseCount = 0;
+};
+
 enum DjCommandOrigin : uint8_t {
 	DJ_ORIGIN_LOCAL_UI,
 	DJ_ORIGIN_PHYSICAL,
@@ -47,6 +94,7 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_NO_DECK,
 	DJ_COMMAND_ERROR_NO_EFFECT,
 	DJ_COMMAND_ERROR_OPEN_FAILED,
+	DJ_COMMAND_ERROR_RECORDING_FAILED,
 	DJ_COMMAND_ERROR_SESSION_ENDING
 };
 
@@ -72,6 +120,9 @@ struct DjCommand {
 	uint8_t deck = 0;
 	uint8_t slot = 0;
 	uint16_t value = 0;
+	uint32_t libraryGeneration = 0;
+	uint64_t libraryKey = 0;
+	DjTrackIdentity trackIdentity = {};
 	char path[DJ_PATH_CAPACITY] = {};
 };
 
@@ -189,6 +240,7 @@ struct DjDeckSnapshot {
 	uint8_t gain = 255;
 	char path[DJ_PATH_CAPACITY] = {};
 	DjEffectSnapshot effects[DJ_EFFECT_SLOT_COUNT] = {};
+	DjTrackMetadataSnapshot metadata = {};
 };
 
 struct DjSnapshot {
@@ -203,6 +255,47 @@ struct DjSnapshot {
 	uint8_t queueDepth = 0;
 	uint32_t queueDrops = 0;
 	DjCommandResult recentResults[DJ_RECENT_RESULT_COUNT] = {};
+};
+
+inline bool djAllowsLibraryWork(const DjSnapshot& snapshot){
+	if(snapshot.recording) return false;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
+		if(snapshot.decks[deck].playing) return false;
+	}
+	return true;
+}
+
+class DjDeckMetadataState {
+public:
+	bool commitIfLoaded(
+		const DjTrackMetadataSnapshot& metadata,
+		bool attached,
+		bool loadSucceeded
+	){
+		if(!loadSucceeded) return false;
+		snapshot_ = metadata;
+		attached_ = attached && metadata.state == DJ_METADATA_VALID;
+		return true;
+	}
+
+	void invalidate(DjMetadataState state, uint32_t generation){
+		snapshot_ = {};
+		snapshot_.state = state;
+		snapshot_.libraryGeneration = generation;
+		attached_ = false;
+	}
+
+	bool attached() const{
+		return attached_;
+	}
+
+	const DjTrackMetadataSnapshot& snapshot() const{
+		return snapshot_;
+	}
+
+private:
+	DjTrackMetadataSnapshot snapshot_ = {};
+	bool attached_ = false;
 };
 
 class DjCommandQueue {

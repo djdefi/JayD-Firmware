@@ -41,11 +41,24 @@ int main(int argc, char** argv){
 	char text[32];
 	assert(reader.readString(track.provenance, text, sizeof(text)));
 	assert(strcmp(text, "firmware-reader-self-check") == 0);
+	uint32_t provenanceHash = 0;
+	assert(reader.readStringHash(track.provenance, provenanceHash));
+	assert(provenanceHash != 0);
 	assert(reader.trackByPath("safe/song.aac", track) == Status::Ready);
+	assert(reader.trackByPath(
+		"safe/song.aac",
+		track,
+		track.fingerprint,
+		track.sourceId
+	) == Status::Ready);
 	uint8_t staleFingerprint[16];
 	memcpy(staleFingerprint, track.fingerprint, sizeof(staleFingerprint));
 	staleFingerprint[0] ^= 1;
 	assert(reader.trackByPath("safe/song.aac", track, staleFingerprint) == Status::Stale);
+	uint8_t staleSourceId[16];
+	memcpy(staleSourceId, track.sourceId, sizeof(staleSourceId));
+	staleSourceId[0] ^= 1;
+	assert(reader.trackByPath("safe/song.aac", track, nullptr, staleSourceId) == Status::Stale);
 	assert(reader.trackByFingerprint(track.fingerprint, track) == Status::Ready);
 	assert(reader.trackBySourceId(track.sourceId, track) == Status::Ready);
 	assert(reader.trackByPath("missing.aac", track) == Status::Missing);
@@ -86,6 +99,8 @@ int main(int argc, char** argv){
 	assert(open(reader, argv[1], "overlapping-sections.jydm") == Status::Corrupt);
 	assert(open(reader, argv[1], "unsupported-version.jydm") == Status::Unsupported);
 	assert(open(reader, argv[1], "traversal-path.jydm") == Status::Corrupt);
+	assert(open(reader, argv[1], "duplicate-path.jydm") == Status::Ready);
+	assert(reader.trackByPath("safe/song.aac", track) == Status::Stale);
 
 	puts("firmware metadata reader self-check passed");
 	return 0;

@@ -55,7 +55,7 @@ def converter_module():
 
 def fixtures(directory: Path) -> None:
     source = directory / "engine.json"
-    source.write_text(json.dumps({
+    document = {
         "schema": "jayd-engine-interchange-1",
         "producer": "firmware-reader-self-check",
         "tracks": [{
@@ -82,7 +82,8 @@ def fixtures(directory: Path) -> None:
                 "confidence": 8000,
             }],
         }],
-    }), encoding="utf-8")
+    }
+    source.write_text(json.dumps(document), encoding="utf-8")
     subprocess.run([
         sys.executable, str(CONVERTER), "engine-json", str(source),
         "-o", str(directory / "valid.jydm"),
@@ -156,6 +157,22 @@ def fixtures(directory: Path) -> None:
     (directory / "fractional-64-bit-product-overflow.jydm").write_bytes(
         repaired(product_overflow)
     )
+
+    duplicate_document = json.loads(json.dumps(document))
+    duplicate_track = duplicate_document["tracks"][0].copy()
+    duplicate_track["source_id"] = "stable-source-2"
+    duplicate_track["path"] = "safe/twin.aac"
+    duplicate_document["tracks"].append(duplicate_track)
+    duplicate_source = directory / "duplicate.json"
+    duplicate_source.write_text(json.dumps(duplicate_document), encoding="utf-8")
+    subprocess.run([
+        sys.executable, str(CONVERTER), "engine-json", str(duplicate_source),
+        "-o", str(directory / "duplicate-path.jydm"),
+    ], check=True, stdout=subprocess.DEVNULL)
+    duplicate = bytearray((directory / "duplicate-path.jydm").read_bytes())
+    location = duplicate.index(b"safe/twin.aac\0")
+    duplicate[location:location + len(b"safe/twin.aac\0")] = b"safe/song.aac\0"
+    (directory / "duplicate-path.jydm").write_bytes(repaired(duplicate))
 
     corrupt = bytearray(valid)
     corrupt[-1] ^= 1

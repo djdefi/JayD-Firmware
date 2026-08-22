@@ -84,3 +84,13 @@ add_executable(LibraryIndexSelfCheck
 set_target_properties(LibraryIndexSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME LibraryIndexSelfCheck COMMAND LibraryIndexSelfCheck)
+
+add_executable(DjSessionSelfCheck tests/dj_session_self_test.cpp)
+set_target_properties(DjSessionSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME DjSessionSelfCheck COMMAND DjSessionSelfCheck)
+
+add_executable(MetadataIntegrationSelfCheck tests/metadata_integration_selfcheck.cpp)
+set_target_properties(MetadataIntegrationSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME MetadataIntegrationSelfCheck COMMAND MetadataIntegrationSelfCheck)

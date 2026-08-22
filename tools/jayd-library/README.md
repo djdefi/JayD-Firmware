@@ -12,6 +12,8 @@ python3 tools/jayd-library/jayd_library.py traktor collection.nml -o library.jyd
 python3 tools/jayd-library/jayd_library.py inspect library.jydm
 ```
 
+Copy the result to `/library.jydm` at the SD-card root for firmware discovery.
+
 Only normalized relative POSIX paths are written. Absolute paths are rejected
 unless `--root` maps them to a relative path below that root; traversal, NULs,
 foreign `file://` authorities, and Windows drive paths are rejected. Windows

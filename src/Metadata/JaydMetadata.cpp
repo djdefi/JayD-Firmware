@@ -406,6 +406,31 @@ bool Reader::readString(uint32_t offset, char* output, size_t capacity){
 	return false;
 }
 
+bool Reader::readStringHash(uint32_t offset, uint32_t& hash){
+	if(status_ != Status::Ready) return false;
+	const Section& strings = sections_[StringSection];
+	if(offset >= strings.byteSize) return false;
+	if(offset){
+		uint8_t previous;
+		if(!readAt(strings.offset + offset - 1, &previous, 1) || previous != 0) return false;
+	}
+
+	hash = 2166136261U;
+	uint8_t buffer[128];
+	uint32_t position = offset;
+	while(position < strings.byteSize){
+		size_t requested = strings.byteSize - position;
+		if(requested > sizeof(buffer)) requested = sizeof(buffer);
+		if(!readAt(strings.offset + position, buffer, requested)) return false;
+		for(size_t i = 0; i < requested; ++i){
+			if(buffer[i] == 0) return true;
+			hash = (hash ^ buffer[i]) * 16777619U;
+		}
+		position += requested;
+	}
+	return false;
+}
+
 bool Reader::validateStringOffset(uint32_t offset){
 	const Section& strings = sections_[StringSection];
 	if(offset >= strings.byteSize) return false;
@@ -632,41 +657,62 @@ Status Reader::trackByIndex(uint32_t index, Track& track){
 	return validateTrack(index, &track) ? Status::Ready : (index >= trackCount_ ? Status::Missing : Status::Corrupt);
 }
 
-Status Reader::trackByPath(const char* normalizedPath, Track& track, const uint8_t* expectedFingerprint){
+Status Reader::trackByPath(
+	const char* normalizedPath,
+	Track& track,
+	const uint8_t* expectedFingerprint,
+	const uint8_t* expectedSourceId
+){
 	if(status_ != Status::Ready) return status_;
 	if(!normalizedPath) return Status::Missing;
 	const size_t length = strlen(normalizedPath);
 	if(length == 0 || length > MaxPathBytes) return Status::Missing;
+	bool sawPath = false;
+	bool matched = false;
 	for(uint32_t index = 0; index < trackCount_; ++index){
 		Track candidate;
 		char path[MaxPathBytes + 1];
 		if(!validateTrack(index, &candidate) || !readString(candidate.path, path, sizeof(path))) return Status::Corrupt;
 		if(strcmp(path, normalizedPath) != 0) continue;
+		sawPath = true;
+		if(expectedFingerprint && memcmp(expectedFingerprint, candidate.fingerprint, 16) != 0) continue;
+		if(expectedSourceId && memcmp(expectedSourceId, candidate.sourceId, 16) != 0) continue;
+		if(matched) return Status::Stale;
 		track = candidate;
-		return expectedFingerprint && memcmp(expectedFingerprint, track.fingerprint, 16) != 0
-			? Status::Stale : Status::Ready;
+		matched = true;
 	}
-	return Status::Missing;
+	if(matched) return Status::Ready;
+	return sawPath ? Status::Stale : Status::Missing;
 }
 
 Status Reader::trackByFingerprint(const uint8_t fingerprint[16], Track& track){
 	if(status_ != Status::Ready) return status_;
 	if(!fingerprint) return Status::Missing;
+	bool matched = false;
 	for(uint32_t index = 0; index < trackCount_; ++index){
-		if(!validateTrack(index, &track)) return Status::Corrupt;
-		if(memcmp(fingerprint, track.fingerprint, 16) == 0) return Status::Ready;
+		Track candidate;
+		if(!validateTrack(index, &candidate)) return Status::Corrupt;
+		if(memcmp(fingerprint, candidate.fingerprint, 16) != 0) continue;
+		if(matched) return Status::Stale;
+		track = candidate;
+		matched = true;
 	}
-	return Status::Missing;
+	return matched ? Status::Ready : Status::Missing;
 }
 
 Status Reader::trackBySourceId(const uint8_t sourceId[16], Track& track){
 	if(status_ != Status::Ready) return status_;
 	if(!sourceId) return Status::Missing;
+	bool matched = false;
 	for(uint32_t index = 0; index < trackCount_; ++index){
-		if(!validateTrack(index, &track)) return Status::Corrupt;
-		if(memcmp(sourceId, track.sourceId, 16) == 0) return Status::Ready;
+		Track candidate;
+		if(!validateTrack(index, &candidate)) return Status::Corrupt;
+		if(memcmp(sourceId, candidate.sourceId, 16) != 0) continue;
+		if(matched) return Status::Stale;
+		track = candidate;
+		matched = true;
 	}
-	return Status::Missing;
+	return matched ? Status::Ready : Status::Missing;
 }
 
 bool Reader::readCue(const Track& track, uint32_t relativeIndex, Cue& cue){

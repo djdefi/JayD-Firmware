@@ -5,6 +5,7 @@
 #include <SPIFFS.h>
 #include <FS/CompressedFile.h>
 #include "../../Fonts.h"
+#include "../../DjSession/DjSession.h"
 
 namespace {
 const char* indexPathA = "/.jayd-library.a";
@@ -63,6 +64,27 @@ bool isHiddenEntry(const char* path){
 	const char* name = strrchr(path, '/');
 	name = name == nullptr ? path : name + 1;
 	return name[0] == '.';
+}
+
+uint64_t libraryKey(
+	const LibraryIndex::CardIdentity& identity,
+	uint32_t generation,
+	uint32_t payloadCrc
+){
+	uint64_t key = 1469598103934665603ULL;
+	const uint64_t values[] = {
+		identity.cardType,
+		identity.cardSize,
+		identity.volumeSize,
+		generation,
+		payloadCrc
+	};
+	for(const uint64_t value : values){
+		for(uint8_t byte = 0; byte < 8; ++byte){
+			key = (key ^ uint8_t(value >> (byte * 8))) * 1099511628211ULL;
+		}
+	}
+	return key;
 }
 }
 
@@ -341,6 +363,7 @@ bool SongList::SongList::loadIndex(const char* path){
 	songCount = validation.header.recordCount;
 	songCapacity = songCount;
 	indexGeneration = validation.header.generation;
+	indexPayloadCrc = validation.header.payloadCrc32;
 	scanLimited = (validation.header.flags & LibraryIndex::HeaderScanLimited) != 0;
 	indexState = IndexState::Verifying;
 	indexProgress = 0;
@@ -456,7 +479,10 @@ bool SongList::SongList::writeGeneration(const char* path, uint32_t generation){
 		maxPathPayload
 	};
 	const IndexProbe written = probeIndex(path, limits, identity);
-	return written.matchesCard && written.validation.header.generation == generation;
+	const bool committed = written.matchesCard &&
+		written.validation.header.generation == generation;
+	if(committed) indexPayloadCrc = header.payloadCrc32;
+	return committed;
 }
 
 bool SongList::SongList::buildIndex(){
@@ -526,6 +552,7 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	allocationFailed = false;
 	indexState = IndexState::Absent;
 	indexGeneration = 0;
+	indexPayloadCrc = 0;
 	indexProgress = 0;
 	indexProgressTotal = 0;
 	identityStrength = LibraryIndex::IdentityStrength::Unknown;
@@ -536,6 +563,7 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	}
 
 	if(!insertedSD){
+		if(DjSession::get()) DjSession::get()->invalidateLibraryMetadata();
 		waiting = false;
 		draw();
 		screen.commit();
@@ -550,6 +578,7 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	insertedSD = root;
 	if(!insertedSD){
 		root.close();
+		if(DjSession::get()) DjSession::get()->invalidateLibraryMetadata();
 		waiting = false;
 		draw();
 		screen.commit();
@@ -557,14 +586,19 @@ void SongList::SongList::checkSD(bool forceRebuild){
 	}
 	root.close();
 
-	const bool indexed = !forceRebuild && loadBestIndex();
-	if(!indexed && !buildIndex()){
+	const bool indexed = loadBestIndex();
+	DjSession* session = DjSession::get();
+	const bool rebuildRequested = forceRebuild || !indexed;
+	const bool rebuildAllowed = !session || session->libraryWorkAllowed();
+	if(rebuildRequested && rebuildAllowed && !buildIndex()){
 		const bool memoryFailure = allocationFailed;
 		clearSongs();
 		allocationFailed = false;
 		const bool recovered = loadBestIndex();
 		if(!recovered && memoryFailure) allocationFailed = true;
 		indexState = LibraryIndex::stateAfterRecovery(indexState, recovered);
+	}else if(rebuildRequested && !rebuildAllowed){
+		indexState = IndexState::Verifying;
 	}
 	if(allocationFailed){
 		Serial.printf(
@@ -577,6 +611,13 @@ void SongList::SongList::checkSD(bool forceRebuild){
 
 	waiting = false;
 	empty = songCount == 0;
+	if(session){
+		const LibraryIndex::CardIdentity identity = currentCardIdentity();
+		session->refreshLibraryMetadata(
+			indexGeneration,
+			libraryKey(identity, indexGeneration, indexPayloadCrc)
+		);
+	}
 	Serial.printf(
 		"SongList: indexed %u tracks (%u path bytes)%s\n",
 		static_cast<unsigned int>(songCount),

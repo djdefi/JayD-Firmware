@@ -121,17 +121,22 @@ int main(){
 	source.seq = 1;
 	source.sessionId = 42;
 	strcpy(source.decks[0].path, "/track.aac");
+	source.decks[0].metadata.state = DJ_METADATA_VALID;
+	source.decks[0].metadata.bpmMilli = 128000;
 	snapshots.publish(source);
 	DjSnapshot copy = {};
 	snapshots.copy(copy);
 	assert(copy.seq == source.seq);
 	assert(copy.sessionId == source.sessionId);
 	assert(strcmp(copy.decks[0].path, source.decks[0].path) == 0);
+	assert(copy.decks[0].metadata.bpmMilli == 128000);
 
 	source.seq = 2;
 	strcpy(source.decks[0].path, "/other.aac");
+	source.decks[0].metadata.bpmMilli = 130000;
 	snapshots.publish(source);
 	assert(copy.seq == 1);
 	assert(strcmp(copy.decks[0].path, "/track.aac") == 0);
+	assert(copy.decks[0].metadata.bpmMilli == 128000);
 	return 0;
 }
