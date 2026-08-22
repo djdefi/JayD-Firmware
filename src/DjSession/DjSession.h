@@ -23,6 +23,9 @@ public:
 	DjSubmitResult setEffectType(uint8_t deck, uint8_t slot, uint8_t type, DjCommandOrigin origin);
 	DjSubmitResult setEffectIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjCommandOrigin origin);
 	DjSubmitResult setRecording(bool recording, DjCommandOrigin origin);
+#if defined(JAYD_ENABLE_WIRELESS)
+	DjSubmitResult requestPairing(DjCommandOrigin origin);
+#endif
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -57,6 +60,9 @@ private:
 	uint32_t queueDrops = 0;
 	uint64_t snapshotSeq = 0;
 	uint32_t sessionId = 0;
+#if defined(JAYD_ENABLE_WIRELESS)
+	uint32_t pairingGeneration = 0;
+#endif
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool apply(const DjCommand& command, DjCommandError& error);

@@ -8,7 +8,11 @@
 static constexpr uint8_t DJ_DECK_COUNT = 2;
 static constexpr uint8_t DJ_EFFECT_SLOT_COUNT = 3;
 static constexpr uint8_t DJ_COMMAND_CAPACITY = 16;
+#if defined(JAYD_ENABLE_WIRELESS)
+static constexpr uint8_t DJ_RECENT_RESULT_COUNT = DJ_COMMAND_CAPACITY + 8;
+#else
 static constexpr uint8_t DJ_RECENT_RESULT_COUNT = 8;
+#endif
 static constexpr size_t DJ_PATH_CAPACITY = 128;
 
 enum DjCommandOrigin : uint8_t {
@@ -27,6 +31,9 @@ enum DjCommandType : uint8_t {
 	DJ_COMMAND_SET_EFFECT_TYPE,
 	DJ_COMMAND_SET_EFFECT_INTENSITY,
 	DJ_COMMAND_SET_RECORDING
+#if defined(JAYD_ENABLE_WIRELESS)
+	,DJ_COMMAND_OPEN_PAIRING
+#endif
 };
 
 enum DjCommandStatus : uint8_t {
@@ -48,6 +55,10 @@ enum DjCommandError : uint8_t {
 	DJ_COMMAND_ERROR_NO_EFFECT,
 	DJ_COMMAND_ERROR_OPEN_FAILED,
 	DJ_COMMAND_ERROR_SESSION_ENDING
+#if defined(JAYD_ENABLE_WIRELESS)
+	,DJ_COMMAND_ERROR_STALE_IDENTITY,
+	DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED
+#endif
 };
 
 enum DjTimingQuality : uint8_t {
@@ -73,16 +84,35 @@ struct DjCommand {
 	uint8_t slot = 0;
 	uint16_t value = 0;
 	char path[DJ_PATH_CAPACITY] = {};
+#if defined(JAYD_ENABLE_WIRELESS)
+	uint64_t requestBootId = 0;
+	uint32_t requestSessionId = 0;
+	char clientId[33] = {};
+	char clientCommandId[33] = {};
+#endif
 };
 
 struct DjSubmitResult {
 	uint32_t id = 0;
 	DjCommandStatus status = DJ_COMMAND_REJECTED;
 	DjCommandError error = DJ_COMMAND_ERROR_NONE;
+#if defined(JAYD_ENABLE_WIRELESS)
+	bool duplicate = false;
+#endif
 
 	DjSubmitResult() = default;
-	DjSubmitResult(uint32_t id, DjCommandStatus status, DjCommandError error) :
-			id(id), status(status), error(error){}
+	DjSubmitResult(
+		uint32_t id,
+		DjCommandStatus status,
+		DjCommandError error
+#if defined(JAYD_ENABLE_WIRELESS)
+		,bool duplicate = false
+#endif
+	) : id(id), status(status), error(error)
+#if defined(JAYD_ENABLE_WIRELESS)
+		,duplicate(duplicate)
+#endif
+	{}
 
 	bool accepted() const{
 		return status == DJ_COMMAND_ACCEPTED;
@@ -95,6 +125,10 @@ struct DjCommandResult {
 	DjCommandType type = DJ_COMMAND_SET_PLAYING;
 	DjCommandStatus status = DJ_COMMAND_REJECTED;
 	DjCommandError error = DJ_COMMAND_ERROR_NONE;
+#if defined(JAYD_ENABLE_WIRELESS)
+	char clientId[33] = {};
+	char clientCommandId[33] = {};
+#endif
 };
 
 struct DjEffectSnapshot {
@@ -202,8 +236,18 @@ struct DjSnapshot {
 	DjDeckSnapshot decks[DJ_DECK_COUNT] = {};
 	uint8_t queueDepth = 0;
 	uint32_t queueDrops = 0;
+#if defined(JAYD_ENABLE_WIRELESS)
+	uint32_t pairingGeneration = 0;
+#endif
 	DjCommandResult recentResults[DJ_RECENT_RESULT_COUNT] = {};
 };
+
+#if defined(JAYD_ENABLE_WIRELESS)
+inline bool djCommandIdentityMatches(const DjCommand& command, uint64_t bootId, uint32_t sessionId){
+	return command.origin != DJ_ORIGIN_HTTP ||
+		(command.requestBootId == bootId && command.requestSessionId == sessionId);
+}
+#endif
 
 class DjCommandQueue {
 public:
@@ -277,13 +321,33 @@ private:
 class DjCommandResults {
 public:
 	void record(const DjCommand& command, DjCommandStatus status, DjCommandError error){
+#if defined(JAYD_ENABLE_WIRELESS)
+		uint8_t selected = next;
+		for(uint8_t offset = 0; offset < DJ_RECENT_RESULT_COUNT; offset++){
+			const uint8_t candidate = (next + offset) % DJ_RECENT_RESULT_COUNT;
+			if(results[candidate].id == 0 || results[candidate].status != DJ_COMMAND_ACCEPTED){
+				selected = candidate;
+				break;
+			}
+		}
+		DjCommandResult& result = results[selected];
+#else
 		DjCommandResult& result = results[next];
+#endif
 		result.id = command.id;
 		result.origin = command.origin;
 		result.type = command.type;
 		result.status = status;
 		result.error = error;
+#if defined(JAYD_ENABLE_WIRELESS)
+		memcpy(result.clientId, command.clientId, sizeof(result.clientId));
+		memcpy(result.clientCommandId, command.clientCommandId, sizeof(result.clientCommandId));
+#endif
+#if defined(JAYD_ENABLE_WIRELESS)
+		next = (selected + 1) % DJ_RECENT_RESULT_COUNT;
+#else
 		next = (next + 1) % DJ_RECENT_RESULT_COUNT;
+#endif
 	}
 
 	void finish(uint32_t id, DjCommandStatus status, DjCommandError error){
@@ -301,6 +365,20 @@ public:
 			destination[i] = results[index];
 		}
 	}
+
+#if defined(JAYD_ENABLE_WIRELESS)
+	bool findClientCommand(const char* clientId, const char* clientCommandId, DjCommandResult& destination) const{
+		if(!clientId || clientId[0] == '\0' || !clientCommandId || clientCommandId[0] == '\0') return false;
+		for(uint8_t i = 0; i < DJ_RECENT_RESULT_COUNT; i++){
+			const DjCommandResult& result = results[i];
+			if(strcmp(result.clientId, clientId) != 0) continue;
+			if(strcmp(result.clientCommandId, clientCommandId) != 0) continue;
+			destination = result;
+			return true;
+		}
+		return false;
+	}
+#endif
 
 private:
 	DjCommandResult results[DJ_RECENT_RESULT_COUNT] = {};
