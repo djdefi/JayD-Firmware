@@ -42,6 +42,12 @@ public:
 		return history.size();
 	}
 
+	// True if `identity` is currently queued (pinned, planned, or the
+	// in-flight pending entry) - i.e. not eligible to be queued again.
+	bool isQueued(const AutoDjIdentity& identity) const{
+		return queue.containsIdentity(identity);
+	}
+
 	bool pinTrack(const AutoDjIdentity& identity, uint32_t artistHash = 0, uint32_t titleHash = 0){
 		return queue.pushPinned(identity, artistHash, titleHash);
 	}
@@ -138,13 +144,20 @@ private:
 		return port.hasStableIdEndpoint() && !port.manualTakeoverActive() && !queue.empty();
 	}
 
+	// Starts (or retries) exactly one load. `pendingEntry` is captured once
+	// per attempt-cycle (pendingAttempts == 0) from whatever is currently at
+	// the queue front; while pendingAttempts > 0 (waiting on an outcome, or
+	// retrying after a failure) it is reused as-is rather than re-derived
+	// from the queue front, which can change if a different track gets
+	// pinned while this load is in flight or awaiting retry.
 	void beginNextLoad(){
-		AutoDjQueueEntry entry;
-		if(!queue.peekNext(entry)){
-			machine.complete();
-			return;
+		if(pendingAttempts == 0){
+			if(!queue.peekNext(pendingEntry)){
+				machine.complete();
+				return;
+			}
 		}
-		if(!port.submitLoad(entry.identity)){
+		if(!port.submitLoad(pendingEntry.identity)){
 			pendingAttempts++;
 			handleLoadFailure();
 			return;
@@ -163,10 +176,7 @@ private:
 		}
 
 		if(outcome == AutoDjLoadOutcome::Applied){
-			AutoDjQueueEntry entry;
-			if(queue.popNext(entry)){
-				history.record(entry.identity, entry.artistHash, entry.titleHash);
-			}
+			removeResolvedEntry(true /* recordHistory */);
 			pendingPhase = AutoDjPendingPhase::None;
 			pendingAttempts = 0;
 			pendingTimeoutTicks = 0;
@@ -178,17 +188,19 @@ private:
 
 	// A failed/timed-out attempt either retries (within the bounded budget)
 	// or, once the budget is exhausted, permanently skips that one entry so
-	// the planner can never get stuck retrying forever.
+	// the planner can never get stuck retrying forever. Either way this
+	// resolves the exact entry that was submitted (`pendingEntry`), never
+	// "whatever is currently at the queue front".
 	void handleLoadFailure(){
 		pendingPhase = AutoDjPendingPhase::None;
 		pendingTimeoutTicks = 0;
 		if(pendingAttempts > AUTO_DJ_RETRY_BUDGET){
-			AutoDjQueueEntry dropped;
-			queue.popNext(dropped);
+			removeResolvedEntry(false /* recordHistory */);
 			pendingAttempts = 0;
 		}
-		// else: leave the entry at the front of the queue; the next tick()
-		// retries it as long as the deck is still reporting end-of-track.
+		// else: pendingAttempts stays > 0 and pendingEntry stays set, so the
+		// next beginNextLoad() retries this exact entry regardless of what
+		// else may have been queued/pinned meanwhile.
 	}
 
 	// While Stopping, an in-flight load is allowed to resolve exactly once
@@ -200,10 +212,20 @@ private:
 			pendingTimeoutTicks++;
 			if(pendingTimeoutTicks < AUTO_DJ_LOAD_TIMEOUT_TICKS) return;
 		} else if(outcome == AutoDjLoadOutcome::Applied){
-			AutoDjQueueEntry entry;
-			if(queue.popNext(entry)) history.record(entry.identity, entry.artistHash, entry.titleHash);
+			removeResolvedEntry(true /* recordHistory */);
 		}
 		cancelPending();
+	}
+
+	// Removes exactly the entry that was submitted for the just-resolved
+	// attempt (matched by its unique insertion sequence, not queue
+	// position), optionally recording it to history. If the entry is no
+	// longer present (e.g. dropped already by invalidateGeneration()) this
+	// is a no-op - there is nothing stale left to remove or record.
+	void removeResolvedEntry(bool recordHistory){
+		AutoDjQueueEntry resolved;
+		if(!queue.removeBySequence(pendingEntry.sequence, resolved)) return;
+		if(recordHistory) history.record(resolved.identity, resolved.artistHash, resolved.titleHash);
 	}
 
 	void cancelPending(){
@@ -217,6 +239,7 @@ private:
 	DjAutoDjQueue queue;
 	DjAutoDjHistory history;
 	AutoDjPendingPhase pendingPhase = AutoDjPendingPhase::None;
+	AutoDjQueueEntry pendingEntry = {}; // valid whenever pendingAttempts > 0
 	uint16_t pendingTimeoutTicks = 0;
 	uint8_t pendingAttempts = 0;
 };

@@ -466,6 +466,165 @@ void testMissingMetadataNeverClaimsMatch(){
 	assert(!(chosen.reasons & AUTO_DJ_REASON_CONSERVATIVE_FALLBACK));
 }
 
+// Regression for a review finding: a pending load must resolve (record to
+// history / drop / retry) the exact queue entry that was submitted, never
+// "whatever is currently at the queue front" - which changes if a track is
+// pinned while that load is in flight. Covered for every resolution path:
+// Applied, Failed (retry-then-skip), Pending timeout, and Stopping.
+
+void testPinDuringPendingLoadAppliedResolvesSubmittedEntry(){
+	AutoDjCandidate candidateX = makeCandidate(30);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1)); // X queued as a planned entry
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending; // stays in flight so we can pin mid-load
+	planner.tick(); // submits X
+	assert(port.submitCount == 1);
+	assert(port.lastSubmitted.sameTrack(candidateX.identity));
+
+	AutoDjIdentity trackY = makeIdentity(31);
+	assert(planner.pinTrack(trackY)); // user pins Y while X's load is still pending
+	assert(planner.queueDepth() == 2);
+
+	port.nextOutcome = AutoDjLoadOutcome::Applied;
+	planner.tick(); // resolves X's outcome specifically, not Y's
+
+	assert(planner.historySize() == 1); // only X recorded
+	assert(!planner.isQueued(candidateX.identity)); // X removed
+	assert(planner.isQueued(trackY)); // Y untouched, still queued
+	assert(planner.queueDepth() == 1);
+}
+
+void testPinDuringPendingLoadFailureDropsSubmittedEntryNotFront(){
+	AutoDjCandidate candidateX = makeCandidate(32);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Failed;
+
+	planner.tick(); // attempt 1: submits X
+	assert(port.submitCount == 1);
+	assert(port.lastSubmitted.sameTrack(candidateX.identity));
+
+	AutoDjIdentity trackY = makeIdentity(33);
+	// Pinned entries are served ahead of planned ones, so without the fix
+	// this would become the new queue front and hijack X's retries.
+	assert(planner.pinTrack(trackY));
+
+	const int maxTicksAllowed = 32;
+	bool dropped = false;
+	for(int i = 0; i < maxTicksAllowed && !dropped; i++){
+		planner.tick();
+		if(!planner.isQueued(candidateX.identity)) dropped = true;
+	}
+	assert(dropped);
+	assert(port.submitCount == 1 + AUTO_DJ_RETRY_BUDGET); // every retry targeted X
+	assert(port.lastSubmitted.sameTrack(candidateX.identity)); // never Y
+	assert(planner.isQueued(trackY)); // Y untouched throughout
+	assert(planner.historySize() == 0); // dropped, never recorded as played
+	assert(planner.queueDepth() == 1); // only Y remains
+}
+
+void testPinDuringPendingLoadTimeoutRetriesSubmittedEntryNotFront(){
+	AutoDjCandidate candidateX = makeCandidate(34);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending; // never resolves on its own -> times out
+
+	planner.tick(); // attempt 1: submits X
+	assert(port.submitCount == 1);
+
+	AutoDjIdentity trackY = makeIdentity(35);
+	assert(planner.pinTrack(trackY));
+
+	const int maxTicksAllowed = (AUTO_DJ_LOAD_TIMEOUT_TICKS + 2) * (AUTO_DJ_RETRY_BUDGET + 1) + 4;
+	bool dropped = false;
+	for(int i = 0; i < maxTicksAllowed && !dropped; i++){
+		planner.tick();
+		if(!planner.isQueued(candidateX.identity)) dropped = true;
+	}
+	assert(dropped);
+	assert(port.submitCount == 1 + AUTO_DJ_RETRY_BUDGET); // every timeout retried X specifically
+	assert(planner.isQueued(trackY));
+	assert(planner.historySize() == 0);
+}
+
+void testPinDuringStopResolvesSubmittedEntryNotFront(){
+	AutoDjCandidate candidateX = makeCandidate(36);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending;
+	planner.tick(); // submits X, now waiting on hardware
+	assert(port.submitCount == 1);
+
+	AutoDjIdentity trackY = makeIdentity(37);
+	assert(planner.pinTrack(trackY)); // pinned while X's load is in flight
+
+	assert(planner.stop());
+	assert(planner.state() == AutoDjState::Stopping);
+	planner.tick(); // still pending: must not abandon X yet
+	assert(planner.state() == AutoDjState::Stopping);
+
+	port.nextOutcome = AutoDjLoadOutcome::Applied;
+	planner.tick(); // resolves X specifically into history, not Y
+	assert(planner.historySize() == 1);
+	assert(!planner.isQueued(candidateX.identity));
+	assert(planner.isQueued(trackY)); // Y untouched, remains queued
+
+	planner.tick(); // no pending left: finish stopping
+	assert(planner.state() == AutoDjState::Off);
+	assert(planner.queueDepth() == 1); // only Y remains
+}
+
+// Regression for a review finding: planNext()/selectNext() only checked
+// history, not identities already sitting in the queue, so repeatedly
+// planning against the same candidate list could queue the same track more
+// than once. Every distinct candidate must be queued exactly once, and once
+// they're all queued, planNext() must report no eligible candidate rather
+// than duplicating one.
+void testPlanNextNeverQueuesSameIdentityTwice(){
+	AutoDjCandidate candidates[3] = {
+		makeCandidate(40),
+		makeCandidate(41),
+		makeCandidate(42)
+	};
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+
+	assert(planner.planNext(candidates, 3));
+	assert(planner.planNext(candidates, 3));
+	assert(planner.planNext(candidates, 3));
+	assert(planner.queueDepth() == 3);
+	assert(planner.isQueued(candidates[0].identity));
+	assert(planner.isQueued(candidates[1].identity));
+	assert(planner.isQueued(candidates[2].identity));
+
+	assert(!planner.planNext(candidates, 3)); // every candidate is already queued
+	assert(planner.queueDepth() == 3); // unchanged - no duplicate pushed
+}
+
 } // namespace
 
 int main(){
@@ -487,5 +646,10 @@ int main(){
 	testStopWaitsForPendingLoadBeforeGoingOff();
 	testEndOfTrackTriggersLoadOnlyWhenTrustworthy();
 	testMissingMetadataNeverClaimsMatch();
+	testPinDuringPendingLoadAppliedResolvesSubmittedEntry();
+	testPinDuringPendingLoadFailureDropsSubmittedEntryNotFront();
+	testPinDuringPendingLoadTimeoutRetriesSubmittedEntryNotFront();
+	testPinDuringStopResolvesSubmittedEntryNotFront();
+	testPlanNextNeverQueuesSameIdentityTwice();
 	return 0;
 }

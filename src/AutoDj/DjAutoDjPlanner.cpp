@@ -13,6 +13,11 @@ bool DjAutoDjPlanner::selectNext(const AutoDjCandidate* candidates, uint8_t coun
 	for(uint8_t i = 0; i < count; i++){
 		const AutoDjCandidate& candidate = candidates[i];
 		if(!candidate.identity.valid()) continue;
+		// A track already queued (pinned, planned, or the in-flight pending
+		// entry - all of which live in `queue` until they resolve) is never
+		// eligible again: otherwise repeated planning would stack the same
+		// identity into the bounded queue multiple times.
+		if(queue.containsIdentity(candidate.identity)) continue;
 		if(history.wasRecentlyPlayed(candidate.identity, AUTO_DJ_DEFAULT_RECENT_EXCLUSION)) continue;
 		if(history.artistOnCooldown(candidate.artistHash, AUTO_DJ_DEFAULT_ARTIST_EXCLUSION)) continue;
 		if(history.titleOnCooldown(candidate.titleHash, AUTO_DJ_DEFAULT_TITLE_EXCLUSION)) continue;
@@ -38,11 +43,13 @@ bool DjAutoDjPlanner::selectNext(const AutoDjCandidate* candidates, uint8_t coun
 
 	if(bestIndex < 0){
 		// Every eligible candidate was excluded by recency. The queue must
-		// never starve permanently, so relax the exclusion and fall back to
-		// a stable identity ordering - still never a fabricated match.
+		// never starve permanently, so relax the recency exclusion and fall
+		// back to a stable identity ordering - still never a fabricated
+		// match, and still never a track that's already queued/in flight.
 		for(uint8_t i = 0; i < count; i++){
 			const AutoDjCandidate& candidate = candidates[i];
 			if(!candidate.identity.valid()) continue;
+			if(queue.containsIdentity(candidate.identity)) continue;
 			if(bestIndex < 0 || autoDjIdentityLess(candidate.identity, candidates[bestIndex].identity)){
 				bestIndex = i;
 				bestReasons = AUTO_DJ_REASON_CONSERVATIVE_FALLBACK | AUTO_DJ_REASON_TIE_BREAK;

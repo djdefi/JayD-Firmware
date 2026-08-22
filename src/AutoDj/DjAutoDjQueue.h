@@ -60,6 +60,35 @@ public:
 		return true;
 	}
 
+	// True if any queued entry (pinned or planned, regardless of position)
+	// already carries this stable identity. Used to keep the planner from
+	// queuing the same track twice while it is already queued or in flight.
+	bool containsIdentity(const AutoDjIdentity& identity) const{
+		for(uint8_t index = 0; index < count; index++){
+			if(entries[index].identity.sameTrack(identity)) return true;
+		}
+		return false;
+	}
+
+	// Removes the entry with the given monotonic sequence number, wherever
+	// it currently sits in the array. `sequence` is assigned once at push
+	// time and never reused, so this always targets exactly the entry that
+	// was originally submitted for loading - not "whatever is currently at
+	// the front", which can change if a different track is pinned while
+	// that load is in flight. Returns false (queue unchanged) if the entry
+	// is no longer present, e.g. it was already dropped by
+	// invalidateGeneration().
+	bool removeBySequence(uint32_t sequence, AutoDjQueueEntry& removed){
+		for(uint8_t index = 0; index < count; index++){
+			if(entries[index].sequence == sequence){
+				removed = entries[index];
+				removeAt(index);
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Drops entries whose library generation no longer matches the current
 	// one. Used defensively when the library index rebuilds underneath a
 	// queued reference, so a stale entry is never loaded blind. Returns the
