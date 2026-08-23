@@ -141,7 +141,35 @@ public:
 		}
 
 		if(pendingPhase != AutoDjPendingPhase::None){
+			// The stable-ID authority is checked at arm()/start() time, but
+			// nothing previously re-checked it while Running: a fill-worker
+			// exit or later allocation failure mid-session went unnoticed
+			// until the next load attempt exhausted its retry budget and
+			// was silently skipped (or retried forever against a dead
+			// authority). A composite load/Coach-arm/transition/rollback
+			// already in flight when the loss is detected must never be
+			// interrupted or stranded, though - see failAfterPending's doc
+			// comment - so this only ever records the loss and lets
+			// progressPending() carry the in-flight attempt through to its
+			// own outcome exactly as before.
+			if(!port.hasStableIdEndpoint()) failAfterPending = true;
 			progressPending();
+			return;
+		}
+
+		// Nothing is in flight (the branch above returned already if it
+		// were), so this is the "no composite operation pending" case: if
+		// the authority has ever been lost - either just now, or while the
+		// attempt that has since resolved was in flight - fail immediately
+		// and admit no further Auto command, rather than letting
+		// currentTrackAtEnd()/beginNextLoad() below attempt a fresh load
+		// against an authority that can no longer produce a trustworthy
+		// candidate. Terminal, like TeardownTimeout: only an explicit
+		// reset() (and a live hasStableIdEndpoint() at the next arm())
+		// returns Auto DJ to service.
+		if(failAfterPending || !port.hasStableIdEndpoint()){
+			failAfterPending = false;
+			machine.fail(AutoDjFailReason::AuthorityUnavailable);
 			return;
 		}
 
@@ -174,6 +202,14 @@ private:
 	// attempt is abandoned cleanly instead, so a stale/foreign identity is
 	// never sent to the load port.
 	void beginNextLoad(){
+		// Defense-in-depth: tick()'s own gate above should already prevent
+		// this call whenever the authority has dropped, but this must never
+		// submit a load derived from a stale RAM authority once it is gone,
+		// regardless of how this method is ever reached in the future.
+		if(!port.hasStableIdEndpoint()){
+			machine.fail(AutoDjFailReason::AuthorityUnavailable);
+			return;
+		}
 		if(pendingAttempts == 0){
 			if(!queue.peekNext(pendingEntry)){
 				machine.complete();
@@ -295,10 +331,19 @@ private:
 		if(recordHistory) history.record(resolved.identity, resolved.artistHash, resolved.titleHash);
 	}
 
+	// Centralized "abandon whatever pending bookkeeping exists" reset, used
+	// by reset() and by resolvePendingWhileStopping()'s own cleanup path -
+	// see failAfterPending's doc comment for why this (rather than
+	// progressPending()'s own Applied/ordinary-Failed resolution) is the
+	// right place to clear it: those two call sites are the only ones that
+	// abandon an attempt-cycle outright (explicit reset, or the stop
+	// sequence finishing), so a stale flag from a run that has already
+	// ended can never leak into and immediately fail the next one.
 	void cancelPending(){
 		pendingPhase = AutoDjPendingPhase::None;
 		pendingDeadlineUs = 0;
 		pendingAttempts = 0;
+		failAfterPending = false;
 	}
 
 	AutoDjLoadPort& port;
@@ -309,6 +354,18 @@ private:
 	AutoDjQueueEntry pendingEntry = {}; // valid whenever pendingAttempts > 0
 	uint64_t pendingDeadlineUs = 0; // valid whenever pendingPhase == WaitingOutcome
 	uint8_t pendingAttempts = 0;
+	// Sticky "the stable-ID authority was observed unavailable while a
+	// composite load/Coach-arm/transition/rollback attempt was already in
+	// flight" latch. Set only from tick()'s pendingPhase-in-flight branch
+	// (never while pendingPhase == None, so it can never fire mid-attempt-
+	// start), and consumed by the very next tick() where pendingPhase has
+	// resolved back to None - forcing an immediate terminal
+	// AuthorityUnavailable there instead of letting handleLoadFailure()'s
+	// ordinary retry/skip budget (or a fresh beginNextLoad()) run against
+	// an authority that is already known to be gone. Cleared by
+	// cancelPending() (see its doc comment) so it never survives past the
+	// attempt-cycle/session boundary that observed the loss.
+	bool failAfterPending = false;
 };
 
 #endif //JAYD_FIRMWARE_DJ_AUTO_DJ_PLANNER_H

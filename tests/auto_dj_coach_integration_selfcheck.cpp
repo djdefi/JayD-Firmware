@@ -973,6 +973,21 @@ public:
 	static void forceFillWorkerLaunchFailure(DjAssistController& controller){
 		controller.fillWorker_.forceLaunchFailureForTest = true;
 	}
+
+	// Round 6 (continuous capability enforcement) test-only seam: flips
+	// authorityReady() false the same way a real fill-worker exit or a
+	// later candidate-table allocation failure would, WITHOUT touching
+	// anything else DjAssistController owns. Deliberately narrower than
+	// calling controller.end(): end() also tears down actuator_/session_,
+	// which would freeze Coach's own tickTransition()/tickRollback()
+	// machinery mid-flight (both bail out immediately once actuator_ is
+	// null) - these tests specifically need an already-in-flight Coach
+	// transition/rollback to keep resolving normally on its own while only
+	// the candidate-fill authority itself is reported gone, so this must
+	// mutate exactly (and only) what authorityReady() reads.
+	static void forceAuthorityLossForTest(DjAssistController& controller){
+		controller.allocationFailed_ = true;
+	}
 };
 
 namespace {
@@ -1111,6 +1126,299 @@ void testAutoDjLoadTriggersGridHydrationEndToEnd(){
 
 } // namespace
 
+namespace {
+
+// -- round 6: "authorityReady is checked only arm/start. If fill worker
+// exits while Running, planner can begin another cached load; no pause/
+// fail." -- these four tests drive the REAL controller/actuator through
+// AutoDjCoachGridHydrationHarness::forceAuthorityLossForTest() (which
+// flips authorityReady() false exactly the way a real fill-worker exit or
+// later candidate-table allocation failure would, without disturbing
+// Coach's own transition/rollback machinery - see that helper's doc
+// comment) at each of the four distinct points the review calls out, and
+// assert in every case that: an already-in-flight command/transition/
+// rollback is never stranded or interrupted, only ever allowed to settle
+// to its own real outcome; no LOAD_DECK is ever submitted afterward
+// (checked against a 2-entry library, so a healthy planner would
+// otherwise have topped up and loaded the second entry); and Auto DJ
+// converges on the terminal AutoDjState::Failed /
+// AutoDjFailReason::AuthorityUnavailable state, never a silent retry.
+
+int countLoadDeckCommands(const FakePort& port){
+	int count = 0;
+	for(const DjCommand& cmd : port.poppedLog){
+		if(cmd.type == DJ_COMMAND_LOAD_DECK) count++;
+	}
+	return count;
+}
+
+void assertTerminalAuthorityUnavailable(AutoDjSessionActuator& actuator){
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(actuator.failReason() == AutoDjFailReason::AuthorityUnavailable);
+}
+
+// 1) Idle Running, nothing pending yet (deck far from end - no load has
+// ever been attempted). The authority loss must be caught on the very
+// next tick, before currentTrackAtEnd()/beginNextLoad() ever gets a
+// chance to run.
+void testAuthorityLossIdleRunningBeforeLoadFailsWithoutLoad(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x81);
+	port.entries[1].entry = makeEntry(0x82);
+	port.entryCount = 2;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	// Plenty of time left - currentTrackAtEnd() stays false throughout.
+	setDeckPlaying(port, 0, 10, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+	assert(actuator.state() == AutoDjState::Running);
+
+	for(int i = 0; i < 4; i++) loopOnce(port, controller, actuator); // idle Running.
+	assert(countLoadDeckCommands(port) == 0);
+
+	assert(controller.authorityReady());
+	AutoDjCoachGridHydrationHarness::forceAuthorityLossForTest(controller);
+	assert(!controller.authorityReady());
+
+	loopOnce(port, controller, actuator);
+	assertTerminalAuthorityUnavailable(actuator);
+	assert(countLoadDeckCommands(port) == 0); // never even attempted a load.
+
+	for(int i = 0; i < 4; i++) loopOnce(port, controller, actuator); // must not resurrect.
+	assert(countLoadDeckCommands(port) == 0);
+	assertTerminalAuthorityUnavailable(actuator);
+
+	controller.end();
+}
+
+// 2) A LOAD_DECK has just been submitted into the shared queue but not
+// yet popped/applied when the authority is lost. That already-submitted
+// command must still be allowed to apply (and, since nothing else here
+// interferes, the whole composite load->arm->transition attempt must
+// still be allowed to run to a real Applied) - only the NEXT attempt is
+// forbidden.
+void testAuthorityLossAfterLoadQueuedBeforeApplyStillSettles(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x83);
+	port.entries[1].entry = makeEntry(0x84);
+	port.entryCount = 2;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+
+	// One Running tick submits the first LOAD_DECK into port.queue via
+	// actuator.tick() - loopOnce() pops/applies BEFORE ticking, so
+	// immediately after this call the command is genuinely still queued,
+	// not yet applied.
+	loopOnce(port, controller, actuator);
+	assert(!port.snapshot.decks[1].loaded);
+	assert(countLoadDeckCommands(port) == 0); // submitted, not yet popped/applied.
+
+	AutoDjCoachGridHydrationHarness::forceAuthorityLossForTest(controller);
+	assert(!controller.authorityReady());
+
+	// The already-in-flight attempt must still be allowed to settle to a
+	// genuine Applied - authority loss must never strand it.
+	AutoDjSnapshot snap;
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(snap);
+		return snap.historySize == 1;
+	});
+	assert(port.snapshot.decks[1].loaded);
+	assert(port.snapshot.decks[1].playing);
+	assert(countLoadDeckCommands(port) == 1);
+
+	// The very next settle must forbid a second load (the library still
+	// has a second, otherwise-eligible entry) and converge terminal.
+	loopUntil(port, controller, actuator, [&]{
+		return actuator.state() == AutoDjState::Failed;
+	});
+	assertTerminalAuthorityUnavailable(actuator);
+	assert(countLoadDeckCommands(port) == 1); // no subsequent load.
+
+	controller.end();
+}
+
+// 3) Authority is lost mid Coach TRANSITION_RUNNING (arm already applied,
+// crossfade plan actively advancing). The transition must be allowed to
+// keep running to its own real completion (nothing here gates on
+// authorityReady()) before Auto DJ ever reacts to the loss.
+void testAuthorityLossDuringCoachTransitionStillSettles(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x85);
+	port.entries[1].entry = makeEntry(0x86);
+	port.entryCount = 2;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+
+	loopUntil(port, controller, actuator, [&]{
+		DjAssistSnapshot coachSnap;
+		controller.copySnapshot(coachSnap);
+		return coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING;
+	});
+
+	AutoDjCoachGridHydrationHarness::forceAuthorityLossForTest(controller);
+	assert(!controller.authorityReady());
+
+	AutoDjSnapshot snap;
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(snap);
+		return snap.historySize == 1;
+	}, 128);
+	assert(port.snapshot.decks[1].loaded);
+	assert(port.snapshot.decks[1].playing);
+	assert(countLoadDeckCommands(port) == 1);
+
+	loopUntil(port, controller, actuator, [&]{
+		return actuator.state() == AutoDjState::Failed;
+	});
+	assertTerminalAuthorityUnavailable(actuator);
+	assert(countLoadDeckCommands(port) == 1); // no subsequent load.
+
+	controller.end();
+}
+
+// 4) Authority is lost while Coach's own rollback (after a genuine
+// transition failure) is still unsettled. The rollback must be allowed to
+// run to completion exactly as it would with a healthy authority (proven
+// the same way testCoachFailureRollbackSettlesBeforeAutoDjRetries proves
+// it: the rollback's own STOP_DECK on the target deck must actually be
+// observed in the popped-command log) - but afterward, unlike that
+// sibling test, the failed attempt must NEVER retry; it must converge
+// terminal AuthorityUnavailable instead.
+void testAuthorityLossDuringRollbackNeverRetries(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x87);
+	port.entries[1].entry = makeEntry(0x88);
+	port.entryCount = 2;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+
+	// Drive deep enough that CROSSFADE has genuinely been submitted (see
+	// testCoachFailureRollbackSettlesBeforeAutoDjRetries's identical
+	// wait for exactly why .submitted, not just currentStep, is required).
+	DjAssistSnapshot coachSnap;
+	loopUntil(port, controller, actuator, [&]{
+		controller.copySnapshot(coachSnap);
+		return coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING &&
+			coachSnap.plan.currentStep < coachSnap.plan.stepCount &&
+			coachSnap.plan.steps[coachSnap.plan.currentStep].action == DJ_ASSIST_ACTION_CROSSFADE &&
+			coachSnap.plan.steps[coachSnap.plan.currentStep].submitted;
+	}, 128);
+
+	const size_t poppedBeforeFailure = port.poppedLog.size();
+
+	port.media = false; // trips guardOk()'s DJ_ASSIST_FAIL_MEDIA_REMOVED on the next controller.tick().
+	loopOnce(port, controller, actuator);
+	controller.copySnapshot(coachSnap);
+	assert(coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(!controller.rollbackSettled()); // crossfade was submitted - MIX is still pending.
+
+	// Authority is lost while the rollback is genuinely still unsettled.
+	AutoDjCoachGridHydrationHarness::forceAuthorityLossForTest(controller);
+	assert(!controller.authorityReady());
+	port.media = true; // media returning must not be what gates the retry here.
+
+	// The rollback itself must still be allowed to run to completion -
+	// its own STOP_DECK on the target deck (deck 1) must actually appear
+	// in the popped-command log, exactly as the healthy-authority sibling
+	// test proves.
+	loopUntil(port, controller, actuator, [&]{
+		return controller.rollbackSettled();
+	}, 128);
+	bool rollbackStopSeen = false;
+	for(size_t i = poppedBeforeFailure; i < port.poppedLog.size(); i++){
+		const DjCommand& cmd = port.poppedLog[i];
+		if(cmd.type == DJ_COMMAND_SET_PLAYING && cmd.deck == 1 && cmd.value == 0){
+			rollbackStopSeen = true;
+			break;
+		}
+	}
+	assert(rollbackStopSeen); // the rollback genuinely ran to completion, not merely abandoned.
+
+	// Now that rollback has settled, Auto DJ must fail terminally instead
+	// of retrying the same entry (contrast testCoachFailureRollbackSettlesBeforeAutoDjRetries,
+	// where a healthy authority genuinely retries and succeeds here).
+	loopUntil(port, controller, actuator, [&]{
+		return actuator.state() == AutoDjState::Failed;
+	}, 128);
+	assertTerminalAuthorityUnavailable(actuator);
+
+	// No retry LOAD_DECK for deck 1 after the failure was first observed.
+	int retryLoadCount = 0;
+	for(size_t i = poppedBeforeFailure; i < port.poppedLog.size(); i++){
+		const DjCommand& cmd = port.poppedLog[i];
+		if(cmd.type == DJ_COMMAND_LOAD_DECK && cmd.deck == 1) retryLoadCount++;
+	}
+	assert(retryLoadCount == 0);
+
+	controller.end();
+}
+
+} // namespace
+
 int main(){
 	testFullTwoEntryRunThroughRealPorts();
 	testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj();
@@ -1120,5 +1428,9 @@ int main(){
 	testAutoDjLoadTriggersGridHydrationEndToEnd();
 	testCapabilityDisabledWhenFillWorkerLaunchFails();
 	testCapabilityDisabledWhenCandidateAllocationFails();
+	testAuthorityLossIdleRunningBeforeLoadFailsWithoutLoad();
+	testAuthorityLossAfterLoadQueuedBeforeApplyStillSettles();
+	testAuthorityLossDuringCoachTransitionStillSettles();
+	testAuthorityLossDuringRollbackNeverRetries();
 	return 0;
 }

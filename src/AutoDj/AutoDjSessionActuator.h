@@ -206,6 +206,13 @@ public:
 	}
 
 	bool submitLoad(const AutoDjIdentity& identity) override{
+		// Independent authority re-check: hasStableIdEndpoint() already
+		// gates every call site that could reach here (tick()'s continuous
+		// gate, and beginNextLoad()'s own defense-in-depth check), but this
+		// stays a hard, unconditional reject here too so a future caller
+		// reaching submitLoad() through some other path can never load
+		// against an authority already known to be gone.
+		if(!sessionPort.autoDjStableIdAuthorityReady()) return false;
 		// Hard, unconditional reject while Coach's own rollback (mix/sync/
 		// stop-deck restore after a failed/cancelled transition) is still
 		// unsettled - independent of loadSubPhase, so this guard holds even

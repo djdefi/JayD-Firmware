@@ -499,6 +499,8 @@ const char* autoDjFailReasonName(AutoDjFailReason reason){
 		case AutoDjFailReason::CapabilityDisabled: return "capability_disabled";
 		case AutoDjFailReason::RetryBudgetExhausted: return "retry_budget_exhausted";
 		case AutoDjFailReason::RecordingFailure: return "recording_failure";
+		case AutoDjFailReason::TeardownTimeout: return "teardown_timeout";
+		case AutoDjFailReason::AuthorityUnavailable: return "authority_unavailable";
 		default: return "none";
 	}
 }

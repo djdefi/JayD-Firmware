@@ -191,7 +191,22 @@ enum class AutoDjFailReason : uint8_t {
 	// targeted, so submitting a fresh load could race them. Requires an
 	// explicit reset() (and, in practice, human verification of real deck
 	// state) before Auto DJ can arm again.
-	TeardownTimeout
+	TeardownTimeout,
+	// The stable-ID load authority (DjAssistController's candidate-table
+	// allocation + running fill-worker) was available at arm()/start() time
+	// but has since become unavailable - e.g. the fill-worker exited or a
+	// later allocation failed - while Auto DJ was Running. Checked
+	// continuously every tick(), not just at arm()/start(), so a capability
+	// loss mid-session is caught before any further load is ever attempted
+	// against an authority that can no longer produce a trustworthy
+	// candidate. Terminal and never retried/skipped through, matching
+	// TeardownTimeout's rationale: retrying here would only ever resubmit
+	// against the same dead authority. If a composite load/Coach-transition/
+	// rollback was already in flight when the loss was detected, that
+	// attempt is always allowed to settle to its own outcome first (see
+	// DjAutoDjPlanner::failAfterPending's doc comment) - this reason is
+	// never used to interrupt or strand an in-flight command.
+	AuthorityUnavailable
 };
 
 #endif //JAYD_FIRMWARE_DJ_AUTO_DJ_TYPES_H

@@ -631,6 +631,8 @@ void MixScreen::MixScreen::drawAutoDjBank(){
 			case AutoDjFailReason::CapabilityDisabled: reasonText = "NO STABLE-ID LOAD CAPABILITY"; break;
 			case AutoDjFailReason::RetryBudgetExhausted: reasonText = "LOAD RETRY BUDGET EXHAUSTED"; break;
 			case AutoDjFailReason::RecordingFailure: reasonText = "RECORDING FAILURE"; break;
+			case AutoDjFailReason::TeardownTimeout: reasonText = "ROLLBACK DID NOT SETTLE"; break;
+			case AutoDjFailReason::AuthorityUnavailable: reasonText = "LOAD AUTHORITY UNAVAILABLE"; break;
 			default: reasonText = "UNKNOWN"; break;
 		}
 		canvas->setTextDatum(MC_DATUM);
