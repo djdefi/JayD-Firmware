@@ -210,6 +210,48 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_test(NAME DjAssistIntegrationSelfCheckTSan COMMAND DjAssistIntegrationSelfCheckTSan)
 endif ()
 
+# Isolated Auto DJ core (DjAutoDjQueue/DjAutoDjHistory/DjAutoDjStateMachine/
+# DjAutoDjPlanner). Hardware-free by design (see src/AutoDj/DjAutoDjTypes.h),
+# held to the same strict bar as DjAssistSelfCheck: warnings-as-errors plus
+# ASan/UBSan on compilers that support it.
+add_executable(AutoDjSelfCheck
+        tests/auto_dj_selfcheck.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp)
+set_target_properties(AutoDjSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjSelfCheck COMMAND AutoDjSelfCheck)
+
+# Real AutoDjSessionActuator (the production coordinator DjSession drives via
+# the AutoDjSessionPort seam) exercised end-to-end - scan/plan/submit/apply,
+# already-queued exclusion, manual-takeover pause, library-generation
+# invalidation (including mid-retry abandonment and the Stopping path),
+# missing-safe-window conservatism, recording-failure handling, pinned-track
+# identity translation, and bounded stop/pause/resume cycling - against a
+# fake AutoDjSessionPort double. DjSession.cpp itself is not host-compiled
+# here (AudioLib/SD/esp_system dependencies are out of scope for a host
+# build, same boundary DjAssistIntegrationSelfCheck already draws for
+# DjSession/DjAssistController), but every line of the real
+# AutoDjSessionActuator/DjAutoDjPlanner stack that DjSession calls into is
+# exercised through the exact same port interface DjSession implements in
+# production.
+add_executable(AutoDjSessionBridgeSelfCheck
+        tests/auto_dj_session_bridge_selfcheck.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp
+        src/DjAssist/DjAssistScoring.cpp)
+set_target_properties(AutoDjSessionBridgeSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjSessionBridgeSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjSessionBridgeSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjSessionBridgeSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjSessionBridgeSelfCheck COMMAND AutoDjSessionBridgeSelfCheck)
+
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the
 # pinned JayD-Library headers (WavHeader.h, AudioSetup.hpp) via

@@ -92,7 +92,26 @@ enum DjCommandType : uint8_t {
 	// on wireless) since the physical Assist bank uses these too.
 	DJ_COMMAND_ASSIST_SET_MODE,
 	DJ_COMMAND_ASSIST_ARM_TRANSITION,
-	DJ_COMMAND_ASSIST_CANCEL_TRANSITION
+	DJ_COMMAND_ASSIST_CANCEL_TRANSITION,
+	// Auto DJ runtime state-machine control surface. Always present (not
+	// gated on wireless) since the physical Auto DJ bank uses these too -
+	// routing both origins through the same submit()/validate() pipeline
+	// gives every Auto DJ control the same boot_id/session_id staleness
+	// check and client_command_id idempotent-retry dedup as every other
+	// command, and a durable, pollable DjCommandResult. Arm/Resume still
+	// require the one-shot autoDjPhysicalConfirm() gate to have been set
+	// immediately beforehand (DjSession::apply() does this for the caller
+	// exactly once per command, mirroring the physical bank's convention);
+	// authenticated+leased browser origin and physical-hold origin both
+	// count as a valid confirmation source. These never touch a deck
+	// directly - only DjAutoDjPlanner's own internal, already
+	// origin-aware/mutex-protected DJ_COMMAND_LOAD_DECK submissions do.
+	DJ_COMMAND_AUTODJ_ARM,
+	DJ_COMMAND_AUTODJ_START,
+	DJ_COMMAND_AUTODJ_PAUSE,
+	DJ_COMMAND_AUTODJ_RESUME,
+	DJ_COMMAND_AUTODJ_STOP,
+	DJ_COMMAND_AUTODJ_RESET
 #if defined(JAYD_ENABLE_WIRELESS)
 	,DJ_COMMAND_OPEN_PAIRING
 #endif
@@ -139,11 +158,26 @@ enum DjCommandError : uint8_t {
 	// policy below. The manual command keeps its place; the caller (the
 	// actuator's poll loop) simply retries the same submit next tick once
 	// it drains.
-	DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING
+	DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING,
+	// Auto DJ arm/start/pause/resume/stop/reset rejected by the state
+	// machine's own precondition for the requested transition (capability
+	// disabled, missing physical/authenticated confirmation, no safe
+	// window to start, or wrong current state - e.g. start() while Off).
+	// See DjAutoDjStateMachine for the exact per-transition guard rules;
+	// this is a generic rejection code because the state machine itself
+	// only reports a bool accept/reject per call, not a granular reason.
+	DJ_COMMAND_ERROR_AUTODJ_REJECTED
 #if defined(JAYD_ENABLE_WIRELESS)
 	,DJ_COMMAND_ERROR_STALE_IDENTITY,
 	DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED
 #endif
+	// DJ_COMMAND_LOAD_DECK submitted with no path (an Auto DJ stable-ID
+	// load, see DjSession::loadDeckByIdentity()): the library generation
+	// changed since submit, the reader isn't Ready, or the fingerprint
+	// resolved to zero or more than one track (trackByFingerprint()
+	// reports Stale on any duplicate-fingerprint match) - never guessed,
+	// never falls back to a stale/foreign path.
+	,DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED
 };
 
 enum DjTimingQuality : uint8_t {
@@ -297,6 +331,67 @@ struct DjAssistIntentGenerations {
 	uint32_t playing[DJ_DECK_COUNT] = {};
 	uint32_t sync[DJ_DECK_COUNT] = {};
 };
+
+// Monotonic non-system ("user"/manual) intent generation per deck, plus a
+// shared crossfader-mix generation - deliberately a SEPARATE, broader
+// tracker from DjAssistIntentGenerations above. Coach's transition guard
+// only needs to know about mix/play/sync (the controls its own plan steps
+// touch); Auto DJ must yield to ANY manual transport, crossfader, rate/
+// effect, load, cue, or loop touch on either deck (see
+// djIsAutoDjManualSignal()/djBumpAutoDjManualIntent()), a materially wider
+// set, so the two counters intentionally do not share storage. Bumped by
+// DjSession::submit() immediately on admission (see
+// djBumpAutoDjManualIntent()), same timing convention as
+// DjAssistIntentGenerations, so a manual command still only queued is
+// visible to the Auto DJ actuator's baseline comparison right away.
+struct AutoDjManualIntentGenerations {
+	uint32_t deck[DJ_DECK_COUNT] = {};
+	uint32_t mix = 0;
+};
+
+// True for every command type that represents "the user is driving this
+// deck directly right now": transport (play/seek), stable-ID or path load,
+// gain, rate/effect, quantize, loop, cue, and sync control. Coach's own
+// ASSIST_* commands and pairing are never deck/mix commands so they are
+// excluded by construction. Recording start/stop is deliberately excluded:
+// Auto DJ never starts or stops a recording itself, and a recording toggle
+// alone does not contest deck/transport ownership.
+inline bool djIsAutoDjManualSignal(const DjCommand& command){
+	switch(command.type){
+		case DJ_COMMAND_LOAD_DECK:
+		case DJ_COMMAND_SET_PLAYING:
+		case DJ_COMMAND_SEEK:
+		case DJ_COMMAND_SET_GAIN:
+		case DJ_COMMAND_SET_EFFECT_TYPE:
+		case DJ_COMMAND_SET_EFFECT_INTENSITY:
+		case DJ_COMMAND_SET_QUANTIZE:
+		case DJ_COMMAND_LOOP_ENGAGE:
+		case DJ_COMMAND_LOOP_DISENGAGE:
+		case DJ_COMMAND_LOOP_RELOOP:
+		case DJ_COMMAND_SET_CUE:
+		case DJ_COMMAND_TRIGGER_CUE:
+		case DJ_COMMAND_CLEAR_CUE:
+		case DJ_COMMAND_SET_SYNC:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// Mirrors djBumpIntentGeneration()'s admission-time timing/origin policy
+// (system-origin commands - Auto DJ's own stable-ID loads - never bump
+// this), but over the broader djIsAutoDjManualSignal() set instead of just
+// mix/play/sync.
+inline void djBumpAutoDjManualIntent(AutoDjManualIntentGenerations& generations, const DjCommand& command){
+	if(command.origin == DJ_ORIGIN_SYSTEM) return;
+	if(command.type == DJ_COMMAND_SET_MIX){
+		generations.mix++;
+		return;
+	}
+	if(djIsAutoDjManualSignal(command) && command.deck < DJ_DECK_COUNT){
+		generations.deck[command.deck]++;
+	}
+}
 
 struct DjEffectSnapshot {
 	uint8_t type = 0;

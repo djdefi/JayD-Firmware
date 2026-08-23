@@ -6,9 +6,7 @@
 //       -I ../src/AutoDj auto_dj_selfcheck.cpp ../src/AutoDj/DjAutoDjPlanner.cpp \
 //       -o auto_dj_selfcheck && ./auto_dj_selfcheck
 //
-// This is not yet wired into CMakeLists.txt on purpose: that file is being
-// edited concurrently on other branches, and this layer is still isolated
-// pending rebase onto the final Coach/DjSession interfaces.
+// Also wired into CMakeLists.txt as the AutoDjSelfCheck CTest target.
 
 #include <assert.h>
 #include <string.h>

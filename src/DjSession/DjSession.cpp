@@ -59,7 +59,7 @@ void DjSession::end(){
 }
 
 DjSession::DjSession(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix) :
-		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter){
+		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter), autoDjActuator(*this){
 	system = new MixSystem();
 	if(!orphanRecoveryDone){
 		orphanRecoveryDone = true;
@@ -100,6 +100,7 @@ DjSubmitResult DjSession::submit(DjCommand command){
 
 	const DjSubmitResult result = admitAssistCommand(
 		command, commandQueue, commandResults, assistTracked, assistIntentGenerations);
+	if(result.status == DJ_COMMAND_ACCEPTED) djBumpAutoDjManualIntent(autoDjManualIntentGenerations, command);
 	if(result.error == DJ_COMMAND_ERROR_QUEUE_FULL) queueDrops++;
 	commandMutex.unlock();
 	return result;
@@ -126,6 +127,23 @@ DjSubmitResult DjSession::loadDeck(
 	}
 	return submit(command);
 }
+
+DjSubmitResult DjSession::loadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity){
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_LOAD_DECK;
+	command.deck = deck;
+	metadataMutex.lock();
+	command.libraryGeneration = libraryGeneration;
+	command.libraryKey = libraryKey;
+	metadataMutex.unlock();
+	command.trackIdentity = identity;
+	// command.path is left empty (DjCommand{} zero-initializes char[]) -
+	// the sole signal to validate()/applyLoad() that this is a stable-ID
+	// load to be resolved internally, never a caller-supplied path.
+	return submit(command);
+}
+
 
 DjSubmitResult DjSession::setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin){
 	DjCommand command = {};
@@ -326,7 +344,7 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		return DJ_COMMAND_ERROR_STALE_IDENTITY;
 	}
 #else
-	if(command.type > DJ_COMMAND_ASSIST_CANCEL_TRANSITION) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_AUTODJ_RESET) return DJ_COMMAND_ERROR_INVALID_VALUE;
 #endif
 
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
@@ -361,7 +379,14 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
 	   command.value > 255) return DJ_COMMAND_ERROR_INVALID_VALUE;
 	if(command.type == DJ_COMMAND_LOAD_DECK){
-		if(command.path[0] == '\0' || memchr(command.path, '\0', DJ_PATH_CAPACITY) == nullptr){
+		if(command.path[0] == '\0'){
+			// Stable-ID load (see DjSession::loadDeckByIdentity()): valid
+			// only with fingerprint evidence to resolve against - an empty
+			// path AND no identity is never accepted as "load nothing".
+			if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)){
+				return DJ_COMMAND_ERROR_INVALID_PATH;
+			}
+		}else if(memchr(command.path, '\0', DJ_PATH_CAPACITY) == nullptr){
 			return DJ_COMMAND_ERROR_INVALID_PATH;
 		}
 	}
@@ -518,6 +543,49 @@ void DjSession::invalidateLibraryMetadata(){
 	}
 	metadataMutex.unlock();
 	publishSnapshot();
+}
+
+bool DjSession::resolveIdentityPath(const DjCommand& command, char* outPath, size_t outCapacity){
+	if(outCapacity == 0) return false;
+	outPath[0] = '\0';
+	if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
+
+	metadataMutex.lock();
+	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+	   command.libraryGeneration != libraryGeneration ||
+	   command.libraryKey != libraryKey){
+		// Reject stale/missing generation outright rather than resolve
+		// against a library snapshot the caller no longer agrees with.
+		metadataMutex.unlock();
+		return false;
+	}
+
+	JaydMetadata::Track track{};
+	const JaydMetadata::Status status =
+		metadataReader.trackByFingerprint(command.trackIdentity.fingerprint, track);
+	if(status != JaydMetadata::Status::Ready){
+		// Missing (no match) and Stale (ambiguous - more than one track
+		// shares this fingerprint) are both rejected identically: never
+		// guess which candidate the caller meant.
+		metadataMutex.unlock();
+		return false;
+	}
+
+	// Index-stored paths never carry the leading '/' (see
+	// Reader::validateTrack()'s rejection of any stored path that does);
+	// reconstruct the real SD path here.
+	if(outCapacity < 2){
+		metadataMutex.unlock();
+		return false;
+	}
+	outPath[0] = '/';
+	const bool ok = metadataReader.readString(track.path, outPath + 1, outCapacity - 1);
+	metadataMutex.unlock();
+	if(!ok){
+		outPath[0] = '\0';
+		return false;
+	}
+	return true;
 }
 
 DjMetadataState DjSession::resolveMetadata(
@@ -788,6 +856,191 @@ void DjSession::assistPurgePendingSystemCommands(uint8_t deck){
 	commandMutex.unlock();
 }
 
+// -- AutoDjSessionPort --
+
+uint32_t DjSession::autoDjCandidateCount(){
+	return assistTrackCount();
+}
+
+bool DjSession::autoDjCandidateEntry(
+	uint32_t index,
+	DjAssistLibraryEntry& outEntry,
+	uint32_t& outArtistHash,
+	uint32_t& outTitleHash,
+	uint32_t& outRevision
+){
+	metadataMutex.lock();
+	// Same single-critical-section discipline as assistTrackEntry(): the
+	// revision, base entry, and artist/title hashes are all read under one
+	// lock acquisition so a concurrent reader swap can never be observed
+	// as a mix of two different reader states.
+	outRevision = metadataRevision;
+	outArtistHash = 0;
+	outTitleHash = 0;
+	JaydMetadata::Track track;
+	const bool ok = metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready &&
+		metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
+	if(ok){
+		const DjTrackIdentity identity = DjAssistBridge::buildTrackIdentity(track.fingerprint, track.sourceId);
+		outEntry = DjAssistBridge::buildLibraryEntry(
+			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
+			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
+		);
+		// Best-effort: readStringHash() leaves the hash untouched (still
+		// the pre-zeroed value above) on failure, so a bad artist/title
+		// offset just reads back as "unknown" rather than failing the
+		// whole entry - the rest of the entry is still valid for scoring.
+		metadataReader.readStringHash(track.artist, outArtistHash);
+		metadataReader.readStringHash(track.title, outTitleHash);
+	}
+	metadataMutex.unlock();
+	return ok;
+}
+
+uint32_t DjSession::autoDjMetadataRevision(){
+	return assistMetadataRevision();
+}
+
+uint32_t DjSession::autoDjLibraryGeneration(){
+	return libraryGeneration;
+}
+
+DjAssistDeckContext DjSession::autoDjActiveDeckContext(){
+	DjSnapshot snapshot;
+	if(!copySnapshot(snapshot)) return DjAssistDeckContext();
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		if(!snapshot.decks[deck].playing) continue;
+		const DjDeckSnapshot& d = snapshot.decks[deck];
+		if(!d.loaded || d.metadata.state != DJ_METADATA_VALID) return DjAssistDeckContext();
+		DjAssistDeckContext ctx;
+		ctx.valid = true;
+		ctx.bpmMilli = d.metadata.bpmMilli;
+		ctx.key = d.metadata.key;
+		ctx.sampleRate = d.metadata.sourceSampleRate;
+		// Same coarse elapsed/duration-derived estimate as
+		// DjAssistController::buildDeckContext() - deliberately not
+		// frame-accurate, sufficient for a bounded scoring signal.
+		const uint64_t elapsedFrames = ctx.sampleRate ? uint64_t(d.elapsed) * ctx.sampleRate : 0;
+		const uint64_t totalFrames = d.metadata.sourceDurationFrames;
+		ctx.remainingFrames = elapsedFrames < totalFrames ? totalFrames - elapsedFrames : 0;
+		return ctx;
+	}
+	return DjAssistDeckContext();
+}
+
+uint8_t DjSession::autoDjTargetDeck(){
+	DjSnapshot snapshot;
+	if(!copySnapshot(snapshot)) return 1;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		if(!snapshot.decks[deck].playing) return deck;
+	}
+	return 1; // neither/both decks playing: deterministic fallback, callers
+	          // must gate on autoDjActiveDeckContext().valid first anyway.
+}
+
+DjSubmitResult DjSession::autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity){
+	return loadDeckByIdentity(deck, identity);
+}
+
+void DjSession::autoDjTrackLoadCommand(uint32_t commandId){
+	commandMutex.lock();
+	autoDjTracked.id = commandId;
+	autoDjTracked.tracked = true;
+	autoDjTracked.status = DJ_COMMAND_ACCEPTED;
+	commandMutex.unlock();
+}
+
+DjCommandStatus DjSession::autoDjLoadCommandStatus(uint32_t commandId){
+	commandMutex.lock();
+	DjCommandStatus status = DJ_COMMAND_PENDING;
+	if(autoDjTracked.tracked && autoDjTracked.id == commandId){
+		status = autoDjTracked.status;
+	}
+	commandMutex.unlock();
+	return status;
+}
+
+AutoDjManualIntentGenerations DjSession::autoDjManualIntentGenerationsSnapshot(){
+	commandMutex.lock();
+	const AutoDjManualIntentGenerations generations = autoDjManualIntentGenerations;
+	commandMutex.unlock();
+	return generations;
+}
+
+bool DjSession::autoDjConsumePhysicalConfirmation(){
+	commandMutex.lock();
+	const bool confirmed = autoDjPhysicalConfirmPending;
+	autoDjPhysicalConfirmPending = false;
+	commandMutex.unlock();
+	return confirmed;
+}
+
+// -- Auto DJ thin public wrappers (physical bank / browser API v2) --
+// Both origins submit the exact same DjCommand types and go through
+// apply()'s switch below, which performs the actual actuator call under
+// the same commandMutex-serialized processing every other command gets.
+
+DjSubmitResult DjSession::autoDjArmCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_ARM;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjStartCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_START;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjPauseCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_PAUSE;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjResumeCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_RESUME;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjStopCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_STOP;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjResetCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_RESET;
+	return submit(command);
+}
+
+bool DjSession::autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistHash, uint32_t titleHash){
+	if(!(identity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
+	AutoDjIdentity autoIdentity;
+	autoIdentity.flags = identity.flags & (AUTO_DJ_IDENTITY_FINGERPRINT | AUTO_DJ_IDENTITY_SOURCE);
+	autoIdentity.libraryGeneration = libraryGeneration;
+	memcpy(autoIdentity.fingerprint, identity.fingerprint, sizeof(autoIdentity.fingerprint));
+	return autoDjActuator.pinTrack(autoIdentity, artistHash, titleHash);
+}
+
+void DjSession::autoDjPhysicalConfirm(){
+	commandMutex.lock();
+	autoDjPhysicalConfirmPending = true;
+	commandMutex.unlock();
+}
+
+void DjSession::copyAutoDjSnapshot(AutoDjSnapshot& snapshot) const{
+	autoDjActuator.copySnapshot(snapshot);
+}
+
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
 	if(!system || !left || !right || !output) return;
 	if(viewAttached && viewInfo[0] == left && viewInfo[1] == right && viewInfo[2] == output) return;
@@ -824,6 +1077,9 @@ void DjSession::loop(uint micros){
 		if(assistTracked.tracked && assistTracked.id == command.id){
 			assistTracked.status = status;
 		}
+		if(autoDjTracked.tracked && autoDjTracked.id == command.id){
+			autoDjTracked.status = status;
+		}
 		commandMutex.unlock();
 	}
 
@@ -843,10 +1099,21 @@ void DjSession::loop(uint micros){
 	// publish this tick.
 	publishSnapshot();
 	tickAssist();
+	// Same same-iteration-freshness reasoning as tickAssist() above:
+	// AutoDjSessionActuator::tick() takes its own copySnapshot() (called
+	// after publishSnapshot(), same as Coach) and only ever submits
+	// DjCommands (via loadDeckByIdentity()) rather than mutating session
+	// state directly, so a single tick after publishSnapshot() is
+	// sufficient for it too.
+	tickAutoDj();
 }
 
 void DjSession::tickAssist(){
 	assistController.tick();
+}
+
+void DjSession::tickAutoDj(){
+	autoDjActuator.tick();
 }
 
 bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics){
@@ -1084,6 +1351,54 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		case DJ_COMMAND_ASSIST_CANCEL_TRANSITION:
 			assistController.cancelTransition();
 			return true;
+		// Arm/Resume consume the one-shot physical/authenticated
+		// confirmation gate right here, synchronously within the same
+		// apply() call that performs the transition - a command can only
+		// ever reach this point after either a physical hold gesture
+		// (DJ_ORIGIN_PHYSICAL, set immediately before submit() by the Mix
+		// screen) or an authenticated+leased browser request
+		// (DJ_ORIGIN_HTTP, gated by handleCommand()'s authorize()+
+		// hasWriterLease() before submit()), so setting the flag here is
+		// exactly the required "physical OR authenticated" confirmation,
+		// never a bare unconfirmed arm.
+		case DJ_COMMAND_AUTODJ_ARM:
+			autoDjPhysicalConfirm();
+			if(!autoDjArm()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_START:
+			if(!autoDjStart()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_PAUSE:
+			if(!autoDjPause()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_RESUME:
+			autoDjPhysicalConfirm();
+			if(!autoDjResume()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_STOP:
+			if(!autoDjStop()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_RESET:
+			if(!autoDjReset()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
 #if defined(JAYD_ENABLE_WIRELESS)
 		case DJ_COMMAND_OPEN_PAIRING:
 			pairingGeneration++;
@@ -1106,7 +1421,25 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 			return false;
 		}
 	}
-	fs::File file = SD.open(command.path);
+
+	// Stable-ID load (empty path, see loadDeckByIdentity()/validate()):
+	// resolve the path internally against the live, in-memory metadata
+	// index before touching SD at all. Never guessed, never falls back to
+	// a stale/foreign path - any missing/ambiguous/stale-generation
+	// resolution fails the whole command with
+	// DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED.
+	const bool identityLoad = command.path[0] == '\0';
+	char resolvedPath[DJ_PATH_CAPACITY] = {};
+	const char* loadPath = command.path;
+	if(identityLoad){
+		if(!resolveIdentityPath(command, resolvedPath, sizeof(resolvedPath))){
+			error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
+			return false;
+		}
+		loadPath = resolvedPath;
+	}
+
+	fs::File file = SD.open(loadPath);
 	if(!file){
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
 		return false;
@@ -1116,13 +1449,27 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	DjTrackMetadataSnapshot candidateMetadata{};
 	metadataMutex.lock();
 	resolveMetadata(
-		command.path,
+		loadPath,
 		command.libraryGeneration,
 		command.libraryKey,
 		&command.trackIdentity,
 		candidateTrack,
 		candidateMetadata
 	);
+	// Identity-only loads get one extra guard ordinary path-based loads
+	// deliberately don't (an unindexed/loose file is a legitimate
+	// path-based load): resolveIdentityPath() above already matched this
+	// exact fingerprint against the live index, so if this independent
+	// second check (resolveMetadata()'s own generation+fingerprint
+	// cross-validation, see its doc comment) now reports anything other
+	// than DJ_METADATA_VALID - stale, corrupt, or otherwise - Auto DJ
+	// must never silently load the file anyway; hard-reject instead.
+	if(identityLoad && candidateMetadata.state != DJ_METADATA_VALID){
+		metadataMutex.unlock();
+		file.close();
+		error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
+		return false;
+	}
 
 	const bool hadLeft = hasDeck(0);
 	const bool hadRight = hasDeck(1);
@@ -1136,7 +1483,7 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	}
 
 	files[command.deck] = file;
-	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
+	memcpy(paths[command.deck], loadPath, strlen(loadPath) + 1);
 	metadataTracks[command.deck] = candidateTrack;
 	deckMetadata[command.deck].commitIfLoaded(
 		candidateMetadata,

@@ -9,6 +9,7 @@ enum MixControlBank : uint8_t {
 	MIX_BANK_BROWSE,
 	MIX_BANK_LOOPSYNC,
 	MIX_BANK_ASSIST,
+	MIX_BANK_AUTODJ,
 	MIX_BANK_COUNT
 };
 
@@ -18,6 +19,7 @@ enum MixPaletteItem : uint8_t {
 	MIX_PALETTE_BROWSE,
 	MIX_PALETTE_LOOPSYNC,
 	MIX_PALETTE_ASSIST,
+	MIX_PALETTE_AUTODJ,
 	MIX_PALETTE_MATRIX,
 	MIX_PALETTE_RESCAN,
 	MIX_PALETTE_SETTINGS,
@@ -48,7 +50,7 @@ struct MixControlState {
 
 	MixPaletteItem confirmPalette(){
 		const MixPaletteItem selected = static_cast<MixPaletteItem>(paletteSelection);
-		if(selected <= MIX_PALETTE_ASSIST) bank = static_cast<MixControlBank>(selected);
+		if(selected <= MIX_PALETTE_AUTODJ) bank = static_cast<MixControlBank>(selected);
 		paletteOpen = false;
 		return selected;
 	}

@@ -10,9 +10,11 @@
 #include "../Metadata/JaydMetadata.h"
 #include "../DjAssist/DjAssistController.h"
 #include "../DjAssist/DjAssistSessionPort.h"
+#include "../AutoDj/AutoDjSessionActuator.h"
+#include "../AutoDj/AutoDjSessionPort.h"
 #include "DjSessionState.h"
 
-class DjSession : public LoopListener, public DjAssistSessionPort {
+class DjSession : public LoopListener, public DjAssistSessionPort, public AutoDjSessionPort {
 public:
 	static DjSession* begin(uint8_t leftGain, uint8_t rightGain, uint8_t mix);
 	static DjSession* get();
@@ -25,6 +27,16 @@ public:
 		DjCommandOrigin origin,
 		const DjTrackIdentity* identity = nullptr
 	);
+	// Stable-ID load: never accepts a path from the caller. path stays
+	// empty in the submitted command; validate()/applyLoad() resolve it
+	// internally against the live, in-memory metadata index (fingerprint
+	// lookup + generation check), rejecting a missing/ambiguous/stale
+	// identity with DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED rather
+	// than ever guessing or falling back to a foreign path. Always
+	// DJ_ORIGIN_SYSTEM: only Auto DJ calls this (see
+	// AutoDjSessionActuator), so it never itself counts as a manual
+	// takeover (see djBumpAutoDjManualIntent()).
+	DjSubmitResult loadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity);
 	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin);
 	DjSubmitResult seek(uint8_t deck, uint16_t seconds, DjCommandOrigin origin);
 	DjSubmitResult setGain(uint8_t deck, uint8_t gain, DjCommandOrigin origin);
@@ -136,6 +148,56 @@ public:
 	void assistPurgePendingSystemCommands(uint8_t deck) override;
 
 	bool copySnapshot(DjSnapshot& snapshot) override;
+
+	// AutoDjSessionPort (AutoDjSessionActuator.h/.cpp) - candidate table
+	// with artist/title hashes (DjAssistLibraryEntry alone doesn't carry
+	// these), the currently-playing deck's scoring context, stable-ID
+	// load submission/tracking, and the broader manual-takeover surface.
+	// See AutoDjSessionPort.h for the exact contract each method fulfills.
+	uint32_t autoDjCandidateCount() override;
+	bool autoDjCandidateEntry(
+		uint32_t index,
+		DjAssistLibraryEntry& outEntry,
+		uint32_t& outArtistHash,
+		uint32_t& outTitleHash,
+		uint32_t& outRevision
+	) override;
+	uint32_t autoDjMetadataRevision() override;
+	uint32_t autoDjLibraryGeneration() override;
+	DjAssistDeckContext autoDjActiveDeckContext() override;
+	uint8_t autoDjTargetDeck() override;
+	DjSubmitResult autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity) override;
+	void autoDjTrackLoadCommand(uint32_t commandId) override;
+	DjCommandStatus autoDjLoadCommandStatus(uint32_t commandId) override;
+	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override;
+	bool autoDjConsumePhysicalConfirmation() override;
+
+	// Thin public wrappers over the Auto DJ planner/actuator for the
+	// physical Auto DJ bank and browser/API v2 to drive. Each routes
+	// through submit()/apply() (like assistArmTransition()/
+	// assistCancelTransition() above) rather than calling the actuator
+	// directly, so both origins get the same boot_id/session_id
+	// staleness check, client_command_id idempotent-retry dedup, and a
+	// durable, pollable DjCommandResult - not just a bare bool. Arm/
+	// Resume additionally require autoDjPhysicalConfirm() to have been
+	// called immediately beforehand in the same handler (apply()
+	// consumes the one-shot flag synchronously for these two types).
+	DjSubmitResult autoDjArmCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjStartCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjPauseCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjResumeCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjStopCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjResetCommand(DjCommandOrigin origin);
+	bool autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistHash, uint32_t titleHash);
+	// Sets the one-shot physical/browser confirmation gate consumed by
+	// autoDjConsumePhysicalConfirmation() on the very next arm()/resume()
+	// check - set from the physical bank's hold-to-confirm gesture
+	// (mirrors Coach's L1/R1 500ms encBtnHold convention) or an
+	// authenticated browser confirm action, never from a plain
+	// press/click.
+	void autoDjPhysicalConfirm();
+	void copyAutoDjSnapshot(AutoDjSnapshot& snapshot) const;
+
 	bool hasPendingLoad();
 	bool libraryWorkAllowed();
 	DjMetadataState refreshLibraryMetadata(uint32_t generation, uint64_t libraryKey);
@@ -242,6 +304,40 @@ private:
 
 	DjAssistController assistController;
 	void tickAssist();
+
+	// Auto DJ's own durable single-slot command-outcome tracker (mirrors
+	// assistTracked's semantics/timing exactly, but for the one
+	// stable-ID load Auto DJ is ever waiting on at a time -
+	// AutoDjSessionActuator enforces the "at most one in flight" part of
+	// the contract, this just needs to survive commandResults' bounded
+	// ring eviction). Only Auto DJ ever submits a DJ_ORIGIN_SYSTEM
+	// LOAD_DECK, so scoping this to that exact command is unambiguous.
+	DjAssistTrackedCommand autoDjTracked;
+	// Broader non-system intent-generation tracker for Auto DJ's manual-
+	// takeover detection (transport/crossfader/rate/load/cue/loop) - see
+	// AutoDjManualIntentGenerations (DjSessionState.h). Bumped from
+	// submit() alongside assistIntentGenerations, via a separate call so
+	// admitAssistCommand() (shared with Coach) never needs to know Auto
+	// DJ exists.
+	AutoDjManualIntentGenerations autoDjManualIntentGenerations;
+	// One-shot physical/browser confirmation gate for autoDjArm()/
+	// autoDjResume() - set by autoDjPhysicalConfirm(), consumed (cleared)
+	// by autoDjConsumePhysicalConfirmation() the first time it is read,
+	// so a stale confirmation can never be replayed by polling again.
+	bool autoDjPhysicalConfirmPending = false;
+	AutoDjSessionActuator autoDjActuator;
+	void tickAutoDj();
+	// Raw actuator calls - only ever invoked from apply() while
+	// commandMutex-serialized command processing already has exclusive
+	// access (see autoDjArmCommand() etc. above for the public,
+	// queue-routed entry point every caller actually uses).
+	bool autoDjArm(){ return autoDjActuator.arm(); }
+	bool autoDjStart(){ return autoDjActuator.start(); }
+	bool autoDjPause(){ return autoDjActuator.pause(); }
+	bool autoDjResume(){ return autoDjActuator.resume(); }
+	bool autoDjStop(){ return autoDjActuator.stop(); }
+	bool autoDjReset(){ return autoDjActuator.reset(); }
+	bool resolveIdentityPath(const DjCommand& command, char* outPath, size_t outCapacity);
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;
