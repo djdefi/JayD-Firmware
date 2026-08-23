@@ -123,6 +123,21 @@ public:
 				resolvePendingWhileStopping();
 				return;
 			}
+			// Nothing was pending by the time Stopping got here, but
+			// failAfterPending may still be latched: it is set as soon as
+			// authority is lost while an attempt is in flight, and is only
+			// ever cleared by cancelPending() - if that attempt then
+			// resolved via an ordinary Running tick's progressPending()
+			// (which clears pendingPhase directly, never calling
+			// cancelPending() - see failAfterPending's doc comment) before
+			// stop() was requested, this is the first place afterward that
+			// can observe it. resolvePendingWhileStopping()'s own
+			// Applied/timeout fallthrough already calls cancelPending(),
+			// so this call is only ever a no-op there; it is required
+			// here so a stale latch can never survive through Off and
+			// spuriously fail the next otherwise-healthy arm()/start(),
+			// even once the authority has since recovered.
+			cancelPending();
 			machine.finishStop();
 			return;
 		}
@@ -332,13 +347,17 @@ private:
 	}
 
 	// Centralized "abandon whatever pending bookkeeping exists" reset, used
-	// by reset() and by resolvePendingWhileStopping()'s own cleanup path -
-	// see failAfterPending's doc comment for why this (rather than
+	// by reset(), by resolvePendingWhileStopping()'s own cleanup path, and
+	// by tick()'s Stopping-with-nothing-pending path (finishStop()) - see
+	// failAfterPending's doc comment for why this (rather than
 	// progressPending()'s own Applied/ordinary-Failed resolution) is the
-	// right place to clear it: those two call sites are the only ones that
-	// abandon an attempt-cycle outright (explicit reset, or the stop
-	// sequence finishing), so a stale flag from a run that has already
-	// ended can never leak into and immediately fail the next one.
+	// right place to clear it: those three call sites are the only ones
+	// that abandon an attempt-cycle/session outright (explicit reset, the
+	// stop sequence resolving an in-flight attempt, or Stopping finishing
+	// with nothing in flight - which can still observe a latch left by an
+	// attempt that resolved earlier via an ordinary Running tick, before
+	// stop() was even requested), so a stale flag from a run that has
+	// already ended can never leak into and immediately fail the next one.
 	void cancelPending(){
 		pendingPhase = AutoDjPendingPhase::None;
 		pendingDeadlineUs = 0;

@@ -881,6 +881,88 @@ void testInvalidatedRevisionDuringStoppingNeverRecordsStaleEntry(){
 	assert(planner.state() == AutoDjState::Off);
 }
 
+// -- Round-6 MEDIUM fix: the Stopping "nothing pending" path leaked
+// failAfterPending. Sequence: authority is lost while an attempt is in
+// flight (failAfterPending latches true); that attempt then resolves via
+// an ordinary Running tick's progressPending() (which clears pendingPhase
+// directly, never calling cancelPending() - see failAfterPending's doc
+// comment), so the latch survives even though nothing is pending anymore;
+// stop() is requested before the next Running tick would have observed
+// the stale latch and failed terminal. tick()'s Stopping/pendingPhase==
+// None branch must clear the latch itself (via cancelPending()) before
+// finishStop(), or it survives through Off and spuriously fails the very
+// next otherwise-healthy arm()/start() even once authority has recovered. --
+void testAuthorityLossResolvedThenStopClearsLatchForNextSession(){
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.pinTrack(makeIdentity(91)));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending;
+	planner.tick(); // submits the load; pendingPhase -> WaitingOutcome.
+	assert(port.submitCount == 1);
+
+	port.stableIdEndpoint = false; // authority lost while this attempt is in flight.
+	port.nextOutcome = AutoDjLoadOutcome::Applied;
+	planner.tick(); // resolves Applied via the ordinary Running path -
+	                // never stranded/interrupted - but failAfterPending
+	                // stays latched true even though pendingPhase is now
+	                // None (only cancelPending() clears it).
+	assert(planner.queueDepth() == 0);
+	assert(planner.historySize() == 1);
+	assert(planner.state() == AutoDjState::Running);
+
+	// stop() lands in exactly the window the bug leaked through: before
+	// any further Running tick could have observed the latch itself.
+	assert(planner.stop());
+	assert(planner.state() == AutoDjState::Stopping);
+
+	planner.tick(); // pendingPhase already None here - must still clear the latch.
+	assert(planner.state() == AutoDjState::Off);
+
+	// Authority recovers; a fresh session must run completely healthy -
+	// no stale AuthorityUnavailable surviving from the previous run.
+	port.stableIdEndpoint = true;
+	assert(planner.pinTrack(makeIdentity(92)));
+	assert(planner.arm());
+	assert(planner.start());
+	planner.tick();
+	assert(planner.state() == AutoDjState::Running); // not Failed/AuthorityUnavailable.
+	planner.tick();
+	assert(planner.state() == AutoDjState::Running);
+}
+
+// Sibling sanity check: the same authority-loss-then-resolve sequence,
+// but with no stop() interruption, must still fail terminal
+// AuthorityUnavailable on the very next tick - proving the fix above only
+// closes the Stopping-path leak, without weakening continuous
+// enforcement itself.
+void testAuthorityLossResolvedWithoutStopStillFailsNextTick(){
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.pinTrack(makeIdentity(93)));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending;
+	planner.tick();
+	assert(port.submitCount == 1);
+
+	port.stableIdEndpoint = false;
+	port.nextOutcome = AutoDjLoadOutcome::Applied;
+	planner.tick();
+	assert(planner.state() == AutoDjState::Running);
+
+	planner.tick(); // no stop() - the ordinary continuous-enforcement gate must fire.
+	assert(planner.state() == AutoDjState::Failed);
+	assert(planner.failReason() == AutoDjFailReason::AuthorityUnavailable);
+}
+
 } // namespace
 
 int main(){
@@ -915,5 +997,7 @@ int main(){
 	testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry();
 	testInvalidatedRevisionDuringRetryNeverResubmitsStaleEntry();
 	testInvalidatedRevisionDuringStoppingNeverRecordsStaleEntry();
+	testAuthorityLossResolvedThenStopClearsLatchForNextSession();
+	testAuthorityLossResolvedWithoutStopStillFailsNextTick();
 	return 0;
 }
