@@ -68,7 +68,8 @@ bool DjAssistEngine::armTransition(
 	uint8_t crossfadeBeats,
 	bool startAtBoundary,
 	bool tempoLock,
-	const DjAssistGuardSnapshot& guard
+	const DjAssistGuardSnapshot& guard,
+	bool autoDjOwned
 ){
 	if(mode_ == DJ_ASSIST_MODE_TRANSITION_ARMED || mode_ == DJ_ASSIST_MODE_TRANSITION_RUNNING) return false;
 	if(fromDeck >= DJ_DECK_COUNT || toDeck >= DJ_DECK_COUNT || fromDeck == toDeck) return false;
@@ -99,6 +100,7 @@ bool DjAssistEngine::armTransition(
 	plan_.armedMix = guard.mix;
 	plan_.armedFromRateMilli = guard.rateMilli[fromDeck];
 	plan_.armedMixGeneration = guard.mixIntentGeneration;
+	plan_.autoDjOwned = autoDjOwned;
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
 		plan_.armedPlayGeneration[deck] = guard.playIntentGeneration[deck];
 		plan_.armedSyncGeneration[deck] = guard.syncIntentGeneration[deck];
@@ -153,6 +155,12 @@ void DjAssistEngine::buildSteps(DjAssistTransitionPlan& plan) const{
 		n++;
 	}
 	plan.stepCount = n;
+	// Every forward-plan step inherits the plan's ownership tag so
+	// DjAssistSessionActuator::submit() can propagate it onto the real
+	// DjCommand it issues - see DjAssistTransitionStep::autoDjOwned.
+	for(uint8_t i = 0; i < n; i++){
+		plan.steps[i].autoDjOwned = plan.autoDjOwned;
+	}
 }
 
 bool DjAssistEngine::stepSubmitted(DjAssistTransitionAction action) const{

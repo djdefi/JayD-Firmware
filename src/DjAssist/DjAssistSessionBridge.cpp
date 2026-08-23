@@ -37,7 +37,9 @@ DjAssistLibraryEntry buildLibraryEntry(
 	uint8_t rating,
 	uint32_t cueCount,
 	uint32_t gridCount,
-	uint32_t phraseCount
+	uint32_t phraseCount,
+	uint32_t firstGrid,
+	uint32_t firstPhrase
 ){
 	DjAssistLibraryEntry entry;
 	entry.libraryIndex = libraryIndex;
@@ -48,6 +50,11 @@ DjAssistLibraryEntry buildLibraryEntry(
 	entry.rating = rating;
 	entry.durationFrames = durationFrames;
 	entry.sampleRate = sampleRate;
+	entry.cueCount = cueCount;
+	entry.gridCount = gridCount;
+	entry.phraseCount = phraseCount;
+	entry.firstGrid = firstGrid;
+	entry.firstPhrase = firstPhrase;
 
 	uint16_t capabilities = 0;
 	if(sampleRate && durationFrames) capabilities |= DJ_METADATA_HAS_SOURCE_FRAMES;

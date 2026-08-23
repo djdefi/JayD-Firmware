@@ -87,6 +87,22 @@ public:
 	bool physicalConfirmationPresent() const override{
 		return confirmed;
 	}
+
+	// Fully controllable fake wall clock (deliberately independent of
+	// tick/call count - see AutoDjLoadPort::nowMicros()'s own doc comment):
+	// tests advance it explicitly via advanceMicros() rather than relying
+	// on a fixed per-call increment, so a timeout test asserts exactly what
+	// it claims (elapsed wall time crossed AUTO_DJ_LOAD_TIMEOUT_US) instead
+	// of coincidentally working out at some tick count.
+	uint64_t fakeNowUs = 0;
+
+	uint64_t nowMicros() const override{
+		return fakeNowUs;
+	}
+
+	void advanceMicros(uint64_t deltaUs){
+		fakeNowUs += deltaUs;
+	}
 };
 
 void testQueuePinnedOrder(){
@@ -340,12 +356,16 @@ void testLoadTimeoutIsBounded(){
 	port.durationTrustworthy = true;
 	port.nextOutcome = AutoDjLoadOutcome::Pending; // never resolves on its own
 
-	// Each attempt costs AUTO_DJ_LOAD_TIMEOUT_TICKS ticks before it's treated
-	// as a failure; (budget + 1) attempts must all time out and skip.
-	const int maxTicksAllowed = (AUTO_DJ_LOAD_TIMEOUT_TICKS + 2) * (AUTO_DJ_RETRY_BUDGET + 1) + 4;
+	// Each attempt costs AUTO_DJ_LOAD_TIMEOUT_US of (fake) wall-clock time
+	// before it's treated as a failure; (budget + 1) attempts must all
+	// time out and skip. One tick submits the load, then one tick per
+	// timed-out attempt after the fake clock crosses the deadline; a small
+	// fixed number of ticks is more than enough headroom.
 	bool skipped = false;
-	for(int i = 0; i < maxTicksAllowed && !skipped; i++){
-		planner.tick();
+	for(int attempt = 0; attempt <= AUTO_DJ_RETRY_BUDGET && !skipped; attempt++){
+		planner.tick(); // submits (or re-submits) the load
+		port.advanceMicros(AUTO_DJ_LOAD_TIMEOUT_US + 1);
+		planner.tick(); // observes the deadline has passed -> handleLoadFailure()
 		if(planner.queueDepth() == 0) skipped = true;
 	}
 	assert(skipped); // proves the timeout path converges within a bounded number of ticks, never hangs
@@ -573,11 +593,12 @@ void testPinDuringPendingLoadTimeoutRetriesSubmittedEntryNotFront(){
 	AutoDjIdentity trackY = makeIdentity(35);
 	assert(planner.pinTrack(trackY));
 
-	const int maxTicksAllowed = (AUTO_DJ_LOAD_TIMEOUT_TICKS + 2) * (AUTO_DJ_RETRY_BUDGET + 1) + 4;
 	bool dropped = false;
-	for(int i = 0; i < maxTicksAllowed && !dropped; i++){
-		planner.tick();
+	for(int attempt = 0; attempt <= AUTO_DJ_RETRY_BUDGET && !dropped; attempt++){
+		port.advanceMicros(AUTO_DJ_LOAD_TIMEOUT_US + 1);
+		planner.tick(); // observes the deadline has passed for this attempt
 		if(!planner.isQueued(candidateX.identity)) dropped = true;
+		else planner.tick(); // re-submits X for the next attempt
 	}
 	assert(dropped);
 	assert(port.submitCount == 1 + AUTO_DJ_RETRY_BUDGET); // every timeout retried X specifically

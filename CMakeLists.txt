@@ -43,13 +43,23 @@ include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/LovyanGFX/src)
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/CircuitOS/src)
 
-# Override to point host-only self-checks (DjRecordingSelfCheck) at a
+# Override to point host-only self-checks (DjRecordingSelfCheck) and the
+# real firmware compile targets (CMBuild/CMBuildWireless below) at a
 # specific JayD-Library checkout's src/ directory, e.g. a pinned SHA under
 # review, instead of whatever core version happens to be installed:
 #   cmake -DJAYD_LIBRARY_SRC=/path/to/JayD-Library/src ..
 if (NOT DEFINED JAYD_LIBRARY_SRC)
     set(JAYD_LIBRARY_SRC ${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD-Library/src)
 endif ()
+
+# arduino-cli's --library flag takes the library ROOT (the directory
+# containing library.properties), not its src/ subdirectory, so derive
+# it from JAYD_LIBRARY_SRC rather than introducing a second variable to
+# keep in sync. This is what makes CMBuild/CMBuildWireless reproducible:
+# they compile against the exact checkout named by JAYD_LIBRARY_SRC via
+# an explicit --library invocation flag, instead of silently picking up
+# whatever JayD-Library happens to be installed under Arduino15/.
+get_filename_component(JAYD_LIBRARY_ROOT ${JAYD_LIBRARY_SRC} DIRECTORY)
 
 
 # Source directories
@@ -70,13 +80,37 @@ set(BUILD ${ROOT}/build)
 
 SET_SOURCE_FILES_PROPERTIES(${CMAKE_PROJECT_NAME}.ino PROPERTIES LANGUAGE CXX)
 
+# Both firmware compile targets below pin the exact JayD-Library checkout
+# via --library ${JAYD_LIBRARY_ROOT} (an explicit invocation flag), rather
+# than relying on whatever JayD-Library version happens to be installed
+# under Arduino15/packages/.../libraries/JayD-Library. This is what makes
+# a "default" and "wireless" build reproducible from a clean environment:
+# the library source is named by JAYD_LIBRARY_SRC/-ROOT, not mutated
+# global state.
+#
+# The wireless variant sets JAYD_ENABLE_WIRELESS via
+# compiler.cpp.extra_flags, which the platform recipe appends alongside
+# (not instead of) build.extra_flags (board-level -O2 from boards.txt) -
+# using build.extra_flags here instead would silently replace -O2 with
+# nothing, which is what produced the earlier oversized/unoptimized
+# wireless build.
 add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CMAKE_PROJECT_NAME}.ino.elf
-        COMMAND arduino-cli compile --fqbn ${DEVICE} --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} ${CMAKE_PROJECT_NAME}.ino
+        COMMAND arduino-cli compile --fqbn ${DEVICE} --library ${JAYD_LIBRARY_ROOT} --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} ${CMAKE_PROJECT_NAME}.ino
         DEPENDS ${CMAKE_PROJECT_NAME}.ino ${SOURCES}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_custom_target(CMBuild
         SOURCES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CMAKE_PROJECT_NAME}.ino.elf)
+
+add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless/${CMAKE_PROJECT_NAME}.ino.elf
+        COMMAND arduino-cli compile --fqbn ${DEVICE} --library ${JAYD_LIBRARY_ROOT}
+                --build-property "compiler.cpp.extra_flags=-DJAYD_ENABLE_WIRELESS=1"
+                --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless ${CMAKE_PROJECT_NAME}.ino
+        DEPENDS ${CMAKE_PROJECT_NAME}.ino ${SOURCES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_custom_target(CMBuildWireless
+        SOURCES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless/${CMAKE_PROJECT_NAME}.ino.elf)
 
 add_custom_target(CMUpload ALL
         COMMAND arduino-cli upload --fqbn ${DEVICE} -p ${PORT} --input-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}

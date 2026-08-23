@@ -68,7 +68,11 @@ public:
 
 	// This call *is* the explicit user confirmation (mirrors
 	// DjAssistEngine::armTransition()); builds the guard snapshot itself
-	// from DjSession's current published state.
+	// from DjSession's current published state. autoDjOwned true means
+	// Auto DJ (not a direct user Coach gesture) is arming this transition;
+	// forwarded to DjAssistEngine::armTransition() so it is stamped onto
+	// the plan/steps for DjAssistSessionActuator to tag its resulting
+	// commands with (see DjAssistTransitionStep::autoDjOwned).
 	bool armTransition(
 		uint8_t fromDeck,
 		uint8_t toDeck,
@@ -76,11 +80,24 @@ public:
 		const DjTrackIdentity& targetIdentity,
 		uint8_t crossfadeBeats,
 		bool startAtBoundary,
-		bool tempoLock
+		bool tempoLock,
+		bool autoDjOwned = false
 	);
 	void cancelTransition();
 
 	void copySnapshot(DjAssistSnapshot& snapshot) const;
+
+	// True once any previously-FAILED transition has fully settled - i.e.
+	// either the engine was never in DJ_ASSIST_MODE_TRANSITION_FAILED at
+	// all, or tickRollback() has finished undoing that plan's mutations
+	// (rollbackPhase_ reached DJ_ASSIST_ROLLBACK_DONE). armTransition()
+	// itself refuses to arm a fresh transition while this is false (see
+	// its definition) - this accessor exposes the same check to callers
+	// (AutoDjSessionActuator's composite workflow, via AutoDjSessionPort::
+	// autoDjCoachTransitionSettled()) that must not treat a transition as
+	// terminally Failed - and thus retry/re-arm - until rollback is
+	// actually done, not merely started.
+	bool rollbackSettled() const;
 
 	// Bounded, RAM-only read of the background-filled candidate table
 	// (see fillWorkerStep()) - NEVER touches the metadata reader/SD card

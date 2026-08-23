@@ -56,6 +56,8 @@ public:
 	DjSnapshot snapshot;
 	AutoDjManualIntentGenerations manualGenerations;
 	bool physicalConfirmationPending = false;
+	bool coachTransitionSettled = true; // default: nothing to wait for.
+	uint64_t fakeNowUs = 0;
 
 	// Load-submission bookkeeping.
 	uint32_t nextCommandId = 1;
@@ -166,6 +168,14 @@ public:
 		const bool value = physicalConfirmationPending;
 		physicalConfirmationPending = false;
 		return value;
+	}
+
+	bool autoDjCoachTransitionSettled() override{
+		return coachTransitionSettled;
+	}
+
+	uint64_t autoDjNowMicros() const override{
+		return fakeNowUs;
 	}
 };
 
@@ -516,13 +526,14 @@ void testLibraryGenerationInvalidationWhileStopping(){
 	actuator.tick(); // resolvePendingWhileStopping(): still Pending, no resubmit path exists here regardless.
 	assert(!port.lastLoadCalled);
 
-	// Bounded: Stopping must still terminate within a fixed number of ticks.
-	// port.trackedCommandStatus never resolves in this test (stays
-	// ACCEPTED), so the only way out is resolvePendingWhileStopping()'s own
-	// AUTO_DJ_LOAD_TIMEOUT_TICKS timeout - bound the loop against that
-	// constant (now sized for the composite load+arm+transition workflow,
-	// not just a load) rather than an arbitrary small number.
-	for(int i = 0; i < int(AUTO_DJ_LOAD_TIMEOUT_TICKS) + 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
+	// Bounded: Stopping must still terminate within a fixed wall-clock
+	// deadline. port.trackedCommandStatus never resolves in this test
+	// (stays ACCEPTED), so the only way out is
+	// resolvePendingWhileStopping()'s own AUTO_DJ_LOAD_TIMEOUT_US deadline
+	// - drive the port's fake clock straight past it rather than looping
+	// an arbitrary large tick count.
+	port.fakeNowUs += AUTO_DJ_LOAD_TIMEOUT_US + 1;
+	for(int i = 0; i < 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
 	assert(actuator.state() != AutoDjState::Stopping);
 	assert(!port.lastLoadCalled); // never resubmitted the stale entry on the way out either.
 }
@@ -601,13 +612,14 @@ void testMetadataRevisionInvalidationWhileStopping(){
 	actuator.tick();
 	assert(!port.lastLoadCalled);
 
-	// Bounded: Stopping must still terminate within a fixed number of ticks.
-	// port.trackedCommandStatus never resolves in this test (stays
-	// ACCEPTED), so the only way out is resolvePendingWhileStopping()'s own
-	// AUTO_DJ_LOAD_TIMEOUT_TICKS timeout - bound the loop against that
-	// constant (now sized for the composite load+arm+transition workflow,
-	// not just a load) rather than an arbitrary small number.
-	for(int i = 0; i < int(AUTO_DJ_LOAD_TIMEOUT_TICKS) + 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
+	// Bounded: Stopping must still terminate within a fixed wall-clock
+	// deadline. port.trackedCommandStatus never resolves in this test
+	// (stays ACCEPTED), so the only way out is
+	// resolvePendingWhileStopping()'s own AUTO_DJ_LOAD_TIMEOUT_US deadline
+	// - drive the port's fake clock straight past it rather than looping
+	// an arbitrary large tick count.
+	port.fakeNowUs += AUTO_DJ_LOAD_TIMEOUT_US + 1;
+	for(int i = 0; i < 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
 	assert(actuator.state() != AutoDjState::Stopping);
 	assert(!port.lastLoadCalled); // never resubmitted the stale entry on the way out either.
 }
@@ -774,6 +786,73 @@ void testPinTrackTranslatesIdentity(){
 	assert(snapshot.queueDepth == 1);
 }
 
+// -- Test 9 (round-2 review fix #1, regression): a candidate whose identity
+// carries a nonzero sourceId (AUTO_DJ_IDENTITY_SOURCE set, real nonzero
+// bytes - not just the flag) must reach DjSession::autoDjLoadDeckByIdentity()
+// with that exact sourceId still attached, both via the scan/plan/submit
+// path (toAutoDjIdentity() then submitLoad()) and via the direct pin path
+// (pinTrack() then submitLoad()). Before this fix, AutoDjIdentity had no
+// sourceId field at all, so both conversions silently zeroed it while still
+// setting the SOURCE flag - which made DjSession::resolveMetadata() pass a
+// zeroed sourceId to trackByPath() as a REQUIRED match against the real
+// (nonzero) on-disk value, failing resolution for every nonzero-source
+// track and exhausting the retry budget.
+void testNonzeroSourceIdPropagatesThroughScanAndSubmit(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xAA);
+	port.entries[0].entry.identity.flags = DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE;
+	memset(port.entries[0].entry.identity.sourceId, 0x77, sizeof(port.entries[0].entry.identity.sourceId));
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.deckContext.key = 0x801;
+	port.libraryGeneration = 1;
+	port.physicalConfirmationPending = true;
+	setPlayingDeck(port, 0, 190, 200); // 10s remaining == exactly at end margin.
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	actuator.tick();
+	assert(actuator.start());
+	actuator.tick(); // scans, plans, submits the load on this same tick.
+
+	assert(port.lastLoadCalled);
+	assert(port.lastLoadIdentity.flags & DJ_TRACK_IDENTITY_SOURCE);
+	uint8_t expectedSourceId[16];
+	memset(expectedSourceId, 0x77, sizeof(expectedSourceId));
+	assert(memcmp(port.lastLoadIdentity.sourceId, expectedSourceId, sizeof(expectedSourceId)) == 0);
+}
+
+void testNonzeroSourceIdPropagatesThroughPin(){
+	FakeSessionPort port;
+	AutoDjSessionActuator actuator(port);
+	AutoDjIdentity identity;
+	identity.flags = AUTO_DJ_IDENTITY_FINGERPRINT | AUTO_DJ_IDENTITY_SOURCE;
+	identity.libraryGeneration = port.libraryGeneration;
+	identity.metadataRevision = port.metadataRevision; // must match, or the
+	// first tick()'s refreshMetadataRevision()/invalidateMetadataRevision()
+	// (lastKnownRevision starts at 0, differs from port.metadataRevision)
+	// would drop this pin before it can ever be submitted.
+	memset(identity.fingerprint, 0xEE, sizeof(identity.fingerprint));
+	memset(identity.sourceId, 0x99, sizeof(identity.sourceId));
+	assert(actuator.pinTrack(identity, 1, 2));
+
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.deckContext.key = 0x801;
+	port.physicalConfirmationPending = true;
+	setPlayingDeck(port, 0, 190, 200);
+	assert(actuator.arm());
+	assert(actuator.start());
+	actuator.tick(); // pinned entry is submitted ahead of any scan.
+
+	assert(port.lastLoadCalled);
+	assert(port.lastLoadIdentity.flags & DJ_TRACK_IDENTITY_SOURCE);
+	uint8_t expectedSourceId[16];
+	memset(expectedSourceId, 0x99, sizeof(expectedSourceId));
+	assert(memcmp(port.lastLoadIdentity.sourceId, expectedSourceId, sizeof(expectedSourceId)) == 0);
+}
+
 // -- Test 8: stop()/pause()/resume() cycle without a stuck pending load
 // (no infinite loop - tick() always makes bounded progress). --
 void testStopPauseResumeCycle(){
@@ -816,6 +895,8 @@ int main(){
 	testNoSafeWindowWithoutTrustworthyDuration();
 	testRecordingFailureFailsRun();
 	testPinTrackTranslatesIdentity();
+	testNonzeroSourceIdPropagatesThroughScanAndSubmit();
+	testNonzeroSourceIdPropagatesThroughPin();
 	testStopPauseResumeCycle();
 	return 0;
 }

@@ -121,6 +121,19 @@ DjSubmitResult DjSession::submit(DjCommand command){
 		for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
 			commandResults.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
 			if(autoDjTracked.tracked && autoDjTracked.id == removedIds[i]) autoDjTracked.status = DJ_COMMAND_SUPERSEDED;
+			// A purged entry can equally be one of Coach's own internal
+			// transition-step commands (tagged autoDjOwned by armTransition()
+			// when Auto is the arming origin - see DjAssistTransitionPlan's
+			// autoDjOwned field). assistTracked is the single-slot status
+			// DjAssistSessionActuator::poll() reads for that exact command id
+			// (assistTrackedStatus()); without this mirror update it would be
+			// left stale at ACCEPTED. Harmless in practice today (guardOk()'s
+			// own mix/play/sync generation and identity checks independently
+			// fail the transition on the same/next tick for anything Coach's
+			// guard cares about), but keeping both tracked slots consistent
+			// with the queue's ground truth is cheap and removes any future
+			// dependence on that coincidence.
+			if(assistTracked.tracked && assistTracked.id == removedIds[i]) assistTracked.status = DJ_COMMAND_SUPERSEDED;
 		}
 	}
 
@@ -187,12 +200,13 @@ DjSubmitResult DjSession::loadDeckByIdentity(
 }
 
 
-DjSubmitResult DjSession::setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin){
+DjSubmitResult DjSession::setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_PLAYING;
 	command.deck = deck;
 	command.value = playing;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -214,11 +228,12 @@ DjSubmitResult DjSession::setGain(uint8_t deck, uint8_t gain, DjCommandOrigin or
 	return submit(command);
 }
 
-DjSubmitResult DjSession::setMix(uint8_t value, DjCommandOrigin origin){
+DjSubmitResult DjSession::setMix(uint8_t value, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_MIX;
 	command.value = value;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -284,7 +299,7 @@ DjSubmitResult DjSession::loopReloop(uint8_t deck, DjCommandOrigin origin){
 	return submit(command);
 }
 
-DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin){
+DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_SYNC;
@@ -292,6 +307,7 @@ DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, D
 	command.value = armed;
 	// 0 = auto-master, 1..DJ_DECK_COUNT = explicit deck index + 1.
 	command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -587,7 +603,36 @@ void DjSession::invalidateLibraryMetadata(){
 	publishSnapshot();
 }
 
-bool DjSession::resolveIdentityPath(const DjCommand& command, char* outPath, size_t outCapacity){
+// Resolves a stable-ID (Auto DJ) load ENTIRELY from RAM: the path AND the
+// full DjTrackMetadataSnapshot/JaydMetadata::Track pair applyLoad() needs,
+// with zero metadataReader/SD calls on this (DjSession::loop()) thread. This
+// replaces the previous resolveIdentityPath()+resolveMetadata() pair for
+// identity loads specifically - manual path-based loads still go through
+// resolveMetadata() unchanged, since an explicit path load is legitimately
+// allowed to hit SD.
+//
+// Every field this needs (path, grid/phrase offsets+counts, precomputed
+// confidence/downbeatCount, provenanceHash, and every scalar
+// DjTrackMetadataSnapshot already carried) is populated once, off-thread, by
+// DjSession::assistTrackEntry() - the same background DjAssistFillWorker
+// pass that fills every other DjAssistLibraryEntry field - and cached in the
+// PSRAM-backed candidate table (see DjAssistLibraryEntry's doc comment).
+// Fingerprint -> entry is a bounded RAM-only scan over that same table
+// (DjAssistController::candidateEntry(), capped at
+// DJ_ASSIST_MAX_INDEX_ENTRIES POD comparisons) - never a linear SD scan.
+// Ambiguous (more than one match) or missing is rejected outright: never
+// guess. A matched entry whose own state isn't DJ_METADATA_VALID (the
+// background scan itself hit a corrupt/unreadable record, or hasn't been
+// filled yet) is rejected too - this function never partially trusts a
+// degraded cache entry.
+bool DjSession::resolveIdentityLoad(
+	const DjCommand& command,
+	char* outPath, size_t outCapacity,
+	JaydMetadata::Track& track,
+	DjTrackMetadataSnapshot& metadata
+){
+	track = {};
+	metadata = {};
 	if(outCapacity == 0) return false;
 	outPath[0] = '\0';
 	if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
@@ -605,24 +650,22 @@ bool DjSession::resolveIdentityPath(const DjCommand& command, char* outPath, siz
 		metadataMutex.unlock();
 		return false;
 	}
+	const uint32_t liveRevision = metadataRevision;
 	metadataMutex.unlock();
 
-	// Fingerprint -> libraryIndex is now a bounded RAM-only scan over the
-	// same background-filled candidate table Auto DJ's own scan reads
-	// (DjAssistController::candidateEntry(), capped at
-	// DJ_ASSIST_MAX_INDEX_ENTRIES POD comparisons) - never
-	// metadataReader.trackByFingerprint()'s old O(n) full-library scan,
-	// which issued one real SD read per track and ran on this same
-	// (main/DjSession::loop()) thread. Ambiguous (more than one match) or
-	// missing is rejected identically to the old behavior: never guess.
 	const uint32_t candidateTotal = assistController.candidateCount();
 	bool matched = false;
 	bool ambiguous = false;
-	uint32_t matchedIndex = 0;
+	DjAssistLibraryEntry matchedEntry;
 	for(uint32_t i = 0; i < candidateTotal; ++i){
 		DjAssistLibraryEntry entry;
 		uint32_t entryRevision = 0;
 		if(!assistController.candidateEntry(i, entry, entryRevision)) continue;
+		// The candidate table can (briefly) still hold entries filled
+		// under an older metadataRevision while a fresh fill pass catches
+		// up after a same-generation metadata replacement - never trust
+		// one of those, even if its fingerprint happens to still match.
+		if(entryRevision != liveRevision) continue;
 		if(!(entry.identity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) continue;
 		if(memcmp(entry.identity.fingerprint, command.trackIdentity.fingerprint, 16) != 0) continue;
 		if(matched){
@@ -630,49 +673,68 @@ bool DjSession::resolveIdentityPath(const DjCommand& command, char* outPath, siz
 			break;
 		}
 		matched = true;
-		matchedIndex = entry.libraryIndex;
+		matchedEntry = entry;
 	}
 	if(!matched || ambiguous) return false;
+	if(matchedEntry.state != DJ_METADATA_VALID) return false;
 
-	// Single bounded indexed read (not a scan) to fetch the one field the
-	// candidate table doesn't carry: the on-disk path. Still real SD I/O,
-	// but exactly one read, only on an already-resolved, already-approved
-	// library load - never a linear search.
+	// Re-check the live generation/revision one last time, immediately
+	// before committing to this entry - belt-and-suspenders against a
+	// refresh landing in the gap between the RAM scan above and here.
 	metadataMutex.lock();
 	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
 	   command.libraryGeneration != libraryGeneration ||
 	   command.libraryKey != libraryKey ||
-	   command.metadataRevision != metadataRevision){
+	   command.metadataRevision != metadataRevision ||
+	   metadataRevision != liveRevision){
 		metadataMutex.unlock();
 		return false;
 	}
-	JaydMetadata::Track track{};
-	const JaydMetadata::Status status = metadataReader.trackByIndex(matchedIndex, track);
-	if(status != JaydMetadata::Status::Ready ||
-	   memcmp(track.fingerprint, command.trackIdentity.fingerprint, 16) != 0){
-		// Defensive re-check: the underlying index could in principle
-		// have shifted between the RAM scan above and this read (both
-		// still guarded by the same libraryGeneration/libraryKey check,
-		// but belt-and-suspenders against any future gap). Reject rather
-		// than resolve to the wrong track.
-		metadataMutex.unlock();
-		return false;
-	}
+	metadataMutex.unlock();
 
 	// Index-stored paths never carry the leading '/' (see
 	// Reader::validateTrack()'s rejection of any stored path that does);
-	// reconstruct the real SD path here.
-	if(outCapacity < 2){
-		metadataMutex.unlock();
-		return false;
-	}
+	// reconstruct the real SD path here from the cached, null-terminated
+	// path string - no readString() call.
+	const size_t pathLen = strnlen(matchedEntry.path, sizeof(matchedEntry.path));
+	if(pathLen == 0 || outCapacity < pathLen + 2) return false;
 	outPath[0] = '/';
-	const bool ok = metadataReader.readString(track.path, outPath + 1, outCapacity - 1);
-	metadataMutex.unlock();
-	if(!ok){
-		outPath[0] = '\0';
-		return false;
+	memcpy(outPath + 1, matchedEntry.path, pathLen);
+	outPath[pathLen + 1] = '\0';
+
+	// Reconstruct exactly the JaydMetadata::Track fields readGrid()/
+	// readPhrase() need (see their validateGrid()/validatePhrase() call
+	// sites) purely from cached scalars - never a trackByIndex() call.
+	track.index = matchedEntry.libraryIndex;
+	memcpy(track.fingerprint, matchedEntry.identity.fingerprint, 16);
+	if(matchedEntry.identity.flags & DJ_TRACK_IDENTITY_SOURCE){
+		memcpy(track.sourceId, matchedEntry.identity.sourceId, 16);
 	}
+	track.firstGrid = matchedEntry.firstGrid;
+	track.gridCount = matchedEntry.gridCount;
+	track.firstPhrase = matchedEntry.firstPhrase;
+	track.phraseCount = matchedEntry.phraseCount;
+	track.cueCount = matchedEntry.cueCount;
+	track.sampleRate = matchedEntry.sampleRate;
+	track.durationFrames = matchedEntry.durationFrames;
+	track.bpmMilli = matchedEntry.bpmMilli;
+	track.key = matchedEntry.key;
+	track.rating = matchedEntry.rating;
+
+	metadata.state = DJ_METADATA_VALID;
+	metadata.libraryGeneration = libraryGeneration;
+	metadata.provenanceHash = matchedEntry.provenanceHash;
+	metadata.sourceSampleRate = matchedEntry.sampleRate;
+	metadata.sourceDurationFrames = matchedEntry.durationFrames;
+	metadata.bpmMilli = matchedEntry.bpmMilli;
+	metadata.key = matchedEntry.key;
+	metadata.rating = matchedEntry.rating;
+	metadata.cueCount = uint16_t(matchedEntry.cueCount);
+	metadata.gridCount = uint16_t(matchedEntry.gridCount);
+	metadata.phraseCount = uint16_t(matchedEntry.phraseCount);
+	metadata.downbeatCount = uint16_t(matchedEntry.downbeatCount);
+	metadata.confidence = matchedEntry.confidence;
+	metadata.capabilities = matchedEntry.capabilities;
 	return true;
 }
 
@@ -884,7 +946,8 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 		const DjTrackIdentity identity = DjAssistBridge::buildTrackIdentity(track.fingerprint, track.sourceId);
 		outEntry = DjAssistBridge::buildLibraryEntry(
 			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
-			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
+			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount,
+			track.firstGrid, track.firstPhrase
 		);
 		// Artist/title hashes for Auto DJ's repeat/artist/title cooldown
 		// exclusion (DjAssistLibraryEntry.artistHash/titleHash) - this
@@ -899,6 +962,54 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 		// whole entry.
 		metadataReader.readStringHash(track.artist, outEntry.artistHash);
 		metadataReader.readStringHash(track.title, outEntry.titleHash);
+
+		// path + provenanceHash: same best-effort treatment as
+		// artist/title above - a failed readString() just leaves path[]
+		// empty, which DjSession::resolveIdentityLoad() already treats as
+		// "not usable for a stable-ID load" (pathLen == 0 is rejected)
+		// without invalidating the rest of this entry's (still useful for
+		// Coach scoring) fields.
+		outEntry.path[0] = '\0';
+		metadataReader.readString(track.path, outEntry.path, sizeof(outEntry.path));
+		metadataReader.readStringHash(track.provenance, outEntry.provenanceHash);
+
+		// Precompute confidence/downbeatCount exactly as
+		// DjSession::resolveMetadata() does for a manual load - once,
+		// here, off DjSession::loop()'s thread - so
+		// DjSession::resolveIdentityLoad() never needs its own
+		// readGrid()/readPhrase() burst at Auto-apply time. Bounded by
+		// JaydMetadata::Reader::MaxGridPerTrack/MaxPhrasesPerTrack (256/
+		// 128) per track, same as resolveMetadata()'s own loop; unlike
+		// that loop, a read failure here downgrades this entry to
+		// DJ_METADATA_CORRUPT (rather than aborting the whole fill pass)
+		// so one bad track's grid/phrase data never blocks the rest of
+		// the library from filling - the other already-cached scalar
+		// fields above stay intact for Coach's own (non-grid) scoring.
+		bool gridPhraseOk = true;
+		for(uint32_t i = 0; i < track.gridCount && gridPhraseOk; ++i){
+			JaydMetadata::Grid grid;
+			if(!metadataReader.readGrid(track, i, grid)){
+				gridPhraseOk = false;
+				break;
+			}
+			if(grid.beatNumber == 1) ++outEntry.downbeatCount;
+			if(grid.confidence > outEntry.confidence) outEntry.confidence = grid.confidence;
+		}
+		for(uint32_t i = 0; i < track.phraseCount && gridPhraseOk; ++i){
+			JaydMetadata::Phrase phrase;
+			if(!metadataReader.readPhrase(track, i, phrase)){
+				gridPhraseOk = false;
+				break;
+			}
+			if(phrase.confidence > outEntry.confidence) outEntry.confidence = phrase.confidence;
+		}
+		if(!gridPhraseOk){
+			outEntry.state = DJ_METADATA_CORRUPT;
+			outEntry.confidence = 0;
+			outEntry.downbeatCount = 0;
+		}else if(outEntry.downbeatCount){
+			outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
+		}
 	}
 	metadataMutex.unlock();
 	return ok;
@@ -1112,6 +1223,14 @@ bool DjSession::autoDjConsumePhysicalConfirmation(){
 	return confirmed;
 }
 
+bool DjSession::autoDjCoachTransitionSettled(){
+	return assistController.rollbackSettled();
+}
+
+uint64_t DjSession::autoDjNowMicros() const{
+	return uint64_t(micros());
+}
+
 // -- Auto DJ thin public wrappers (physical bank / browser API v2) --
 // Both origins submit the exact same DjCommand types and go through
 // apply()'s switch below, which performs the actual actuator call under
@@ -1172,6 +1291,7 @@ bool DjSession::autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistH
 	// comment.
 	autoIdentity.metadataRevision = metadataRevision;
 	memcpy(autoIdentity.fingerprint, identity.fingerprint, sizeof(autoIdentity.fingerprint));
+	memcpy(autoIdentity.sourceId, identity.sourceId, sizeof(autoIdentity.sourceId));
 	return autoDjActuator.pinTrack(autoIdentity, artistHash, titleHash);
 }
 
@@ -1483,9 +1603,14 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			const uint8_t crossfadeBeats = uint8_t(command.value & 0xFF);
 			const bool startAtBoundary = (command.value & (1 << 8)) != 0;
 			const bool tempoLock = (command.value & (1 << 9)) != 0;
+			// command.autoDjOwned distinguishes Auto DJ's internal arm
+			// (autoDjArmCoachTransition()) from a direct user Coach gesture
+			// (assistArmTransition()) - forwarded so the resulting plan/
+			// steps are tagged for manual-takeover purge (see
+			// DjAssistTransitionStep::autoDjOwned).
 			if(!assistController.armTransition(
 				command.deck, command.slot, command.libraryIndex, command.trackIdentity,
-				crossfadeBeats, startAtBoundary, tempoLock
+				crossfadeBeats, startAtBoundary, tempoLock, command.autoDjOwned
 			)){
 				error = DJ_COMMAND_ERROR_ASSIST_REJECTED;
 				return false;
@@ -1585,8 +1710,10 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	const bool identityLoad = command.path[0] == '\0';
 	char resolvedPath[DJ_PATH_CAPACITY] = {};
 	const char* loadPath = command.path;
+	JaydMetadata::Track candidateTrack{};
+	DjTrackMetadataSnapshot candidateMetadata{};
 	if(identityLoad){
-		if(!resolveIdentityPath(command, resolvedPath, sizeof(resolvedPath))){
+		if(!resolveIdentityLoad(command, resolvedPath, sizeof(resolvedPath), candidateTrack, candidateMetadata)){
 			error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
 			return false;
 		}
@@ -1599,25 +1726,40 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 		return false;
 	}
 
-	JaydMetadata::Track candidateTrack{};
-	DjTrackMetadataSnapshot candidateMetadata{};
 	metadataMutex.lock();
-	resolveMetadata(
-		loadPath,
-		command.libraryGeneration,
-		command.libraryKey,
-		&command.trackIdentity,
-		candidateTrack,
-		candidateMetadata
-	);
+	if(identityLoad){
+		// resolveIdentityLoad() above already resolved AND validated this
+		// exact fingerprint's full metadata entirely from RAM (see its
+		// doc comment) - calling resolveMetadata() here would reintroduce
+		// the very metadataReader.trackByPath()/readStringHash()/grid-
+		// and-phrase-scan calls this path exists to eliminate. One last
+		// cheap (lock-only, zero reader calls) re-check that nothing
+		// moved in the window between that resolution and this commit
+		// point, mirroring every other identity-load re-check in this
+		// function:
+		if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+		   command.libraryGeneration != libraryGeneration ||
+		   command.libraryKey != libraryKey ||
+		   command.metadataRevision != metadataRevision){
+			candidateMetadata.state = DJ_METADATA_STALE;
+		}
+	}else{
+		resolveMetadata(
+			loadPath,
+			command.libraryGeneration,
+			command.libraryKey,
+			&command.trackIdentity,
+			candidateTrack,
+			candidateMetadata
+		);
+	}
 	// Identity-only loads get one extra guard ordinary path-based loads
 	// deliberately don't (an unindexed/loose file is a legitimate
-	// path-based load): resolveIdentityPath() above already matched this
-	// exact fingerprint against the live index, so if this independent
-	// second check (resolveMetadata()'s own generation+fingerprint
-	// cross-validation, see its doc comment) now reports anything other
-	// than DJ_METADATA_VALID - stale, corrupt, or otherwise - Auto DJ
-	// must never silently load the file anyway; hard-reject instead.
+	// path-based load): resolveIdentityLoad() above already matched this
+	// exact fingerprint against the live candidate table, so if this
+	// independent second check now reports anything other than
+	// DJ_METADATA_VALID - stale or otherwise - Auto DJ must never
+	// silently load the file anyway; hard-reject instead.
 	if(identityLoad && candidateMetadata.state != DJ_METADATA_VALID){
 		metadataMutex.unlock();
 		file.close();

@@ -17,23 +17,22 @@
 static constexpr uint8_t AUTO_DJ_QUEUE_CAPACITY = 32;
 static constexpr uint8_t AUTO_DJ_HISTORY_CAPACITY = 24;
 static constexpr uint8_t AUTO_DJ_RETRY_BUDGET = 2; // retries allowed after the first attempt
-// One full attempt-cycle's tick budget, enforced solely by
+// One full attempt-cycle's wall-clock budget, enforced solely by
 // DjAutoDjPlanner::progressPending()/resolvePendingWhileStopping() around
-// AutoDjLoadPort::pollLoad(). Originally sized for a bare stable-ID deck
-// load only. Since the composite-workflow integration (RAM stable-ID
-// resolve -> load submit -> load applied -> internal Auto-owned Coach arm
-// -> poll Coach through boundary/start/sync/crossfade/stop/rollback -> only
-// then Applied), pollLoad() does not report Applied until that entire
-// sequence finishes, so this single budget must now cover the worst case of
-// all of it, not just the load. Assuming DjSession::loop() runs at least
-// ~20 times/sec (a conservative floor for an audio-callback-driven control
-// loop - the exact cadence is a firmware-integration detail not verifiable
-// from a host build), 3000 ticks is at least ~150 wall-clock seconds:
-// comfortably above even a slow-tempo (e.g. 70 BPM) worst-case
-// phrase-boundary wait (~32 beats, ~27s) plus a 32-beat crossfade (~27s)
-// plus load I/O. This value should be re-validated against real hardware
-// loop() throughput; flagged as a deferral.
-static constexpr uint16_t AUTO_DJ_LOAD_TIMEOUT_TICKS = 3000;
+// AutoDjLoadPort::pollLoad(), measured against AutoDjLoadPort::nowMicros()
+// rather than a DjSession::loop() tick count. Originally sized (as a tick
+// count) for a bare stable-ID deck load only; since the composite-workflow
+// integration (RAM stable-ID resolve -> load submit -> load applied ->
+// internal Auto-owned Coach arm -> poll Coach through boundary/start/sync/
+// crossfade/stop/rollback -> only then Applied), pollLoad() does not report
+// Applied until that entire sequence finishes, so this single budget must
+// cover the worst case of all of it, not just the load. A tick count is the
+// wrong unit for that: real DjSession::loop() throughput varies with audio-
+// callback scheduling, so a fixed tick budget does not bound a fixed
+// wall-clock duration. 150 wall-clock seconds is comfortably above even a
+// slow-tempo (e.g. 70 BPM) worst-case phrase-boundary wait (~32 beats,
+// ~27s) plus a 32-beat crossfade (~27s) plus load I/O.
+static constexpr uint64_t AUTO_DJ_LOAD_TIMEOUT_US = 150000000ULL; // 150s
 static constexpr uint8_t AUTO_DJ_DEFAULT_RECENT_EXCLUSION = 8;
 static constexpr uint8_t AUTO_DJ_DEFAULT_ARTIST_EXCLUSION = 4;
 static constexpr uint8_t AUTO_DJ_DEFAULT_TITLE_EXCLUSION = 6;
@@ -51,6 +50,17 @@ struct AutoDjIdentity {
 	uint8_t flags = 0;
 	uint32_t libraryGeneration = 0;
 	uint8_t fingerprint[16] = {};
+	// Mirrors DjTrackIdentity::sourceId exactly (same 16 bytes, same
+	// AUTO_DJ_IDENTITY_SOURCE/DJ_TRACK_IDENTITY_SOURCE flag gating). Without
+	// this field, a round trip through AutoDjIdentity silently zeroed
+	// sourceId while still carrying the SOURCE flag - a review-flagged bug:
+	// DjSession::resolveMetadata() passes trackByPath() a non-null zeroed
+	// sourceId whenever the flag is set, and trackByPath() then requires an
+	// exact match against the real (nonzero) on-disk sourceId, so every
+	// nonzero-source track failed resolution and exhausted its retry budget.
+	// Carried end-to-end: candidate table entry -> AutoDjCandidate ->
+	// queue/history entry -> submitLoad()'s DjTrackIdentity -> resolveMetadata().
+	uint8_t sourceId[16] = {};
 	// Independent epoch from libraryGeneration: bumped on any metadata
 	// content replacement even when the external library generation is
 	// unchanged (e.g. a same-generation sidecar re-tag) - mirrors

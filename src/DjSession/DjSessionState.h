@@ -425,16 +425,25 @@ inline void djBumpAutoDjManualIntent(AutoDjManualIntentGenerations& generations,
 	}
 }
 
-// Broader than djIsAutoDjManualSignal(): also true for a recording toggle
-// (start or stop), which djIsAutoDjManualSignal() deliberately excludes
-// from the per-deck manual-intent generation bump (recording alone doesn't
-// contest deck/transport ownership), but which must still make Auto DJ
-// yield - Auto never starts/stops a recording itself, and a queued Auto
-// load/arm racing a user-initiated recording change is exactly the kind of
-// non-system intent Auto must synchronously get out of the way of. Used
-// only to gate the takeover-purge below, never the generation bump.
+// Broader than djIsAutoDjManualSignal(): also true for DJ_COMMAND_SET_MIX
+// (deliberately excluded from djIsAutoDjManualSignal()'s per-deck switch
+// since mix is a session-wide property, not one deck's transport - see
+// djBumpAutoDjManualIntent()'s own early-return special case for it above)
+// and for a recording toggle (start or stop), which djIsAutoDjManualSignal()
+// deliberately excludes from the per-deck manual-intent generation bump
+// (recording alone doesn't contest deck/transport ownership), but which
+// must still make Auto DJ yield - Auto never starts/stops a recording
+// itself, and a queued Auto load/arm racing a user-initiated mix or
+// recording change is exactly the kind of non-system intent Auto must
+// synchronously get out of the way of. Used only to gate the
+// takeover-purge below, never the generation bump. Without SET_MIX here, a
+// manual crossfader move could be admitted (and start actually mixing)
+// while a still-queued Auto-owned load/arm command applied right out from
+// under it - review-flagged regression.
 inline bool djIsAutoDjTakeoverSignal(const DjCommand& command){
-	return djIsAutoDjManualSignal(command) || command.type == DJ_COMMAND_SET_RECORDING;
+	return djIsAutoDjManualSignal(command) ||
+		command.type == DJ_COMMAND_SET_MIX ||
+		command.type == DJ_COMMAND_SET_RECORDING;
 }
 
 // True if `command` is an AUTODJ_ARM/AUTODJ_RESUME request that is missing

@@ -95,30 +95,35 @@ public:
 	std::atomic<bool> readerBlocked{false};
 	std::atomic<bool> releaseReader{false};
 
-	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) override{
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_PLAYING;
 		command.deck = deck;
 		command.value = playing ? 1 : 0;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 
-	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) override{
+	DjSubmitResult setSync(
+		uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false
+	) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_SYNC;
 		command.deck = deck;
 		command.value = armed ? 1 : 0;
 		command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 
-	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) override{
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_MIX;
 		command.value = mix;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 

@@ -50,14 +50,17 @@ void testBuildTrackIdentityGatesZeroEvidence(){
 }
 
 // -- buildLibraryEntry: capability bits mirror DjSession::resolveMetadata()
-// -- exactly (minus the deliberately-out-of-scope downbeat enumeration).
+// -- exactly (minus confidence/downbeatCount, which need their own reader
+// -- calls beyond the single trackByIndex() this entry's other fields came
+// -- from - DjSession::assistTrackEntry() fills those in separately).
 
 void testBuildLibraryEntryFullCapabilities(){
 	const DjTrackIdentity identity = fingerprintIdentity(7);
 	const DjAssistLibraryEntry entry = buildLibraryEntry(
 		42, identity, DJ_METADATA_VALID,
 		44100, 44100ULL * 180ULL, 128000, 0x105, 4,
-		/*cueCount*/ 3, /*gridCount*/ 64, /*phraseCount*/ 8
+		/*cueCount*/ 3, /*gridCount*/ 64, /*phraseCount*/ 8,
+		/*firstGrid*/ 1000, /*firstPhrase*/ 2000
 	);
 	assert(entry.libraryIndex == 42);
 	assert(entry.state == DJ_METADATA_VALID);
@@ -67,11 +70,21 @@ void testBuildLibraryEntryFullCapabilities(){
 	assert(entry.durationFrames == 44100ULL * 180ULL);
 	assert(entry.sampleRate == 44100);
 	assert(memcmp(entry.identity.fingerprint, identity.fingerprint, 16) == 0);
+	// firstGrid/firstPhrase/gridCount/phraseCount/cueCount are threaded
+	// through verbatim - DjSession::resolveIdentityLoad() reconstructs a
+	// JaydMetadata::Track purely from these, so they must round-trip
+	// exactly, not just influence capability bits.
+	assert(entry.gridCount == 64);
+	assert(entry.phraseCount == 8);
+	assert(entry.cueCount == 3);
+	assert(entry.firstGrid == 1000);
+	assert(entry.firstPhrase == 2000);
 	const uint16_t expected = DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_KEY |
 		DJ_METADATA_HAS_RATING | DJ_METADATA_HAS_CUES | DJ_METADATA_HAS_GRID | DJ_METADATA_HAS_PHRASES;
 	assert(entry.capabilities == expected);
-	// Deliberately never set at the bulk-candidate-table level (see header
-	// comment + DjAssistController): scoring never reads this bit.
+	// Never set by buildLibraryEntry() itself (see header comment) -
+	// assistTrackEntry() sets this bit only after its own bounded
+	// grid-confidence scan finds at least one downbeat.
 	assert(!(entry.capabilities & DJ_METADATA_HAS_DOWNBEATS));
 }
 
@@ -82,7 +95,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry entry = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_STALE,
 		0, 0, 0, 0, 255,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(entry.capabilities == 0);
 	assert(entry.state == DJ_METADATA_STALE);
@@ -93,7 +106,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry rated = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_VALID,
 		44100, 1000, 120000, 5, 0,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(rated.capabilities & DJ_METADATA_HAS_RATING);
 
@@ -102,7 +115,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry halfSource = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_VALID,
 		44100, 0, 0, 0, 255,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(!(halfSource.capabilities & DJ_METADATA_HAS_SOURCE_FRAMES));
 }

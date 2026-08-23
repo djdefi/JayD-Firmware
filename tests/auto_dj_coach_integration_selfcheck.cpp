@@ -35,6 +35,7 @@
 
 #include <assert.h>
 #include <string.h>
+#include <vector>
 
 #include "../src/AutoDj/AutoDjSessionActuator.h"
 #include "../src/DjAssist/DjAssistController.h"
@@ -77,6 +78,12 @@ public:
 	// this port on the same object; autoDjCoachTransitionMode() needs it to
 	// read Coach's live mode, exactly like DjSession::autoDjCoachTransitionMode().
 	DjAssistController* controller = nullptr;
+	// Every command popped from `queue` and applied, in order - lets a
+	// test assert on the exact sequence/interleaving of commands actually
+	// executed (e.g. proving a specific rollback step genuinely ran, and
+	// in what order relative to a later retry's own commands), not just
+	// on a final snapshot that a self-healing later step could mask.
+	std::vector<DjCommand> poppedLog;
 
 	// -- Library/candidate state. --
 	Entry entries[4];
@@ -106,30 +113,35 @@ public:
 
 	// -- DjAssistSessionPort --
 
-	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) override{
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_PLAYING;
 		command.deck = deck;
 		command.value = playing ? 1 : 0;
+		command.autoDjOwned = autoDjOwned;
 		return submit(command);
 	}
 
-	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) override{
+	DjSubmitResult setSync(
+		uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false
+	) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_SYNC;
 		command.deck = deck;
 		command.value = armed ? 1 : 0;
 		command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+		command.autoDjOwned = autoDjOwned;
 		return submit(command);
 	}
 
-	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) override{
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_MIX;
 		command.value = mix;
+		command.autoDjOwned = autoDjOwned;
 		return submit(command);
 	}
 
@@ -288,6 +300,15 @@ public:
 		return value;
 	}
 
+	bool autoDjCoachTransitionSettled() override{
+		if(!controller) return true;
+		return controller->rollbackSettled();
+	}
+
+	uint64_t autoDjNowMicros() const override{
+		return uint64_t(micros());
+	}
+
 	// -- Shared submission path: a faithful copy of DjSession::submit()'s
 	// own body (manual-takeover purge before admission, admitAssistCommand()
 	// for the real FIFO/supersede/priority bookkeeping, then the manual-
@@ -303,6 +324,7 @@ public:
 			for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
 				results.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
 				if(autoDjTracked.tracked && autoDjTracked.id == removedIds[i]) autoDjTracked.status = DJ_COMMAND_SUPERSEDED;
+				if(assistTracked.tracked && assistTracked.id == removedIds[i]) assistTracked.status = DJ_COMMAND_SUPERSEDED;
 			}
 		}
 		const DjSubmitResult result = admitAssistCommand(command, queue, results, assistTracked, assistGenerations);
@@ -348,6 +370,7 @@ void setDeckPlaying(FakePort& port, uint8_t deck, uint16_t elapsed, uint16_t dur
 void loopOnce(FakePort& port, DjAssistController& controller, AutoDjSessionActuator& actuator){
 	DjCommand command;
 	if(port.queue.pop(command)){
+		port.poppedLog.push_back(command);
 		DjCommandError error = DJ_COMMAND_ERROR_NONE;
 		bool applied = true;
 		switch(command.type){
@@ -401,7 +424,7 @@ void loopOnce(FakePort& port, DjAssistController& controller, AutoDjSessionActua
 				const bool tempoLock = (command.value & (1 << 9)) != 0;
 				if(!controller.armTransition(
 					command.deck, command.slot, command.libraryIndex, command.trackIdentity,
-					crossfadeBeats, startAtBoundary, tempoLock
+					crossfadeBeats, startAtBoundary, tempoLock, command.autoDjOwned
 				)){
 					error = DJ_COMMAND_ERROR_ASSIST_REJECTED;
 					applied = false;
@@ -602,6 +625,104 @@ void testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj(){
 	controller.end();
 }
 
+// -- Test (round-2 fix #3 review, "manual mix + Coach ownership" /
+// "test both queue orders with unrelated entries and pending Coach
+// steps"): a manual SET_MIX arrives while Coach's own forward-plan
+// START_DECK step (a SET_PLAYING command - a DIFFERENT command type/
+// channel than SET_MIX) is genuinely submitted into the shared queue but
+// not yet popped/applied. Before this round's autoDjOwned propagation,
+// the OLDER, narrower removeSystemTargeting() purge (gated by
+// sameTarget(), which requires an exact command-type match - see
+// DjSessionState.h) could never reach a queued SET_PLAYING step from an
+// incoming SET_MIX command, so that stale Coach step could still be
+// popped and applied on the very next tick, ahead of guardOk()'s
+// mixIntentGeneration divergence check (which only runs once
+// DjAssistController::tick() is next called) ever getting a chance to
+// abort it. This test proves the new autoDjOwned-tagged
+// removeAutoDjOwned() purge (reachable now that djIsAutoDjTakeoverSignal()
+// includes SET_MIX) removes and durably SUPERSEDEs that queued step
+// synchronously, inside the very setMix() submit() call itself - strictly
+// before any further loopOnce()/tick() ever runs - and that Coach's own
+// independent guard still separately fails the transition right after,
+// exactly as it did before this fix, so Auto DJ still converges to
+// Paused either way. --
+void testManualMixDuringTransitionPurgesQueuedCoachStep(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x55);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator);
+	assert(actuator.start());
+
+	// Drive to TRANSITION_RUNNING with the START_DECK step (SET_PLAYING on
+	// the incoming deck) genuinely submitted into the shared queue but NOT
+	// yet popped/applied - the exact window the review flagged.
+	loopUntil(port, controller, actuator, [&]{
+		DjAssistSnapshot snap;
+		controller.copySnapshot(snap);
+		return snap.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING &&
+			snap.plan.currentStep < snap.plan.stepCount &&
+			snap.plan.steps[snap.plan.currentStep].action == DJ_ASSIST_ACTION_START_DECK &&
+			snap.plan.steps[snap.plan.currentStep].submitted &&
+			!snap.plan.steps[snap.plan.currentStep].applied;
+	});
+
+	DjAssistSnapshot armed;
+	controller.copySnapshot(armed);
+	const uint32_t queuedStepCommandId = armed.plan.steps[armed.plan.currentStep].commandId;
+	assert(queuedStepCommandId != 0);
+	assert(port.queue.depth() == 1); // exactly the queued START_DECK step, nothing else pending.
+	assert(port.assistTracked.tracked && port.assistTracked.id == queuedStepCommandId);
+	assert(port.assistTracked.status == DJ_COMMAND_ACCEPTED); // still awaiting application.
+
+	// The user moves the crossfader themselves, mid-transition - a real,
+	// non-system submit() through the shared port, exactly as
+	// DjSession::setMix(..., DJ_ORIGIN_LOCAL_UI) would.
+	port.setMix(200, DJ_ORIGIN_LOCAL_UI);
+
+	// The purge must be synchronous, inside this one submit() call, before
+	// any further loopOnce()/tick() ever runs - proving the stale step can
+	// never be popped and applied out from under the user's own command.
+	assert(port.queue.depth() == 1); // the queued START_DECK step is gone; only the user's SET_MIX remains.
+	assert(port.assistTracked.status == DJ_COMMAND_SUPERSEDED);
+
+	// Coach's own, independent mixIntentGeneration guard check (a second,
+	// slower detection path this purge does not replace - see guardOk())
+	// still separately fails the transition right after, and Auto DJ
+	// still resolves to Paused, exactly as before this fix.
+	loopUntil(port, controller, actuator, [&]{
+		return actuator.state() == AutoDjState::Paused;
+	});
+
+	DjAssistSnapshot coachSnap;
+	controller.copySnapshot(coachSnap);
+	assert(coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(coachSnap.plan.failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+
+	AutoDjSnapshot autoSnap;
+	actuator.copySnapshot(autoSnap);
+	assert(autoSnap.state == AutoDjState::Paused);
+	assert(autoSnap.historySize == 0); // never resolved as Applied - the takeover pre-empted it.
+
+	controller.end();
+}
+
 // -- Test 3 (fix #5 review, "failures at every stage"): the Coach arm
 // submit itself is rejected by the REAL engine's own guard (not a fake
 // return value) - the target deck is not stopped/sync-off at arm time
@@ -661,11 +782,141 @@ void testRealCoachGuardRejectionAtArmRetriesThenSucceeds(){
 	controller.end();
 }
 
+// -- Test 5 (round-3 fix #4 review, "rollback race"): Coach's transition
+// fails mid-crossfade via its OWN guard (media removed) - deliberately NOT
+// the manual-intent-generation channel testManualPlayDivergenceMid
+// TransitionStopsBothCoachAndAutoDj above already covers, so this
+// genuinely exercises AutoDjSessionActuator's Teardown sub-phase (
+// pollTransitionPhase()'s default branch) rather than manualTakeoverActive()'s
+// separate early-cancel path. Failing this late (after CROSSFADE has
+// actually been submitted) forces a real, multi-step MIX -> SYNC ->
+// STOP_DECK rollback (see DjAssistSessionBridge::nextRollbackPhase()), not
+// an instant no-op DONE. Media is restored immediately once the failure
+// trips, so a fresh arm attempt would otherwise be free to race the still-
+// in-flight rollback exactly as the review described.
+//
+// The decisive assertion is NOT "rollbackSettled() before retry", nor "deck
+// 1 keeps playing afterwards" - both are fooled by the bug's own self-
+// healing side effect: a buggy re-arm's armTransition() unconditionally
+// resets rollbackPhase_ to IDLE (so the accessor trivially reports settled
+// once mode leaves TRANSITION_FAILED), and the retry's own forward plan
+// re-issues START_DECK/ENABLE_SYNC on the SAME target deck anyway, so deck 1
+// ends up looking fine either way. The one command a raced retry can never
+// produce itself, only the ORIGINAL failed transition's rollback can, is
+// its STOP_DECK step: SET_PLAYING(deck=toDeck(1), value=false) - the retry's
+// own forward plan only ever stops fromDeck(0), never re-stops its own
+// target. So the decisive, bug-unmaskable check is: that exact command must
+// have actually been popped/applied (rollback ran to completion) BEFORE the
+// retry's own LOAD_DECK(1) is popped - i.e. before any load resolves for
+// the retry attempt, never after or interleaved mid-way.
+void testCoachFailureRollbackSettlesBeforeAutoDjRetries(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x66);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator);
+	assert(actuator.start());
+
+	// Drive deep enough into the transition that CROSSFADE has genuinely
+	// been submitted (not merely "current" - DjAssistEngine::tick() only
+	// submits OR polls-and-advances a single step per call, so reaching
+	// currentStep==CROSSFADE on its own does not yet mean its command was
+	// actually pushed; require .submitted too, matching exactly what
+	// nextRollbackPhase() itself checks via planStepSubmitted()/
+	// crossfadeSubmitted).
+	DjAssistSnapshot coachSnap;
+	loopUntil(port, controller, actuator, [&]{
+		controller.copySnapshot(coachSnap);
+		return coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING &&
+			coachSnap.plan.currentStep < coachSnap.plan.stepCount &&
+			coachSnap.plan.steps[coachSnap.plan.currentStep].action == DJ_ASSIST_ACTION_CROSSFADE &&
+			coachSnap.plan.steps[coachSnap.plan.currentStep].submitted;
+	}, 128);
+
+	const int armAttemptsBeforeFailure = port.armAttemptCount;
+	const size_t poppedBeforeFailure = port.poppedLog.size();
+
+	port.media = false; // trips guardOk()'s DJ_ASSIST_FAIL_MEDIA_REMOVED on the very next controller.tick().
+	loopOnce(port, controller, actuator);
+	controller.copySnapshot(coachSnap);
+	assert(coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(coachSnap.plan.failure == DJ_ASSIST_FAIL_MEDIA_REMOVED);
+	assert(!controller.rollbackSettled()); // crossfade was submitted - MIX is still pending.
+
+	// Media returns immediately: the only thing a correct implementation
+	// still has to hold the retry back on is rollback settlement itself.
+	port.media = true;
+
+	// Drive forward (bounded) until the retry resolves as a second history
+	// entry - the SAME candidate (0x66) is the only one in the library, so
+	// this is genuinely the retried attempt, not a different entry.
+	AutoDjSnapshot after;
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(after);
+		return after.historySize == 1;
+	}, 256);
+	assert(port.armAttemptCount > armAttemptsBeforeFailure); // a genuine retry arm happened.
+	assert(port.snapshot.decks[1].loaded);
+	assert(port.snapshot.decks[1].playing);
+	assert(memcmp(port.snapshot.decks[1].identity.fingerprint, port.entries[0].entry.identity.fingerprint, 16) == 0);
+
+	// Decisive regression check, scanning the exact command sequence
+	// popped/applied since the failure tripped: the original transition's
+	// own rollback STOP_DECK step - SET_PLAYING(deck=1, value=false) - is a
+	// command only that rollback ever issues (the retry's own forward plan
+	// only ever stops deck 0, its fromDeck, never re-stops its own target
+	// deck 1), so its presence/position is an unmaskable fingerprint of
+	// whether rollback actually ran to completion, and when.
+	int rollbackStopIndex = -1;
+	int retryLoadIndex = -1;
+	for(size_t i = poppedBeforeFailure; i < port.poppedLog.size(); i++){
+		const DjCommand& cmd = port.poppedLog[i];
+		if(rollbackStopIndex < 0 && cmd.type == DJ_COMMAND_SET_PLAYING && cmd.deck == 1 && cmd.value == 0){
+			rollbackStopIndex = int(i);
+		}
+		if(retryLoadIndex < 0 && cmd.type == DJ_COMMAND_LOAD_DECK && cmd.deck == 1){
+			retryLoadIndex = int(i);
+		}
+	}
+	assert(rollbackStopIndex >= 0); // the failed transition's own rollback actually ran to completion...
+	assert(retryLoadIndex >= 0); // ...and the retry actually loaded (sanity: both events genuinely happened).
+	assert(rollbackStopIndex < retryLoadIndex); // ...strictly before the retry's own load, never after/racing it.
+
+	// Run a few more idle ticks (nothing new queued) as an additional,
+	// cheap belt-and-braces sanity check that the now-healthy retry stays
+	// stable afterwards.
+	for(int i = 0; i < 8; i++){
+		loopOnce(port, controller, actuator);
+		assert(port.snapshot.decks[1].playing);
+		assert(port.snapshot.decks[1].loaded);
+	}
+
+	controller.end();
+}
+
 } // namespace
 
 int main(){
 	testFullTwoEntryRunThroughRealPorts();
 	testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj();
+	testManualMixDuringTransitionPurgesQueuedCoachStep();
 	testRealCoachGuardRejectionAtArmRetriesThenSucceeds();
+	testCoachFailureRollbackSettlesBeforeAutoDjRetries();
 	return 0;
 }

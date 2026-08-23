@@ -110,6 +110,28 @@ public:
 	// authenticated browser confirm); consumed on read (one-shot), so a
 	// stale confirmation can never be replayed by polling again.
 	virtual bool autoDjConsumePhysicalConfirmation() = 0;
+
+	// True once Coach has fully settled after a FAILED/cancelled transition
+	// - i.e. either Coach was never in TRANSITION_FAILED mode at all, or its
+	// own rollback (mix/sync/stop-deck restore - see DjAssistController::
+	// tickRollback()) has finished. False while rollback is still actively
+	// undoing a failed transition's mutations. AutoDjSessionActuator's
+	// composite pollLoad() must wait for this before reporting a terminal
+	// Failed outcome to the planner: reporting Failed (and thus allowing a
+	// retry/new arm) while rollback is still in flight would let a fresh
+	// Coach arm reset the controller's rollback-tracking state out from
+	// under the still-in-flight rollback commands, orphaning them so they
+	// can go on to mutate the NEW transition's target deck.
+	virtual bool autoDjCoachTransitionSettled() = 0;
+
+	// Monotonic wall-clock read (microseconds) - see AutoDjLoadPort::
+	// nowMicros()'s own doc comment for why this replaced a loop-tick
+	// count. DjSession implements this with a real micros() read;
+	// AutoDjSessionActuator forwards its own nowMicros() override here so
+	// this port (like DjAssistSessionPort) stays entirely Arduino-free and
+	// host-testable without pulling a real or stub Arduino.h into every
+	// target that includes AutoDjSessionActuator.h.
+	virtual uint64_t autoDjNowMicros() const = 0;
 };
 
 #endif

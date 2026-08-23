@@ -50,6 +50,21 @@ public:
 
 	// Physical or authenticated confirmation gate for arm()/resume().
 	virtual bool physicalConfirmationPresent() const = 0;
+
+	// Monotonic wall-clock read (microseconds), used solely to bound how
+	// long a single submitted attempt is allowed to stay pending before
+	// DjAutoDjPlanner treats it as timed out (AUTO_DJ_LOAD_TIMEOUT_US -
+	// see DjAutoDjTypes.h). Deliberately NOT a loop/tick counter: the
+	// composite load->arm->transition attempt this now spans can take a
+	// materially different number of DjSession::loop() iterations to
+	// resolve depending on real audio-thread scheduling, so counting
+	// ticks no longer bounds a fixed wall-clock duration the way it did
+	// for a bare single-command load. Routed through the port (not called
+	// directly by the planner) so DjAutoDjPlanner - and its own dedicated
+	// host self-check - stay Arduino-free and fully deterministic under a
+	// fake clock; production implementations return a real micros() read,
+	// test doubles return a fully controllable counter.
+	virtual uint64_t nowMicros() const = 0;
 };
 
 #endif //JAYD_FIRMWARE_DJ_AUTO_DJ_LOAD_PORT_H

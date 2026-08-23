@@ -17,9 +17,18 @@ public:
 	virtual ~DjAssistSessionPort() {}
 
 	// Actuator surface (DjAssistSessionActuator, DjAssistController.cpp).
-	virtual DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) = 0;
-	virtual DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) = 0;
-	virtual DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) = 0;
+	// autoDjOwned tags the resulting DjCommand exactly like Auto DJ's own
+	// load/arm commands are tagged - see DjCommand::autoDjOwned and
+	// DjAssistTransitionStep::autoDjOwned for why: only a command tagged
+	// this way is found by a manual takeover's removeAutoDjOwned() purge,
+	// and Coach's own internal commands must be purgeable too whenever the
+	// transition driving them was armed BY Auto DJ (never for a direct
+	// user Coach gesture, where this stays false).
+	virtual DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false) = 0;
+	virtual DjSubmitResult setSync(
+		uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false
+	) = 0;
+	virtual DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false) = 0;
 	virtual void assistTrackCommand(uint32_t commandId) = 0;
 	virtual DjCommandStatus assistTrackedStatus(uint32_t commandId) = 0;
 	virtual bool copySnapshot(DjSnapshot& snapshot) = 0;

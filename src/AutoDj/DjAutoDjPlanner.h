@@ -181,15 +181,24 @@ private:
 			return;
 		}
 		pendingPhase = AutoDjPendingPhase::WaitingOutcome;
-		pendingTimeoutTicks = 0;
+		pendingDeadlineUs = port.nowMicros() + AUTO_DJ_LOAD_TIMEOUT_US;
 		pendingAttempts++;
+	}
+
+	// Wraparound-safe "has the deadline passed" check: computing the
+	// difference as an unsigned 64-bit subtraction and comparing it against
+	// half the value range tolerates a nowMicros() implementation that
+	// wraps (e.g. widening a real 32-bit micros() read), matching the
+	// existing tolerance DjAssistController's own micros()-based ramp
+	// timing already relies on elsewhere in this codebase.
+	static bool deadlinePassed(uint64_t now, uint64_t deadline){
+		return (now - deadline) < (UINT64_C(1) << 63);
 	}
 
 	void progressPending(){
 		const AutoDjLoadOutcome outcome = port.pollLoad();
 		if(outcome == AutoDjLoadOutcome::Pending || outcome == AutoDjLoadOutcome::Accepted){
-			pendingTimeoutTicks++;
-			if(pendingTimeoutTicks >= AUTO_DJ_LOAD_TIMEOUT_TICKS) handleLoadFailure();
+			if(deadlinePassed(port.nowMicros(), pendingDeadlineUs)) handleLoadFailure();
 			return;
 		}
 
@@ -197,7 +206,7 @@ private:
 			removeResolvedEntry(true /* recordHistory */);
 			pendingPhase = AutoDjPendingPhase::None;
 			pendingAttempts = 0;
-			pendingTimeoutTicks = 0;
+			pendingDeadlineUs = 0;
 			return;
 		}
 
@@ -211,7 +220,7 @@ private:
 	// "whatever is currently at the queue front".
 	void handleLoadFailure(){
 		pendingPhase = AutoDjPendingPhase::None;
-		pendingTimeoutTicks = 0;
+		pendingDeadlineUs = 0;
 		if(pendingAttempts > AUTO_DJ_RETRY_BUDGET){
 			removeResolvedEntry(false /* recordHistory */);
 			pendingAttempts = 0;
@@ -227,8 +236,7 @@ private:
 	void resolvePendingWhileStopping(){
 		const AutoDjLoadOutcome outcome = port.pollLoad();
 		if(outcome == AutoDjLoadOutcome::Pending || outcome == AutoDjLoadOutcome::Accepted){
-			pendingTimeoutTicks++;
-			if(pendingTimeoutTicks < AUTO_DJ_LOAD_TIMEOUT_TICKS) return;
+			if(!deadlinePassed(port.nowMicros(), pendingDeadlineUs)) return;
 		} else if(outcome == AutoDjLoadOutcome::Applied){
 			removeResolvedEntry(true /* recordHistory */);
 		}
@@ -248,7 +256,7 @@ private:
 
 	void cancelPending(){
 		pendingPhase = AutoDjPendingPhase::None;
-		pendingTimeoutTicks = 0;
+		pendingDeadlineUs = 0;
 		pendingAttempts = 0;
 	}
 
@@ -258,7 +266,7 @@ private:
 	DjAutoDjHistory history;
 	AutoDjPendingPhase pendingPhase = AutoDjPendingPhase::None;
 	AutoDjQueueEntry pendingEntry = {}; // valid whenever pendingAttempts > 0
-	uint16_t pendingTimeoutTicks = 0;
+	uint64_t pendingDeadlineUs = 0; // valid whenever pendingPhase == WaitingOutcome
 	uint8_t pendingAttempts = 0;
 };
 

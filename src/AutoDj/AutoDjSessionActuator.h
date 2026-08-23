@@ -79,7 +79,13 @@ enum class AutoDjLoadSubPhase : uint8_t {
 	Idle,
 	LoadInFlight,       // stable-ID deck load submitted, not yet applied.
 	ArmInFlight,         // load applied; Coach arm submitted, not yet applied.
-	TransitionInFlight   // arm applied; polling Coach's own transition mode.
+	TransitionInFlight,  // arm applied; polling Coach's own transition mode.
+	// Coach's transition failed/was cancelled and is now unwinding its own
+	// rollback (see DjAssistController::tickRollback()). Waits for
+	// AutoDjSessionPort::autoDjCoachTransitionSettled() before reporting
+	// the terminal Failed outcome - see pollTeardownPhase()'s doc comment
+	// for exactly why this must not resolve early.
+	Teardown
 };
 
 class AutoDjSessionActuator : public AutoDjLoadPort {
@@ -145,6 +151,11 @@ public:
 		DjTrackIdentity trackIdentity;
 		trackIdentity.flags = identity.flags & (DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE);
 		memcpy(trackIdentity.fingerprint, identity.fingerprint, sizeof(trackIdentity.fingerprint));
+		// sourceId must ride along with the SOURCE flag - see AutoDjIdentity::
+		// sourceId's doc comment (DjAutoDjTypes.h) for the exact failure this
+		// fixes (a zeroed sourceId here previously survived unnoticed because
+		// the flag alone made resolveMetadata() treat it as "present").
+		memcpy(trackIdentity.sourceId, identity.sourceId, sizeof(trackIdentity.sourceId));
 		const uint8_t deck = sessionPort.autoDjTargetDeck();
 		// Thread the exact epoch this candidate was captured/selected
 		// under straight through to the session, rather than letting the
@@ -171,6 +182,7 @@ public:
 			case AutoDjLoadSubPhase::LoadInFlight: return pollLoadPhase();
 			case AutoDjLoadSubPhase::ArmInFlight: return pollArmPhase();
 			case AutoDjLoadSubPhase::TransitionInFlight: return pollTransitionPhase();
+			case AutoDjLoadSubPhase::Teardown: return pollTeardownPhase();
 			case AutoDjLoadSubPhase::Idle: default: return AutoDjLoadOutcome::Failed;
 		}
 	}
@@ -224,6 +236,16 @@ public:
 
 	bool physicalConfirmationPresent() const override{
 		return sessionPort.autoDjConsumePhysicalConfirmation();
+	}
+
+	// See AutoDjLoadPort::nowMicros()'s doc comment: this port stays
+	// Arduino-free (see AutoDjSessionPort::autoDjNowMicros()'s doc
+	// comment), so every target that includes this header - including the
+	// isolated-core/no-Arduino test doubles - keeps compiling without a
+	// real or stub Arduino.h, while DjSession's real implementation still
+	// backs this with an actual micros() read.
+	uint64_t nowMicros() const override{
+		return sessionPort.autoDjNowMicros();
 	}
 
 private:
@@ -303,9 +325,28 @@ private:
 				loadSubPhase = AutoDjLoadSubPhase::Idle;
 				return AutoDjLoadOutcome::Applied;
 			default: // DJ_ASSIST_MODE_OFF / DJ_ASSIST_MODE_COACH / DJ_ASSIST_MODE_TRANSITION_FAILED
-				loadSubPhase = AutoDjLoadSubPhase::Idle;
-				return AutoDjLoadOutcome::Failed;
+				loadSubPhase = AutoDjLoadSubPhase::Teardown;
+				return pollTeardownPhase();
 		}
+	}
+
+	// Coach reported the transition as no longer running (failed, guard
+	// cancel, media/recording conflict, etc.) and is now unwinding its own
+	// rollback (mix -> sync -> stop-deck restore - see
+	// DjAssistController::tickRollback()). This must keep reporting Pending
+	// - never Failed - until AutoDjSessionPort::autoDjCoachTransitionSettled()
+	// confirms rollback has actually finished. Resolving Failed early would
+	// let the planner treat this attempt as terminally done and retry (a
+	// fresh Coach arm) while the OLD rollback's own commands are still in
+	// flight; DjAssistController::armTransition() rejects such a re-arm as
+	// well (see its own doc comment), so at worst this would stall a retry
+	// rather than corrupt state - but waiting here is what lets that retry
+	// actually succeed as soon as rollback settles, instead of bouncing
+	// off the controller's rejection every attempt.
+	AutoDjLoadOutcome pollTeardownPhase(){
+		if(!sessionPort.autoDjCoachTransitionSettled()) return AutoDjLoadOutcome::Pending;
+		loadSubPhase = AutoDjLoadSubPhase::Idle;
+		return AutoDjLoadOutcome::Failed;
 	}
 
 	// The deck currently playing is "active" (the one about to run out);
@@ -355,6 +396,7 @@ private:
 		out.libraryGeneration = generation;
 		out.metadataRevision = revision;
 		memcpy(out.fingerprint, identity.fingerprint, sizeof(out.fingerprint));
+		memcpy(out.sourceId, identity.sourceId, sizeof(out.sourceId));
 		return out;
 	}
 

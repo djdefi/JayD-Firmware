@@ -100,6 +100,31 @@ struct DjAssistLibraryEntry {
 	// DjAutoDjHistory).
 	uint32_t artistHash = 0;
 	uint32_t titleHash = 0;
+	// Additive fields letting Auto DJ resolve a stable-ID load AND build its
+	// full DjTrackMetadataSnapshot without a single metadataReader call on
+	// DjSession::loop()'s thread (see DjSession::resolveIdentityLoad()).
+	// All populated by the same background DjAssistFillWorker pass as every
+	// field above; Coach's own path-based loads never read these. path[]
+	// mirrors DjSessionState.h's DJ_PATH_CAPACITY-bounded, no-leading-slash
+	// on-disk path convention (see resolveIdentityPath()'s reconstruction
+	// comment). firstGrid/gridCount/firstPhrase/phraseCount are the raw
+	// JaydMetadata::Track offsets/counts readGrid()/readPhrase() need;
+	// confidence/downbeatCount/provenanceHash mirror
+	// DjSession::resolveMetadata()'s own grid/phrase scan output exactly,
+	// computed once here instead of on every load. state is downgraded to
+	// DJ_METADATA_CORRUPT (never left VALID) if that background scan
+	// itself hit a corrupt grid/phrase entry, so a stable-ID load can
+	// never trust a confidence/downbeatCount that wasn't actually fully
+	// computed.
+	char path[DJ_PATH_CAPACITY] = {};
+	uint32_t firstGrid = 0;
+	uint32_t gridCount = 0;
+	uint32_t firstPhrase = 0;
+	uint32_t phraseCount = 0;
+	uint32_t cueCount = 0;
+	uint32_t provenanceHash = 0;
+	uint16_t confidence = 0;
+	uint32_t downbeatCount = 0;
 };
 
 // Compact, bounded, POD suggestion - safe to copy into a snapshot/API/browser
@@ -181,6 +206,20 @@ struct DjAssistTransitionStep {
 	uint32_t commandId = 0;
 	bool submitted = false;
 	bool applied = false;
+	// True when this step belongs to a transition Coach was armed for BY
+	// Auto DJ (never set directly by a user-facing Coach arm gesture) -
+	// mirrors DjAssistTransitionPlan::autoDjOwned, copied onto every
+	// FORWARD plan step in buildSteps() so DjAssistSessionActuator::submit()
+	// can tag the resulting setPlaying/setSync/setMix command's
+	// DjCommand::autoDjOwned - the only way a manual takeover's
+	// removeAutoDjOwned() purge can find and drop Coach's own in-flight
+	// internal commands, not just Auto's load/arm. Deliberately NOT copied
+	// onto the synthetic rollback step DjAssistController::tickRollback()
+	// builds fresh each phase - see that function's own comment: rollback
+	// must run to completion once started, even across an unrelated later
+	// manual command, and already has its own one-time
+	// assistPurgePendingSystemCommands() sweep.
+	bool autoDjOwned = false;
 };
 
 enum DjAssistTransitionFailure : uint8_t {
@@ -243,6 +282,11 @@ struct DjAssistTransitionPlan {
 	// play/sync could fool.
 	bool toDeckStartOwnedByPlan = false;
 	bool toDeckSyncOwnedByPlan = false;
+	// True when Auto DJ (not a direct user Coach gesture) armed this
+	// transition - see DjAssistTransitionStep::autoDjOwned above for why
+	// this must be copied onto every step, including the synthetic
+	// rollback ones tickRollback() builds fresh each phase.
+	bool autoDjOwned = false;
 };
 
 // Bounded snapshot supplied every tick so the state machine can detect

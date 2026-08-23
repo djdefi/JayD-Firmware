@@ -40,10 +40,10 @@ public:
 		uint8_t deck, const DjTrackIdentity& identity,
 		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
 	);
-	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin);
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult seek(uint8_t deck, uint16_t seconds, DjCommandOrigin origin);
 	DjSubmitResult setGain(uint8_t deck, uint8_t gain, DjCommandOrigin origin);
-	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin);
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult setEffectType(uint8_t deck, uint8_t slot, uint8_t type, DjCommandOrigin origin);
 	DjSubmitResult setEffectIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjCommandOrigin origin);
 	DjSubmitResult setRecording(bool recording, DjCommandOrigin origin);
@@ -52,7 +52,7 @@ public:
 	DjSubmitResult loopDisengage(uint8_t deck, DjCommandOrigin origin);
 	DjSubmitResult loopReloop(uint8_t deck, DjCommandOrigin origin);
 	// masterDeck: -1 requests auto-master (the other deck); otherwise an explicit deck index.
-	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin);
+	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
@@ -191,6 +191,8 @@ public:
 	DjAssistMode autoDjCoachTransitionMode() override;
 	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override;
 	bool autoDjConsumePhysicalConfirmation() override;
+	bool autoDjCoachTransitionSettled() override;
+	uint64_t autoDjNowMicros() const override;
 
 	// Thin public wrappers over the Auto DJ planner/actuator for the
 	// physical Auto DJ bank and browser/API v2 to drive. Each routes
@@ -357,7 +359,12 @@ private:
 	bool autoDjResume(){ return autoDjActuator.resume(); }
 	bool autoDjStop(){ return autoDjActuator.stop(); }
 	bool autoDjReset(){ return autoDjActuator.reset(); }
-	bool resolveIdentityPath(const DjCommand& command, char* outPath, size_t outCapacity);
+	bool resolveIdentityLoad(
+		const DjCommand& command,
+		char* outPath, size_t outCapacity,
+		JaydMetadata::Track& track,
+		DjTrackMetadataSnapshot& metadata
+	);
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;
