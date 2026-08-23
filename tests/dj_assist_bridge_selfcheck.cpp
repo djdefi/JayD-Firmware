@@ -306,21 +306,16 @@ void testPhraseCacheRescansOnMetadataGenerationOrStateChange(){
 	assert(phraseCacheNeedsRescan(cache, 0, 1500, identity, kGen, DJ_METADATA_STALE)); // state changed.
 }
 
-// -- candidateFillGenerationCurrent: closes the fillWorkerStep() self- -----
-// -- comparison gap (issue #4) where comparing loadedGeneration_ against ---
-// -- the same value it was just set from could never detect a refresh -----
-// -- that completed during the unlocked SD read/scan window. -----
-void testCandidateFillGenerationCurrentDetectsConcurrentRefresh(){
-	// Nothing changed: safe to commit.
-	assert(DjAssistBridge::candidateFillGenerationCurrent(5, 5, 5));
-	// A refresh landed and already updated loadedGeneration_ away from the
-	// value this read started against - must not commit.
-	assert(!DjAssistBridge::candidateFillGenerationCurrent(6, 5, 5));
-	// loadedGeneration_ still matches the read's starting generation, but a
-	// FRESH live read (taken just before the lock) shows a refresh has
-	// already happened - must not commit even though the stale
-	// self-comparison would have looked fine.
-	assert(!DjAssistBridge::candidateFillGenerationCurrent(5, 5, 6));
+// -- candidateGenerationCurrent: closes the fillWorkerStep() check-then- ---
+// -- lock gap (issue #4). It is now a single equality check against a -----
+// -- value that was itself captured atomically with the read it guards ----
+// -- (DjSession::assistTrackEntry()'s outRevision, or a fresh immediate ----
+// -- re-read taken right before the completion commit) - there is no ------
+// -- separate "before" vs "after" probe left to reconcile here. -----------
+void testCandidateGenerationCurrentMatchesExactly(){
+	assert(DjAssistBridge::candidateGenerationCurrent(5, 5));
+	assert(!DjAssistBridge::candidateGenerationCurrent(6, 5));
+	assert(!DjAssistBridge::candidateGenerationCurrent(5, 6));
 }
 
 } // namespace
@@ -346,6 +341,6 @@ int main(){
 	testPhraseCacheRescansOnIdentityChangeOrDeckChange();
 	testPhraseCacheRescansOnBackwardSeek();
 	testPhraseCacheRescansOnMetadataGenerationOrStateChange();
-	testCandidateFillGenerationCurrentDetectsConcurrentRefresh();
+	testCandidateGenerationCurrentMatchesExactly();
 	return 0;
 }

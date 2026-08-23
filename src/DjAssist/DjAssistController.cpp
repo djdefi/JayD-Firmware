@@ -227,15 +227,13 @@ void DjAssistController::fillWorkerStep(){
 	const uint16_t cappedTotal = rawTotal > entryCapacity_ ? entryCapacity_ : uint16_t(rawTotal);
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
 	if(cursor >= cappedTotal){
-		// Re-read the generation counter fresh, immediately before the
-		// lock, rather than reusing currentGeneration (captured at the top
-		// of this call, before cappedTotal/rawTotal were even read) - a
-		// refresh landing in that window would otherwise go undetected by
-		// a self-comparison against loadedGeneration_, which was itself
-		// just set from currentGeneration above.
+		// Fresh, immediate re-read of the live generation right before the
+		// lock - not a reuse of currentGeneration captured at the top of
+		// this call - closes the window between counting cappedTotal and
+		// marking the fill complete.
 		const uint32_t liveGeneration = session_->assistLibraryGeneration();
 		candidateMutex_.lock();
-		if(DjAssistBridge::candidateFillGenerationCurrent(loadedGeneration_, currentGeneration, liveGeneration)){
+		if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, liveGeneration)){
 			entryTotal_ = cappedTotal;
 			fillComplete_ = true;
 		}
@@ -243,9 +241,17 @@ void DjAssistController::fillWorkerStep(){
 		return;
 	}
 
-	// The actual (possibly slow) read happens into a local, unlocked.
+	// The actual (possibly slow) read happens into a local, unlocked -
+	// assistTrackEntry() returns the exact metadata revision it was
+	// performed under, captured atomically (single lock) with the read
+	// itself inside DjSession, rather than via a separate before/after
+	// generation probe here. That closes the previous check-then-lock gap:
+	// there is no window between "read the generation" and "read the
+	// entry" for a concurrent refresh to swap the reader in, because both
+	// happen under one DjSession-side lock acquisition.
 	DjAssistLibraryEntry entry;
-	if(!session_->assistTrackEntry(cursor, entry)){
+	uint32_t entryRevision = 0;
+	if(!session_->assistTrackEntry(cursor, entry, entryRevision)){
 		// Missing/unreadable record: still occupies a slot (so indices
 		// stay stable) but carries no capabilities/state, which the
 		// scorer treats as reduced confidence rather than a rejection.
@@ -253,16 +259,8 @@ void DjAssistController::fillWorkerStep(){
 		entry.libraryIndex = cursor;
 	}
 
-	// Same fresh re-read rationale as above: the generation may have
-	// changed while assistTrackEntry() above was in flight (e.g. a library
-	// refresh landed mid-read) - discard this record rather than writing
-	// stale data into the new generation's table. Comparing only against
-	// currentGeneration (captured before the read even started) would miss
-	// a refresh that both starts and finishes entirely within this read.
-	const uint32_t liveGeneration = session_->assistLibraryGeneration();
 	candidateMutex_.lock();
-	if(DjAssistBridge::candidateFillGenerationCurrent(loadedGeneration_, currentGeneration, liveGeneration) &&
-	   fillCursor_ == cursor){
+	if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, entryRevision) && fillCursor_ == cursor){
 		entries_[cursor] = entry;
 		++fillCursor_;
 		if(fillCursor_ >= cappedTotal){
@@ -347,16 +345,21 @@ DjAssistGuardSnapshot DjAssistController::buildGuard(const DjSnapshot& snapshot)
 		guard.syncActive[d] = snapshot.decks[d].sync.state != DJ_SYNC_OFF;
 		guard.deckIdentity[d] = snapshot.decks[d].identity;
 	}
-	// Durable: compares DjSession's monotonic non-system-mix generation
-	// counter against the value captured at arm() time (armedMixGeneration_,
-	// see armTransition()) - never inferred from the bounded/evictable
-	// recentResults ring, which can silently drop the very event this
-	// exists to detect. Before a transition has ever armed this simply
-	// compares against 0; guardOk()/tickRollback() only consult this field
-	// while a transition is armed/running/failed, so a stale comparison
-	// beforehand has no effect.
-	guard.manualMixOverride = session_ &&
-		session_->assistNonSystemMixGeneration() != armedMixGeneration_;
+	// Live values for the non-system intent generations - see
+	// DjAssistGuardSnapshot's doc comment and
+	// DjSession::assistIntentGenerationsSnapshot(). guardOk()/armTransition()
+	// compare these against the plan's armed*Generation baseline; this
+	// call itself never compares against anything, so it is safe (and
+	// correct) to populate unconditionally even before any transition has
+	// armed.
+	if(session_){
+		const DjAssistIntentGenerations generations = session_->assistIntentGenerationsSnapshot();
+		guard.mixIntentGeneration = generations.mix;
+		for(uint8_t d = 0; d < DJ_DECK_COUNT; ++d){
+			guard.playIntentGeneration[d] = generations.playing[d];
+			guard.syncIntentGeneration[d] = generations.sync[d];
+		}
+	}
 	return guard;
 }
 
@@ -540,12 +543,27 @@ bool planStepSubmitted(const DjAssistTransitionPlan& plan, DjAssistTransitionAct
 void DjAssistController::tickRollback(){
 	if(!actuator_) return;
 	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return;
-	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
 
 	const DjAssistTransitionPlan& p = engine_.plan();
+
+	// Purge exactly once per failure/cancel episode, before computing/
+	// advancing rollback phases: any still-queued mix/play/sync command
+	// this plan itself submitted (or that raced admission just before
+	// cancel) must never be allowed to apply after rollback has already
+	// restored safe state.
+	if(!pendingPurgeDone_){
+		pendingPurgeDone_ = true;
+		if(session_){
+			session_->assistPurgePendingSystemCommands(p.fromDeck);
+			session_->assistPurgePendingSystemCommands(p.toDeck);
+		}
+	}
+
+	if(rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE) return;
+
 	const bool crossfadeSubmitted = planStepSubmitted(p, DJ_ASSIST_ACTION_CROSSFADE);
 	const bool manualMixOccurred = session_ &&
-		session_->assistNonSystemMixGeneration() != armedMixGeneration_;
+		session_->assistIntentGenerationsSnapshot().mix != p.armedMixGeneration;
 
 	rollbackPhase_ = DjAssistBridge::nextRollbackPhase(
 		rollbackPhase_, crossfadeSubmitted, manualMixOccurred,
@@ -650,7 +668,7 @@ bool DjAssistController::armTransition(
 		waitBoundaryCaptured_ = false;
 		rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_IDLE;
 		rollbackSubmitted_ = false;
-		armedMixGeneration_ = session_->assistNonSystemMixGeneration();
+		pendingPurgeDone_ = false;
 	}
 	return armed;
 }

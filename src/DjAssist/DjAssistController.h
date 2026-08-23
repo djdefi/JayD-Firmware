@@ -133,19 +133,20 @@ private:
 	bool waitBoundaryCaptured_ = false;
 	uint64_t waitBoundaryTargetFrame_ = 0;
 
-	// DjSession's durable non-system-mix generation counter (see
-	// DjSession::assistNonSystemMixGeneration()), captured at the moment
-	// the current transition armed. Any later change - checked by simple
-	// inequality, never inferred from the bounded/evictable recentResults
-	// ring - means a manual mix action has occurred since arming.
-	uint32_t armedMixGeneration_ = 0;
-
 	// Controller-owned rollback state (see tickRollback()): advances one
 	// bounded actuator submit/poll per tick, exactly mirroring the forward
 	// step machine, restoring only side effects this plan itself applied.
 	DjAssistBridge::DjAssistRollbackPhase rollbackPhase_ = DjAssistBridge::DJ_ASSIST_ROLLBACK_IDLE;
 	bool rollbackSubmitted_ = false;
 	uint32_t rollbackCommandId_ = 0;
+	// True once assistPurgePendingSystemCommands() has been called for
+	// this failure/cancel episode - set the first time tickRollback()
+	// runs after a transition enters DJ_ASSIST_MODE_TRANSITION_FAILED,
+	// reset alongside rollbackPhase_ whenever a fresh transition arms.
+	// Ensures a cancelled/failed transition's own still-queued
+	// mix/play/sync commands are purged exactly once, before rollback
+	// starts restoring state, so they can never re-appear afterward.
+	bool pendingPurgeDone_ = false;
 
 	DjAssistCoachAdvice lastAdvice_ = {};
 

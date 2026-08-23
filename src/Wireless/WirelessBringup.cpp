@@ -395,6 +395,7 @@ const char* commandErrorName(DjCommandError error){
 		case DJ_COMMAND_ERROR_STALE_IDENTITY: return "stale_identity";
 		case DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED: return "client_id_required";
 		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "assist_rejected";
+		case DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING: return "assist_override_pending";
 		default: return "invalid_value";
 	}
 }

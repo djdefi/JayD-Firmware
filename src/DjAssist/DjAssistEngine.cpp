@@ -3,17 +3,6 @@
 #include "DjAssistScoring.h"
 #include "DjAssistSessionBridge.h"
 
-namespace {
-
-// Small tolerance so mixer noise doesn't read as a manual override.
-static const int16_t MIX_OVERRIDE_THRESHOLD = 3;
-
-uint8_t absDiff(uint8_t a, uint8_t b){
-	return a > b ? static_cast<uint8_t>(a - b) : static_cast<uint8_t>(b - a);
-}
-
-} // namespace
-
 DjAssistEngine::DjAssistEngine() : mode_(DJ_ASSIST_MODE_OFF), plan_(){
 }
 
@@ -108,8 +97,12 @@ bool DjAssistEngine::armTransition(
 	plan_.startAtBoundary = startAtBoundary;
 	plan_.tempoLock = tempoLock;
 	plan_.armedMix = guard.mix;
-	plan_.armedFromPlaying = guard.deckPlaying[fromDeck];
 	plan_.armedFromRateMilli = guard.rateMilli[fromDeck];
+	plan_.armedMixGeneration = guard.mixIntentGeneration;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		plan_.armedPlayGeneration[deck] = guard.playIntentGeneration[deck];
+		plan_.armedSyncGeneration[deck] = guard.syncIntentGeneration[deck];
+	}
 
 	buildSteps(plan_);
 	mode_ = DJ_ASSIST_MODE_TRANSITION_ARMED;
@@ -196,44 +189,41 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 	}
 
 	const bool stopSubmitted = stepSubmitted(DJ_ASSIST_ACTION_STOP_DECK);
-	const bool crossfadeSubmitted = stepSubmitted(DJ_ASSIST_ACTION_CROSSFADE);
-	const bool startDeckSubmitted = stepSubmitted(DJ_ASSIST_ACTION_START_DECK);
-	const bool syncSubmitted = stepSubmitted(DJ_ASSIST_ACTION_ENABLE_SYNC);
 
-	// armTransition() requires the target deck stopped and sync-off at arm
-	// time (see DjAssistTransitionPlan::toDeckStartOwnedByPlan/
-	// toDeckSyncOwnedByPlan). If the user starts playback or engages sync
-	// on the target deck before the plan's own START_DECK/ENABLE_SYNC step
-	// has been submitted, that divergence must abort the transition rather
-	// than let the later idempotent system command silently be credited as
-	// plan-owned (which would make rollback stop/release state the user,
-	// not the plan, introduced).
-	if(!startDeckSubmitted && guard.deckPlaying[plan_.toDeck]){
+	// Authoritative divergence detection: a monotonic non-system intent
+	// generation (mix/play/sync - see DjAssistIntentGenerations,
+	// DjSessionState.h) is latched the instant the corresponding user
+	// command is ADMITTED, compared unconditionally, every tick, against
+	// the baseline captured at arm() time. This catches a user command
+	// that races the plan's own step in either order (queued/applied
+	// before or after it), unlike the previous "has our own step
+	// submitted yet" gating, which went blind the instant our own step
+	// submitted regardless of true ordering - and, because system-origin
+	// commands (including both LOCK_TEMPO and ENABLE_SYNC, which both
+	// call setSync(true) - see buildSteps()) never bump these counters,
+	// the plan's own idempotent steps can never trigger a false positive
+	// either, which is what previously made LOCK_TEMPO's redundant sync
+	// step read as a manual override.
+	if(guard.playIntentGeneration[plan_.toDeck] != plan_.armedPlayGeneration[plan_.toDeck]){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
-	if(!syncSubmitted && guard.syncActive[plan_.toDeck]){
+	if(guard.syncIntentGeneration[plan_.toDeck] != plan_.armedSyncGeneration[plan_.toDeck]){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
-
-	if(!stopSubmitted && guard.deckPlaying[plan_.fromDeck] != plan_.armedFromPlaying){
+	if(guard.playIntentGeneration[plan_.fromDeck] != plan_.armedPlayGeneration[plan_.fromDeck]){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
-	// Checked regardless of crossfadeSubmitted: once the ramp begins, mix
-	// legitimately moves away from armedMix, so the plain threshold check
-	// below is skipped - but a manual (non-system) mix command observed
-	// during that same window must still abort rather than let the next
-	// programmatic ramp tick silently overwrite it.
-	if(guard.manualMixOverride){
+	if(guard.mixIntentGeneration != plan_.armedMixGeneration){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
-	if(!crossfadeSubmitted && absDiff(guard.mix, plan_.armedMix) > MIX_OVERRIDE_THRESHOLD){
-		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
-		return false;
-	}
+	// Rate has no discrete origin-tagged command to generation-track;
+	// once the plan's own STOP_DECK step has submitted, the from-deck's
+	// rate is no longer meaningfully "armed" (the deck is being released),
+	// so this check stays gated as before.
 	if(!stopSubmitted && guard.rateMilli[plan_.fromDeck] != plan_.armedFromRateMilli){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
@@ -300,7 +290,9 @@ void DjAssistEngine::tick(DjAssistActuator& actuator, const DjAssistGuardSnapsho
 			// APPLIED here means this system command is what produced the
 			// current playing/synced state.
 			if(step.action == DJ_ASSIST_ACTION_START_DECK) plan_.toDeckStartOwnedByPlan = true;
-			if(step.action == DJ_ASSIST_ACTION_ENABLE_SYNC) plan_.toDeckSyncOwnedByPlan = true;
+			if(step.action == DJ_ASSIST_ACTION_LOCK_TEMPO || step.action == DJ_ASSIST_ACTION_ENABLE_SYNC){
+				plan_.toDeckSyncOwnedByPlan = true;
+			}
 			plan_.currentStep++;
 			if(plan_.currentStep >= plan_.stepCount) mode_ = DJ_ASSIST_MODE_TRANSITION_COMPLETE;
 			return;

@@ -99,7 +99,7 @@ DjSubmitResult DjSession::submit(DjCommand command){
 	}
 
 	const DjSubmitResult result = admitAssistCommand(
-		command, commandQueue, commandResults, assistTracked, nonSystemMixGeneration);
+		command, commandQueue, commandResults, assistTracked, assistIntentGenerations);
 	if(result.error == DJ_COMMAND_ERROR_QUEUE_FULL) queueDrops++;
 	commandMutex.unlock();
 	return result;
@@ -676,8 +676,18 @@ uint32_t DjSession::assistTrackCount(){
 	return count;
 }
 
-bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry){
+bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision){
 	metadataMutex.lock();
+	// outRevision is captured under the SAME lock acquisition as the
+	// trackByIndex() read below - not a separate before/after probe - so
+	// it is guaranteed to describe the exact reader state this read used.
+	// refreshLibraryMetadata()/invalidateLibraryMetadata() also take
+	// metadataMutex around every libraryGeneration bump and reader swap,
+	// so there is no window in which a refresh can change the reader out
+	// from under this read while still reporting the old generation (the
+	// previously-possible check-then-lock gap between a generation probe
+	// and this call).
+	outRevision = libraryGeneration;
 	JaydMetadata::Track track;
 	const bool ok = metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready &&
 		metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
@@ -715,11 +725,34 @@ DjCommandStatus DjSession::assistTrackedStatus(uint32_t commandId){
 	return status;
 }
 
-uint32_t DjSession::assistNonSystemMixGeneration(){
+DjAssistIntentGenerations DjSession::assistIntentGenerationsSnapshot(){
 	commandMutex.lock();
-	const uint32_t generation = nonSystemMixGeneration;
+	const DjAssistIntentGenerations generations = assistIntentGenerations;
 	commandMutex.unlock();
-	return generation;
+	return generations;
+}
+
+void DjSession::assistPurgePendingSystemCommands(uint8_t deck){
+	commandMutex.lock();
+	DjCommand probe = {};
+	// Only .type/.deck feed DjCommandQueue::sameTarget(); any non-system
+	// origin works as the probe so removeSystemTargeting() matches every
+	// SYSTEM-origin entry for that channel regardless of who ends up
+	// "incoming" here (this call never actually admits `probe`).
+	probe.origin = DJ_ORIGIN_LOCAL_UI;
+	probe.deck = deck;
+
+	const DjCommandType purgedTypes[3] = { DJ_COMMAND_SET_PLAYING, DJ_COMMAND_SET_SYNC, DJ_COMMAND_SET_MIX };
+	for(uint8_t typeIndex = 0; typeIndex < 3; ++typeIndex){
+		probe.type = purgedTypes[typeIndex];
+		uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+		const uint8_t removedCount = commandQueue.removeSystemTargeting(probe, removedIds, DJ_COMMAND_CAPACITY);
+		for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
+			commandResults.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+			if(assistTracked.tracked && assistTracked.id == removedIds[i]) assistTracked.status = DJ_COMMAND_SUPERSEDED;
+		}
+	}
+	commandMutex.unlock();
 }
 
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
@@ -840,7 +873,7 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			system->setVolume(command.deck, gains[command.deck]);
 			return true;
 		case DJ_COMMAND_SET_MIX:
-			// nonSystemMixGeneration is bumped at admission time in
+			// assistIntentGenerations.mix is bumped at admission time in
 			// admitAssistCommand() (called from submit()), not here - a
 			// manual mix that is later superseded before ever applying
 			// still needs to have registered so a system-origin mix

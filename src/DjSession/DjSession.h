@@ -67,7 +67,16 @@ public:
 	// never a fresh file read outside these bounded, mutex-guarded calls.
 	uint32_t assistLibraryGeneration();
 	uint32_t assistTrackCount();
-	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry);
+	// outRevision reports the exact metadata generation this read was
+	// performed under, captured atomically (single metadataMutex
+	// acquisition) with the entry read itself - not a separate before/
+	// after generation probe - so a concurrent refreshLibraryMetadata()
+	// swapping the reader mid-scan can never leave outRevision and
+	// outEntry describing two different underlying reader states (the
+	// review's "check-then-lock gap"). Set regardless of whether the read
+	// itself succeeds, so callers can still detect a stale pass on a
+	// failed/corrupt record.
+	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision);
 	// Cheap, in-memory downbeat hint from the already-built beat grid,
 	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
 	// are expected to throttle the latter (see DjAssistController).
@@ -88,14 +97,26 @@ public:
 	// in between.
 	void assistTrackCommand(uint32_t commandId);
 	DjCommandStatus assistTrackedStatus(uint32_t commandId);
-	// Monotonic count of authoritatively-applied SET_MIX commands whose
-	// origin was NOT DJ_ORIGIN_SYSTEM, incremented exactly once per such
-	// command inside apply() (never inferred from the bounded/evictable
-	// recentResults ring). The Coach controller captures this value at
-	// arm() time and compares it on every guard/rollback check - any
-	// change means a manual mix action has occurred since, durably and
-	// without regard to ring eviction.
-	uint32_t assistNonSystemMixGeneration();
+	// Monotonic non-system ("user") intent generations for the global mix
+	// and per-deck play/sync channels, bumped by admitAssistCommand()
+	// (called from submit()) the instant such a command is admitted -
+	// supersede-replace or fresh push - not when it later applies. The
+	// Coach controller captures this snapshot at arm() time and compares
+	// it on every guard/rollback check; any change to the relevant field
+	// means the user has touched that control since arming, durably and
+	// without regard to recentResults ring eviction. See
+	// DjAssistIntentGenerations (DjSessionState.h).
+	DjAssistIntentGenerations assistIntentGenerationsSnapshot();
+	// Removes every currently-queued SYSTEM-origin SET_PLAYING/SET_SYNC
+	// for `deck` plus every queued SYSTEM-origin SET_MIX (mix is deck-
+	// agnostic, always purged), finishing each through the normal
+	// SUPERSEDED bookkeeping (commandResults + assistTracked). Called by
+	// the Coach controller exactly once per failure/cancel episode, for
+	// both plan decks, before computing rollback phases - so a
+	// cancelled/failed transition can never be followed by a stale queued
+	// Assist write landing after rollback has already restored safe
+	// state.
+	void assistPurgePendingSystemCommands(uint8_t deck);
 
 	bool copySnapshot(DjSnapshot& snapshot);
 	bool hasPendingLoad();
@@ -179,9 +200,10 @@ private:
 	// pops/finishes in loop().
 	DjAssistTrackedCommand assistTracked;
 	// Bumped by admitAssistCommand() (called from submit()) the instant a
-	// non-system-origin SET_MIX is admitted - supersede-replace or fresh
-	// push - not when it later applies (see assistNonSystemMixGeneration()).
-	uint32_t nonSystemMixGeneration = 0;
+	// non-system-origin mix/play/sync command is admitted - supersede-
+	// replace or fresh push - not when it later applies (see
+	// assistIntentGenerationsSnapshot()).
+	DjAssistIntentGenerations assistIntentGenerations;
 
 	DjAssistController assistController;
 	void tickAssist();

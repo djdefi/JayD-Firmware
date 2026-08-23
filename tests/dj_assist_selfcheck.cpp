@@ -486,24 +486,44 @@ void testTransitionOwnershipTrackedFromAppliedStep(){
 	assert(engine.plan().toDeckStartOwnedByPlan);
 	assert(!engine.plan().toDeckSyncOwnedByPlan);
 
-	// Step 1 is LOCK_TEMPO (a plain SET_EFFECT-style step; ownership flags
-	// only apply to START_DECK/ENABLE_SYNC).
+	// Step 1 is LOCK_TEMPO (both LOCK_TEMPO and ENABLE_SYNC ultimately call
+	// setSync(true) - see buildSteps()/DjAssistSessionActuator - so both
+	// must set toDeckSyncOwnedByPlan the moment either one applies.
+	// Previously only ENABLE_SYNC set this flag: if LOCK_TEMPO's own
+	// setSync(true) applied first (as it always does in the default plan)
+	// and something failed the transition before ENABLE_SYNC ever
+	// submitted, rollback would see toDeckSyncOwnedByPlan still false and
+	// skip releasing sync entirely, leaking it on indefinitely.
 	engine.tick(actuator, guard, boundary); // submit LOCK_TEMPO
-	engine.tick(actuator, guard, boundary); // poll -> APPLIED
-
-	// Step 2 is ENABLE_SYNC.
-	engine.tick(actuator, guard, boundary); // submit ENABLE_SYNC
 	assert(!engine.plan().toDeckSyncOwnedByPlan);
-	guard.syncActive[1] = true;
+	guard.syncActive[1] = true; // reflects LOCK_TEMPO's own setSync(true)
+	engine.tick(actuator, guard, boundary); // poll -> APPLIED
+	assert(engine.plan().toDeckSyncOwnedByPlan);
+
+	// Step 2 is ENABLE_SYNC - a no-op idempotent re-application of the
+	// same setSync(true); ownership was already true from LOCK_TEMPO above
+	// and must remain true (not itself require re-detection).
+	engine.tick(actuator, guard, boundary); // submit ENABLE_SYNC
+	assert(engine.plan().toDeckSyncOwnedByPlan);
 	engine.tick(actuator, guard, boundary); // poll -> APPLIED
 	assert(engine.plan().toDeckSyncOwnedByPlan);
 }
 
-// A manual play/sync on the target deck after arm but before the plan's own
-// START_DECK/ENABLE_SYNC step has been submitted must abort the transition
-// with MANUAL_OVERRIDE rather than let the later idempotent system command
-// be silently credited as plan-owned.
-void testTransitionAbortsOnTargetDivergenceBeforeOwnStep(){
+// A user command (play/sync on the target deck, or mix) admitted at any
+// point after arm - whether it is admitted before the plan's own
+// corresponding step ever submits, or admitted/applied after that step has
+// already submitted - must abort the transition with MANUAL_OVERRIDE. This
+// is the core regression for issue #2: the previous "has our own step
+// submitted yet" gating went blind to a user command that raced in after
+// submission (queued behind it, or applied while the plan's own command was
+// still in flight); the monotonic intent-generation baseline captured at
+// arm() is instead compared unconditionally every tick, so ordering can
+// never matter. Bumping guard.playIntentGeneration/syncIntentGeneration
+// here stands in for DjSession::admitAssistCommand() incrementing
+// DjAssistIntentGenerations the instant a non-system command is admitted -
+// see DjSessionState.h.
+void testTransitionAbortsOnTargetIntentDivergence(){
+	// Target play intent diverges before START_DECK is ever submitted.
 	{
 		DjAssistEngine engine;
 		FakeActuator actuator;
@@ -511,15 +531,14 @@ void testTransitionAbortsOnTargetDivergenceBeforeOwnStep(){
 		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
 		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
 
-		// User starts the target deck manually while still waiting on the
-		// WAIT_BOUNDARY step (before START_DECK is ever submitted).
 		DjAssistGuardSnapshot diverged = guard;
-		diverged.deckPlaying[1] = true;
+		diverged.playIntentGeneration[1] = guard.playIntentGeneration[1] + 1;
 		DjAssistBoundaryHint boundary;
 		engine.tick(actuator, diverged, boundary);
 		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
 	}
+	// Target sync intent diverges before ENABLE_SYNC is ever submitted.
 	{
 		DjAssistEngine engine;
 		FakeActuator actuator;
@@ -528,8 +547,30 @@ void testTransitionAbortsOnTargetDivergenceBeforeOwnStep(){
 		assert(engine.armTransition(0, 1, 5, target, 16, true, true, guard));
 
 		DjAssistGuardSnapshot diverged = guard;
-		diverged.syncActive[1] = true;
+		diverged.syncIntentGeneration[1] = guard.syncIntentGeneration[1] + 1;
 		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, diverged, boundary);
+		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
+		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	}
+	// Same divergence, but admitted only AFTER the plan's own START_DECK
+	// step has already submitted (still in flight, not yet applied) - the
+	// exact ordering the old stepSubmitted-gated check went blind to.
+	{
+		DjAssistEngine engine;
+		FakeActuator actuator;
+		actuator.completeAfterPolls = 5; // stays ACCEPTED for several polls
+		DjTrackIdentity target = fingerprintIdentity(1);
+		DjAssistGuardSnapshot guard = readyGuard(0, 1, target);
+		assert(engine.armTransition(0, 1, 5, target, 16, false, false, guard));
+
+		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, guard, boundary); // submit START_DECK
+		assert(engine.plan().steps[0].submitted);
+		assert(!engine.plan().steps[0].applied);
+
+		DjAssistGuardSnapshot diverged = guard;
+		diverged.playIntentGeneration[1] = guard.playIntentGeneration[1] + 1;
 		engine.tick(actuator, diverged, boundary);
 		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
@@ -648,7 +689,10 @@ void testTransitionMediaAndMetadataLoss(){
 }
 
 void testTransitionManualOverride(){
-	// Manual play override: source deck stops before the STOP_DECK step.
+	// Manual play override: source deck's play intent diverges before the
+	// STOP_DECK step is ever submitted (see testTransitionAbortsOnTarget-
+	// IntentDivergence's doc comment - a real user PLAY/PAUSE command is
+	// what bumps guard.playIntentGeneration[fromDeck] on admission).
 	{
 		DjAssistEngine engine;
 		FakeActuator actuator;
@@ -657,30 +701,17 @@ void testTransitionManualOverride(){
 		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
 
 		DjAssistGuardSnapshot manualStop = guard;
-		manualStop.deckPlaying[0] = false;
+		manualStop.playIntentGeneration[0] = guard.playIntentGeneration[0] + 1;
 		DjAssistBoundaryHint boundary;
 		engine.tick(actuator, manualStop, boundary);
 		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
 	}
 
-	// Manual crossfader override before the crossfade step is reached.
-	{
-		DjAssistEngine engine;
-		FakeActuator actuator;
-		DjTrackIdentity target = fingerprintIdentity(1);
-		DjAssistGuardSnapshot guard = readyGuard(0, 1);
-		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
-
-		DjAssistGuardSnapshot manualMix = guard;
-		manualMix.mix = 200;
-		DjAssistBoundaryHint boundary;
-		engine.tick(actuator, manualMix, boundary);
-		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
-		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
-	}
-
-	// Manual rate override on the still-playing source deck.
+	// Manual rate override on the still-playing source deck: rate has no
+	// discrete origin-tagged command to generation-track, so this remains
+	// a direct state comparison (guardOk() keeps this gated on
+	// !stopSubmitted - see below for the post-STOP_DECK case).
 	{
 		DjAssistEngine engine;
 		FakeActuator actuator;
@@ -696,24 +727,35 @@ void testTransitionManualOverride(){
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
 	}
 
-	// Manual mix override observed via the controller-set guard flag (a
-	// durable comparison of DjSession's monotonic non-system-mix generation
-	// counter against the value captured at arm() time - see
-	// DjSession::assistNonSystemMixGeneration()) must abort immediately.
-	// Unlike the plain mix-threshold check above, this one is NOT skipped
-	// once the crossfade step has been submitted - that is exactly the gap
-	// the review flagged (a manual override during an active programmatic
-	// ramp must not be silently overwritten by the next system tick).
+	// Manual mix override: a durable comparison of DjSession's monotonic
+	// non-system mix-intent generation counter against the value captured
+	// at arm() time (DjAssistTransitionPlan::armedMixGeneration - see
+	// DjSession::assistIntentGenerationsSnapshot()), latched at command
+	// ADMISSION rather than apply. This is checked unconditionally every
+	// tick - NOT skipped once the crossfade step has submitted, which is
+	// exactly the gap the review flagged: a manual override during an
+	// active programmatic ramp must not be silently overwritten by the
+	// next system tick. Drive the transition up through the CROSSFADE
+	// step's submission first, then prove the divergence still aborts.
 	{
 		DjAssistEngine engine;
-		FakeActuator actuator;
+		FakeActuator actuator; // default completeAfterPolls == 1
 		DjTrackIdentity target = fingerprintIdentity(1);
 		DjAssistGuardSnapshot guard = readyGuard(0, 1);
 		assert(engine.armTransition(0, 1, 5, target, 4, false, false, guard));
 
-		DjAssistGuardSnapshot manualOverride = guard;
-		manualOverride.manualMixOverride = true;
 		DjAssistBoundaryHint boundary;
+		engine.tick(actuator, guard, boundary); // submit START_DECK
+		guard.deckPlaying[1] = true;
+		engine.tick(actuator, guard, boundary); // poll -> APPLIED, advances to CROSSFADE
+		engine.tick(actuator, guard, boundary); // submit CROSSFADE (not yet polled)
+		assert(engine.plan().steps[engine.plan().currentStep].action == DJ_ASSIST_ACTION_CROSSFADE);
+		assert(engine.plan().steps[engine.plan().currentStep].submitted);
+		assert(!engine.plan().steps[engine.plan().currentStep].applied);
+
+		DjAssistGuardSnapshot manualOverride = guard;
+		manualOverride.mix = 200;
+		manualOverride.mixIntentGeneration = guard.mixIntentGeneration + 1;
 		engine.tick(actuator, manualOverride, boundary);
 		assert(engine.mode() == DJ_ASSIST_MODE_TRANSITION_FAILED);
 		assert(engine.plan().failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
@@ -928,7 +970,7 @@ int main(){
 	testArmRequiresValidPreconditions();
 	testArmRejectsAlreadyPlayingOrSyncedTarget();
 	testTransitionOwnershipTrackedFromAppliedStep();
-	testTransitionAbortsOnTargetDivergenceBeforeOwnStep();
+	testTransitionAbortsOnTargetIntentDivergence();
 	testTransitionFailsOnSupersededNormalStep();
 	testTransitionHappyPath();
 	testTransitionWaitsForAppliedResult();

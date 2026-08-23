@@ -157,12 +157,8 @@ void updatePhraseCache(
 	cache.metadataState = metadataState;
 }
 
-bool candidateFillGenerationCurrent(
-	uint32_t loadedGeneration,
-	uint32_t generationAtReadStart,
-	uint32_t liveGenerationAtCommit
-){
-	return loadedGeneration == generationAtReadStart && liveGenerationAtCommit == generationAtReadStart;
+bool candidateGenerationCurrent(uint32_t loadedGeneration, uint32_t observedGeneration){
+	return loadedGeneration == observedGeneration;
 }
 
 } // namespace DjAssistBridge

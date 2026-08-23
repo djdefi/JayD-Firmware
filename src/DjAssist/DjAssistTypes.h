@@ -203,10 +203,26 @@ struct DjAssistTransitionPlan {
 	DjAssistTransitionFailure failure = DJ_ASSIST_FAIL_NONE;
 
 	// State captured at arm() time, used to detect a manual override of the
-	// in-progress transition (crossfader/play/rate changed by the user).
+	// in-progress transition (crossfader/play/sync/rate changed by the
+	// user). armedMix/armedFromRateMilli remain plain captured values (the
+	// former is also the rollback MIX phase's restore target; the latter
+	// has no discrete origin-tagged command to generation-track). Mix/
+	// play/sync divergence itself is detected via the monotonic non-
+	// system intent generations below instead of comparing raw state -
+	// see DjAssistGuardSnapshot's generation fields and
+	// DjAssistIntentGenerations (DjSessionState.h) for why: a raw-state
+	// comparison cannot distinguish the plan's own idempotent system
+	// mutation (e.g. LOCK_TEMPO and ENABLE_SYNC both calling setSync(true))
+	// from a genuine user override, and goes blind the instant the plan's
+	// own corresponding step is submitted regardless of true ordering. A
+	// generation captured at ADMISSION time and compared unconditionally,
+	// every tick, has neither weakness: system-origin commands never bump
+	// it, and a user command still only queued is visible immediately.
 	uint8_t armedMix = 127;
-	bool armedFromPlaying = false;
 	uint32_t armedFromRateMilli = DJ_ASSIST_RATE_UNITY_MILLI;
+	uint32_t armedMixGeneration = 0;
+	uint32_t armedPlayGeneration[DJ_DECK_COUNT] = {};
+	uint32_t armedSyncGeneration[DJ_DECK_COUNT] = {};
 	// Rollback must only undo a mutation THIS plan actually applied, never
 	// a pre-existing or independently-user-introduced state. armTransition()
 	// requires the target deck to be stopped and sync-off at arm time (see
@@ -235,25 +251,36 @@ struct DjAssistGuardSnapshot {
 	// True when the deck's sync state is anything other than off (armed,
 	// locked, out-of-range, or error). armTransition() requires this to be
 	// false for the target deck at arm time (see
-	// DjAssistTransitionPlan::toDeckSyncOwnedByPlan); guardOk() also checks
-	// it every tick before the plan's own ENABLE_SYNC step has been
-	// submitted, to catch a manual sync-on in the gap between arm and step.
+	// DjAssistTransitionPlan::toDeckSyncOwnedByPlan).
 	bool syncActive[DJ_DECK_COUNT] = {};
 	// Identity currently loaded on each deck, so a running/armed transition
 	// can detect a target-deck swap (re-load or deck-swap) before acting on
 	// an unconfirmed track. Only meaningful when deckLoaded[deck] is true.
 	DjTrackIdentity deckIdentity[DJ_DECK_COUNT] = {};
-	// True when a mix command from a non-system origin (physical/browser)
-	// has been authoritatively applied since the transition armed. Set only
-	// by the controller, by comparing DjSession's durable monotonic
-	// non-system-mix generation counter against the value captured at
-	// arm() time (see DjSession::assistNonSystemMixGeneration()) - never
-	// inferred from the bounded/evictable recent-results ring, which can
-	// silently drop the very event this flag exists to catch. The engine
-	// never inspects command history itself. A programmatic crossfade must
-	// not silently overwrite this - guardOk() fails the transition
-	// immediately when this is true.
-	bool manualMixOverride = false;
+	// Live (current, "right now") monotonic non-system intent generations
+	// for the global mix and per-deck play/sync channels - see
+	// DjAssistIntentGenerations (DjSessionState.h) and
+	// DjSession::assistIntentGenerationsSnapshot(). Bumped the instant a
+	// non-system-origin command targeting that control is ADMITTED to the
+	// queue (fresh push or supersede-replace), never when it later
+	// applies - so a queued-but-not-yet-applied user command is already
+	// visible here, unlike the recentResults ring the controller must
+	// never infer correctness from. guardOk() compares each of these
+	// against the plan's own armed*Generation baseline (captured from
+	// this exact guard at arm() time, see DjAssistEngine::armTransition())
+	// by simple inequality, unconditionally every tick: any change means
+	// the user touched that control since arming, full stop. This
+	// subsumes the old raw-state divergence checks (deckPlaying/
+	// syncActive vs. a captured baseline, gated on "our own step hasn't
+	// submitted yet") and the old mix-value-threshold heuristic, both of
+	// which went blind once the plan's own corresponding step submitted -
+	// and, because system-origin commands (including both LOCK_TEMPO and
+	// ENABLE_SYNC, which both call setSync(true)) never bump these
+	// counters, the plan's own steps can never trigger a false positive
+	// either.
+	uint32_t mixIntentGeneration = 0;
+	uint32_t playIntentGeneration[DJ_DECK_COUNT] = {};
+	uint32_t syncIntentGeneration[DJ_DECK_COUNT] = {};
 };
 
 #endif

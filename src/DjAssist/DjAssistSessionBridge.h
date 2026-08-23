@@ -181,22 +181,19 @@ void updatePhraseCache(
 	uint64_t phraseFrame
 );
 
-// True when a candidate-table fill write/finalize may be safely committed.
-// generationAtReadStart is the library generation observed at the top of
-// the fillWorkerStep() call that performed the (possibly slow, unlocked)
-// read; liveGenerationAtCommit is a FRESH re-read of the same counter taken
-// immediately before acquiring the table lock to commit. Both must still
-// match the table's currently-loaded generation: comparing only against a
-// value captured before the read (as a naive single check would) misses a
-// refresh that completes *during* the unlocked read/scan window, letting a
-// stale record slip into the new generation's table - re-checking a
-// freshly-read value closes that gap without needing to change the
-// metadata reader functions' locking.
-bool candidateFillGenerationCurrent(
-	uint32_t loadedGeneration,
-	uint32_t generationAtReadStart,
-	uint32_t liveGenerationAtCommit
-);
+// True when a background-filled candidate-table entry (or a fill pass'
+// completion) may be safely committed. `loadedGeneration` is the library
+// generation this fill pass is currently loading; `observedGeneration` is
+// either (a) the exact metadata revision an entry read was performed under -
+// captured atomically with the read itself, inside the same reader-lifetime
+// lock, by DjSession::assistTrackEntry() - or (b) a fresh immediate re-read
+// of the live generation taken right before the completion commit. Either
+// way this is a single equality check against a value that cannot have
+// drifted from what was actually read/observed, closing the previous
+// check-then-lock gap where two independent generation probes (one before,
+// one after an unlocked read) could still both match a stale value while a
+// refresh completed unnoticed in between.
+bool candidateGenerationCurrent(uint32_t loadedGeneration, uint32_t observedGeneration);
 
 } // namespace DjAssistBridge
 

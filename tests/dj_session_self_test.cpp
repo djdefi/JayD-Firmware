@@ -267,28 +267,32 @@ int main(){
 	assert(djCommandIdentityMatches(local, UINT64_MAX, 0));
 #endif
 
-	// --- admitAssistCommand(): durable tracked-slot routing, SET_MIX ------
-	// --- origin priority, and admission-time (not apply-time) mix -----
-	// --- generation, exercised against the real queue/results/tracked -----
-	// --- types (review round 4, issues #2/#3/#6). --------------------------
+	// --- admitAssistCommand(): durable tracked-slot routing, queue-wide ---
+	// --- origin priority across mix/play/sync, and admission-time (not ---
+	// --- apply-time) intent generations, exercised against the real -----
+	// --- queue/results/tracked types (review round 4, issues #1-#3/#6). ---
+	// This is the exact free function DjSession::submit() calls with its
+	// real commandQueue/commandResults/assistTracked/assistIntentGenerations
+	// members (see DjSession.cpp) - not a parallel test-only reimplementation
+	// - so exercising it here covers the real admission path end to end.
 	{
 		DjCommandQueue assistQueue;
 		DjCommandResults assistResults;
 		DjAssistTrackedCommand tracked;
-		uint32_t mixGeneration = 0;
+		DjAssistIntentGenerations generations;
 
 		// A tracked command that gets superseded before it is ever dequeued
 		// must flip to SUPERSEDED immediately, at admission time - not stay
 		// stuck reporting ACCEPTED forever because it never reached
 		// DjSession::loop()'s pop()/finish() path.
 		DjCommand quantizeA = command(60, DJ_COMMAND_SET_QUANTIZE, 0);
-		DjSubmitResult r1 = admitAssistCommand(quantizeA, assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult r1 = admitAssistCommand(quantizeA, assistQueue, assistResults, tracked, generations);
 		assert(r1.accepted());
 		tracked.id = quantizeA.id;
 		tracked.tracked = true;
 		tracked.status = DJ_COMMAND_ACCEPTED;
 		DjCommand quantizeB = command(61, DJ_COMMAND_SET_QUANTIZE, 0);
-		DjSubmitResult r2 = admitAssistCommand(quantizeB, assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult r2 = admitAssistCommand(quantizeB, assistQueue, assistResults, tracked, generations);
 		assert(r2.accepted());
 		assert(tracked.id == quantizeA.id);
 		assert(tracked.status == DJ_COMMAND_SUPERSEDED); // routed at admission, not left ACCEPTED.
@@ -301,34 +305,101 @@ int main(){
 		assistQueue.clear();
 		DjCommand manualMix = command(70, DJ_COMMAND_SET_MIX, 0);
 		manualMix.origin = DJ_ORIGIN_PHYSICAL;
-		DjSubmitResult manualAdmit = admitAssistCommand(manualMix, assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult manualAdmit = admitAssistCommand(manualMix, assistQueue, assistResults, tracked, generations);
 		assert(manualAdmit.accepted());
-		const uint32_t generationAfterManual = mixGeneration;
+		const uint32_t generationAfterManual = generations.mix;
 		assert(generationAfterManual > 0); // latched at admission of the non-system mix itself.
 		DjCommand systemMix = command(71, DJ_COMMAND_SET_MIX, 0);
 		systemMix.origin = DJ_ORIGIN_SYSTEM;
-		DjSubmitResult systemAdmit = admitAssistCommand(systemMix, assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult systemAdmit = admitAssistCommand(systemMix, assistQueue, assistResults, tracked, generations);
 		assert(!systemAdmit.accepted());
 		assert(systemAdmit.status == DJ_COMMAND_REJECTED);
-		assert(systemAdmit.error == DJ_COMMAND_ERROR_MIX_OVERRIDE_PENDING);
+		assert(systemAdmit.error == DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING);
 		assert(assistQueue.depth() == 1); // manual mix still the sole queued command.
-		assert(mixGeneration == generationAfterManual); // rejected attempt must not bump it.
+		assert(generations.mix == generationAfterManual); // rejected attempt must not bump it.
 
 		// SET_MIX origin priority, order 2: a system-origin mix is queued
 		// first, then a manual mix arrives - the manual mix must win
 		// (replace it), since only system-over-manual is blocked.
 		assistQueue.clear();
-		mixGeneration = 0;
+		generations = DjAssistIntentGenerations();
 		DjCommand systemFirst = command(72, DJ_COMMAND_SET_MIX, 0);
 		systemFirst.origin = DJ_ORIGIN_SYSTEM;
-		assert(admitAssistCommand(systemFirst, assistQueue, assistResults, tracked, mixGeneration).accepted());
-		assert(mixGeneration == 0); // system-origin admission never bumps the manual generation.
+		assert(admitAssistCommand(systemFirst, assistQueue, assistResults, tracked, generations).accepted());
+		assert(generations.mix == 0); // system-origin admission never bumps the manual generation.
 		DjCommand manualSecond = command(73, DJ_COMMAND_SET_MIX, 0);
 		manualSecond.origin = DJ_ORIGIN_LOCAL_UI;
-		DjSubmitResult manualReplaces = admitAssistCommand(manualSecond, assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult manualReplaces = admitAssistCommand(manualSecond, assistQueue, assistResults, tracked, generations);
 		assert(manualReplaces.accepted());
 		assert(assistQueue.depth() == 1);
-		assert(mixGeneration == 1); // now latched, since the winning command is non-system.
+		assert(generations.mix == 1); // now latched, since the winning command is non-system.
+
+		// Queue-WIDE scan, not tail-only (review issue #3): a system mix is
+		// queued, then an unrelated command is pushed after it (so the
+		// system mix is no longer at the tail supersede() alone can reach),
+		// then a manual mix arrives - it must still purge the system mix
+		// from wherever it sits, not just fail to notice it and queue
+		// alongside it.
+		assistQueue.clear();
+		generations = DjAssistIntentGenerations();
+		DjCommand systemMixBuried = command(80, DJ_COMMAND_SET_MIX, 0);
+		systemMixBuried.origin = DJ_ORIGIN_SYSTEM;
+		assert(admitAssistCommand(systemMixBuried, assistQueue, assistResults, tracked, generations).accepted());
+		DjCommand unrelatedAfterSystemMix = command(81, DJ_COMMAND_LOAD_DECK, 1);
+		assert(admitAssistCommand(unrelatedAfterSystemMix, assistQueue, assistResults, tracked, generations).accepted());
+		assert(assistQueue.depth() == 2);
+		DjCommand manualMixBuried = command(82, DJ_COMMAND_SET_MIX, 0);
+		manualMixBuried.origin = DJ_ORIGIN_HTTP;
+		DjSubmitResult manualPurgesBuried = admitAssistCommand(manualMixBuried, assistQueue, assistResults, tracked, generations);
+		assert(manualPurgesBuried.accepted());
+		assert(assistQueue.depth() == 2); // unrelated command + the new manual mix; system mix purged.
+		{
+			DjCommand popped1, popped2;
+			assert(assistQueue.pop(popped1));
+			assert(assistQueue.pop(popped2));
+			assert((popped1.id == unrelatedAfterSystemMix.id && popped2.id == manualMixBuried.id) ||
+				   (popped2.id == unrelatedAfterSystemMix.id && popped1.id == manualMixBuried.id));
+			assert(popped1.id != systemMixBuried.id && popped2.id != systemMixBuried.id);
+		}
+		assert(generations.mix == 1); // the winning non-system mix still latches.
+
+		// Reverse queue-wide scan: a manual mix is queued, then buried by an
+		// unrelated command, then a system-origin mix attempt must still be
+		// rejected (hasNonSystemPending() scans the whole queue, not only
+		// the tail slot supersede() would reach).
+		assistQueue.clear();
+		generations = DjAssistIntentGenerations();
+		DjCommand manualMixFirst = command(90, DJ_COMMAND_SET_MIX, 0);
+		manualMixFirst.origin = DJ_ORIGIN_PHYSICAL;
+		assert(admitAssistCommand(manualMixFirst, assistQueue, assistResults, tracked, generations).accepted());
+		DjCommand unrelatedAfterManualMix = command(91, DJ_COMMAND_LOAD_DECK, 1);
+		assert(admitAssistCommand(unrelatedAfterManualMix, assistQueue, assistResults, tracked, generations).accepted());
+		DjCommand systemMixBlocked = command(92, DJ_COMMAND_SET_MIX, 0);
+		systemMixBlocked.origin = DJ_ORIGIN_SYSTEM;
+		DjSubmitResult systemBlocked = admitAssistCommand(systemMixBlocked, assistQueue, assistResults, tracked, generations);
+		assert(!systemBlocked.accepted());
+		assert(systemBlocked.error == DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING);
+		assert(assistQueue.depth() == 2); // unchanged: manual mix + unrelated command only.
+
+		// SET_PLAYING/SET_SYNC are tracked per-deck, independently of each
+		// other and of SET_MIX: a manual play on deck 0 must not touch deck
+		// 1's play generation, sync's generation, or mix's generation.
+		assistQueue.clear();
+		generations = DjAssistIntentGenerations();
+		DjCommand manualPlayDeck0 = command(93, DJ_COMMAND_SET_PLAYING, 0);
+		manualPlayDeck0.origin = DJ_ORIGIN_PHYSICAL;
+		assert(admitAssistCommand(manualPlayDeck0, assistQueue, assistResults, tracked, generations).accepted());
+		assert(generations.playing[0] == 1);
+		assert(generations.playing[1] == 0);
+		assert(generations.sync[0] == 0);
+		assert(generations.mix == 0);
+		DjCommand systemPlayDeck0 = command(94, DJ_COMMAND_SET_PLAYING, 0);
+		systemPlayDeck0.origin = DJ_ORIGIN_SYSTEM;
+		DjSubmitResult systemPlayBlocked = admitAssistCommand(systemPlayDeck0, assistQueue, assistResults, tracked, generations);
+		assert(!systemPlayBlocked.accepted()); // deck 0's queued manual play still pending.
+		DjCommand systemPlayDeck1 = command(95, DJ_COMMAND_SET_PLAYING, 1);
+		systemPlayDeck1.origin = DJ_ORIGIN_SYSTEM;
+		assert(admitAssistCommand(systemPlayDeck1, assistQueue, assistResults, tracked, generations).accepted()); // different deck: unaffected.
 
 		// A queue-full rejection must not disturb the durable tracked slot
 		// of whatever command it *is* watching - only supersession (above)
@@ -338,9 +409,9 @@ int main(){
 		tracked.tracked = true;
 		tracked.status = DJ_COMMAND_ACCEPTED;
 		for(uint32_t id = 100; id < 100 + DJ_COMMAND_CAPACITY; id++){
-			assert(admitAssistCommand(command(id, DJ_COMMAND_LOAD_DECK), assistQueue, assistResults, tracked, mixGeneration).accepted());
+			assert(admitAssistCommand(command(id, DJ_COMMAND_LOAD_DECK), assistQueue, assistResults, tracked, generations).accepted());
 		}
-		DjSubmitResult overflow = admitAssistCommand(command(999, DJ_COMMAND_LOAD_DECK), assistQueue, assistResults, tracked, mixGeneration);
+		DjSubmitResult overflow = admitAssistCommand(command(999, DJ_COMMAND_LOAD_DECK), assistQueue, assistResults, tracked, generations);
 		assert(!overflow.accepted());
 		assert(overflow.error == DJ_COMMAND_ERROR_QUEUE_FULL);
 		assert(tracked.status == DJ_COMMAND_ACCEPTED); // untouched - not the command that overflowed.
@@ -354,7 +425,7 @@ int main(){
 		DjCommandResults burstResults;
 		DjAssistTrackedCommand burstTracked;
 		DjCommand watched = command(200, DJ_COMMAND_SET_QUANTIZE, 0);
-		assert(admitAssistCommand(watched, assistQueue, burstResults, burstTracked, mixGeneration).accepted());
+		assert(admitAssistCommand(watched, assistQueue, burstResults, burstTracked, generations).accepted());
 		burstTracked.id = watched.id;
 		burstTracked.tracked = true;
 		burstTracked.status = DJ_COMMAND_ACCEPTED;
