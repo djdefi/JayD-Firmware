@@ -234,6 +234,11 @@ void DjAssistController::fillWorkerStepTrampoline(void* self){
 void DjAssistController::fillWorkerStep(){
 	if(!session_ || allocationFailed_) return;
 
+	// Bounded, independent of the main candidate-table fill progress below
+	// (which early-returns once fillComplete_ - grid hydration must not
+	// stall just because the rest of the table already finished filling).
+	stepGridHydration();
+
 	const uint32_t currentGeneration = session_->assistMetadataRevision();
 
 	candidateMutex_.lock();
@@ -309,6 +314,68 @@ void DjAssistController::fillWorkerStep(){
 	candidateMutex_.unlock();
 }
 
+// Bounded, incremental hydration of at most ONE pending grid-cache request
+// per call (see DjAssistGridCache/DjAssistGridCacheSlot's doc comments) -
+// this is the review-flagged PSRAM-budget fix's on-demand replacement for
+// caching gridAnchors[] on every candidate-table entry: only the handful of
+// identities Auto DJ actually requested a load for ever get their grid
+// anchors computed, and only via this background-worker step, never on
+// DjSession::loop()'s thread.
+void DjAssistController::stepGridHydration(){
+	candidateMutex_.lock();
+	const int pendingIndex = gridCache_.findPending();
+	if(pendingIndex < 0){
+		candidateMutex_.unlock();
+		return;
+	}
+	const DjAssistGridCacheSlot pending = gridCache_.at(uint8_t(pendingIndex));
+	// The candidate table's own fill must be current AND complete for
+	// this exact metadataRevision before its entries_[] can be trusted to
+	// resolve pending.identity to a libraryIndex - otherwise this could
+	// either miss a real match (fill still in progress) or match a stale
+	// record left over from a previous generation.
+	if(!fillComplete_ || !DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, pending.metadataRevision)){
+		candidateMutex_.unlock();
+		return;
+	}
+	int32_t matchedIndex = -1;
+	for(uint16_t i = 0; i < entryTotal_; ++i){
+		if(DjAssistScoring::identityMatches(entries_[i].identity, pending.identity)){
+			matchedIndex = int32_t(i);
+			break;
+		}
+	}
+	candidateMutex_.unlock();
+
+	if(matchedIndex < 0){
+		candidateMutex_.lock();
+		gridCache_.resolve(
+			pendingIndex, pending.libraryGeneration, pending.metadataRevision, pending.identity, false, nullptr, 0
+		);
+		candidateMutex_.unlock();
+		return;
+	}
+
+	// The actual (possibly SD-backed) read happens OUTSIDE the lock -
+	// mirrors fillWorkerStep()'s own discipline for assistTrackEntry().
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY];
+	uint16_t anchorCount = 0;
+	uint32_t readRevision = 0;
+	const bool ok = session_->assistTrackGridAnchors(uint32_t(matchedIndex), anchors, anchorCount, readRevision);
+
+	candidateMutex_.lock();
+	// Re-validate the revision the read was actually performed under
+	// immediately before committing - a refresh landing in the gap while
+	// this (possibly slow) read was outside the lock must not let a
+	// now-stale result be handed out as current.
+	const bool stillValid = ok && DjAssistBridge::candidateGenerationCurrent(pending.metadataRevision, readRevision);
+	gridCache_.resolve(
+		pendingIndex, pending.libraryGeneration, pending.metadataRevision, pending.identity,
+		stillValid, anchors, anchorCount
+	);
+	candidateMutex_.unlock();
+}
+
 // Bounded, lock-protected readiness check - never blocks on I/O (the fill
 // task never holds candidateMutex_ across a read). Retained for tests/
 // diagnostics (see DjAssistIntegrationSelfCheck::tableReady()), but
@@ -346,6 +413,24 @@ bool DjAssistController::candidateEntry(uint32_t index, DjAssistLibraryEntry& ou
 	outRevision = loadedGeneration_;
 	const bool ok = entries_ != nullptr && index < entryTotal_;
 	if(ok) outEntry = entries_[index];
+	candidateMutex_.unlock();
+	return ok;
+}
+
+void DjAssistController::requestGridHydration(
+	uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity
+){
+	candidateMutex_.lock();
+	gridCache_.request(libraryGeneration, metadataRevision, identity);
+	candidateMutex_.unlock();
+}
+
+bool DjAssistController::gridAnchorsFor(
+	uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity,
+	DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+){
+	candidateMutex_.lock();
+	const bool ok = gridCache_.lookup(libraryGeneration, metadataRevision, identity, outAnchors, outAnchorCount);
 	candidateMutex_.unlock();
 	return ok;
 }

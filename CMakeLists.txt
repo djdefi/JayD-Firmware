@@ -175,7 +175,8 @@ add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
 add_executable(DjAssistBridgeSelfCheck
         tests/dj_assist_bridge_selfcheck.cpp
         src/DjAssist/DjAssistScoring.cpp
-        src/DjAssist/DjAssistSessionBridge.cpp)
+        src/DjAssist/DjAssistSessionBridge.cpp
+        src/DjAssist/DjAssistGridCache.cpp)
 set_target_properties(DjAssistBridgeSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 target_compile_options(DjAssistBridgeSelfCheck PRIVATE -Wall -Wextra -Werror)
@@ -202,6 +203,7 @@ add_executable(DjAssistIntegrationSelfCheck
         tests/dj_assist_integration_selfcheck.cpp
         tests/host_stubs/host_arduino_shim.cpp
         src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistGridCache.cpp
         src/DjAssist/DjAssistFillWorker.cpp
         src/DjAssist/DjAssistScoring.cpp
         src/DjAssist/DjAssistSessionBridge.cpp
@@ -235,6 +237,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
             tests/dj_assist_integration_selfcheck.cpp
             tests/host_stubs/host_arduino_shim.cpp
             src/DjAssist/DjAssistController.cpp
+            src/DjAssist/DjAssistGridCache.cpp
             src/DjAssist/DjAssistFillWorker.cpp
             src/DjAssist/DjAssistScoring.cpp
             src/DjAssist/DjAssistSessionBridge.cpp
@@ -306,6 +309,7 @@ add_executable(AutoDjCoachIntegrationSelfCheck
         tests/host_stubs/host_arduino_shim.cpp
         src/AutoDj/DjAutoDjPlanner.cpp
         src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistGridCache.cpp
         src/DjAssist/DjAssistFillWorker.cpp
         src/DjAssist/DjAssistScoring.cpp
         src/DjAssist/DjAssistSessionBridge.cpp

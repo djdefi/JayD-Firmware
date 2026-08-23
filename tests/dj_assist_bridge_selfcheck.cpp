@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <string.h>
 
+#include "../src/DjAssist/DjAssistGridCache.h"
 #include "../src/DjAssist/DjAssistSessionBridge.h"
 
 using namespace DjAssistBridge;
@@ -331,6 +332,154 @@ void testCandidateGenerationCurrentMatchesExactly(){
 	assert(!DjAssistBridge::candidateGenerationCurrent(5, 6));
 }
 
+// -- DjAssistGridCache: bounded, few-slot on-demand grid-anchor hydration --
+// -- cache (the round-4 PSRAM-budget fix's replacement for a per-candidate-
+// -- entry gridAnchors[] array). Pure logic, no threading/locking of its
+// -- own (DjAssistController serializes every call under candidateMutex_).
+
+DjGridAnchor anchor(uint64_t frame, int64_t quarterBeat){
+	DjGridAnchor a;
+	a.frame = frame;
+	a.quarterBeat = quarterBeat;
+	return a;
+}
+
+void testGridCacheRequestFindPendingResolveLookupRoundTrip(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	assert(cache.request(10, 20, identity));
+
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	assert(cache.at(uint8_t(pending)).state == DjAssistGridCacheState::Pending);
+
+	DjGridAnchor anchors[2] = { anchor(100, 0), anchor(200, 4) };
+	cache.resolve(pending, 10, 20, identity, true, anchors, 2);
+
+	assert(cache.findPending() < 0); // no longer pending.
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(10, 20, identity, out, outCount));
+	assert(outCount == 2);
+	assert(out[0].frame == 100 && out[0].quarterBeat == 0);
+	assert(out[1].frame == 200 && out[1].quarterBeat == 4);
+}
+
+void testGridCacheLookupMissForNeverRequestedKey(){
+	DjAssistGridCache cache;
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 7; // non-zero sentinel - lookup() must reset it on a miss.
+	assert(!cache.lookup(1, 1, fingerprintIdentity(9), out, outCount));
+	assert(outCount == 0);
+}
+
+void testGridCacheLookupMissWhileStillPending(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(2);
+	cache.request(1, 1, identity);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identity, out, outCount));
+}
+
+void testGridCacheResolveFailedLeavesLookupMiss(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(3);
+	cache.request(1, 1, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	cache.resolve(pending, 1, 1, identity, false, nullptr, 0);
+	assert(cache.at(uint8_t(pending)).state == DjAssistGridCacheState::Failed);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identity, out, outCount));
+}
+
+// A resolve() targeting a slot that a NEWER request() has since evicted (or
+// overwritten with a different key while the read was in flight) must be
+// silently ignored - never let a late/stale result clobber the newer
+// request's own state. Mirrors DjAssistController::stepGridHydration()'s
+// "still Pending for the exact key" re-validation.
+void testGridCacheResolveIgnoredAfterSlotReused(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identityA = fingerprintIdentity(4);
+	cache.request(1, 1, identityA);
+	const int pendingForA = cache.findPending();
+	assert(pendingForA >= 0);
+
+	// Evict slot `pendingForA` by cycling DJ_ASSIST_GRID_CACHE_SLOTS more
+	// distinct requests through round-robin (request() itself never
+	// blocks/fails - see its doc comment).
+	for(uint8_t i = 0; i < DJ_ASSIST_GRID_CACHE_SLOTS; ++i){
+		cache.request(1, 1, fingerprintIdentity(uint8_t(100 + i)));
+	}
+	// The original A key is no longer represented by ANY slot.
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identityA, out, outCount));
+
+	// A late resolve() for the now-stale (index, key) pair must be a no-op.
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pendingForA, 1, 1, identityA, true, anchors, 1);
+	assert(!cache.lookup(1, 1, identityA, out, outCount));
+}
+
+void testGridCacheRequestIdempotentWhilePendingOrReady(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(5);
+	cache.request(1, 1, identity);
+	const int firstPending = cache.findPending();
+	assert(firstPending >= 0);
+	// Re-requesting the same still-Pending key must not restart/duplicate
+	// it - findPending() keeps reporting the exact same slot.
+	cache.request(1, 1, identity);
+	assert(cache.findPending() == firstPending);
+
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(firstPending, 1, 1, identity, true, anchors, 1);
+	// Re-requesting an already-Ready key must not reset it back to Pending
+	// (that would needlessly re-trigger a background read).
+	cache.request(1, 1, identity);
+	assert(cache.findPending() < 0);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, identity, out, outCount));
+}
+
+void testGridCacheAnchorCountCappedToCapacity(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(6);
+	cache.request(1, 1, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY + 5] = {};
+	for(uint16_t i = 0; i < DJ_GRID_ANCHOR_CAPACITY + 5; ++i) anchors[i] = anchor(i, i);
+	cache.resolve(pending, 1, 1, identity, true, anchors, uint16_t(DJ_GRID_ANCHOR_CAPACITY + 5));
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, identity, out, outCount));
+	assert(outCount == DJ_GRID_ANCHOR_CAPACITY);
+}
+
+// A different metadataRevision (a same-generation metadata replacement) or
+// libraryGeneration for the SAME identity must never be treated as the same
+// cache entry - both must be part of the key, not just the identity.
+void testGridCacheKeyIncludesGenerationAndRevision(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(7);
+	cache.request(1, 5, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pending, 1, 5, identity, true, anchors, 1);
+
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 5, identity, out, outCount));
+	assert(!cache.lookup(1, 6, identity, out, outCount)); // different revision.
+	assert(!cache.lookup(2, 5, identity, out, outCount)); // different generation.
+}
+
 } // namespace
 
 int main(){
@@ -355,5 +504,13 @@ int main(){
 	testPhraseCacheRescansOnBackwardSeek();
 	testPhraseCacheRescansOnMetadataGenerationOrStateChange();
 	testCandidateGenerationCurrentMatchesExactly();
+	testGridCacheRequestFindPendingResolveLookupRoundTrip();
+	testGridCacheLookupMissForNeverRequestedKey();
+	testGridCacheLookupMissWhileStillPending();
+	testGridCacheResolveFailedLeavesLookupMiss();
+	testGridCacheResolveIgnoredAfterSlotReused();
+	testGridCacheRequestIdempotentWhilePendingOrReady();
+	testGridCacheAnchorCountCappedToCapacity();
+	testGridCacheKeyIncludesGenerationAndRevision();
 	return 0;
 }

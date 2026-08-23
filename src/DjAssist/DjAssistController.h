@@ -3,6 +3,7 @@
 
 #include "DjAssistEngine.h"
 #include "DjAssistFillWorker.h"
+#include "DjAssistGridCache.h"
 #include "DjAssistSessionBridge.h"
 #include "DjAssistSessionPort.h"
 
@@ -116,12 +117,37 @@ public:
 	uint32_t candidateCount();
 	bool candidateEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision);
 
+	// Bounded, few-slot on-demand grid-anchor hydration cache (see
+	// DjAssistGridCache/DjAssistGridCacheSlot's doc comments) - the PSRAM-
+	// budget-safe replacement for the old per-candidate-entry gridAnchors[]
+	// array. requestGridHydration() is called by AutoDjSessionActuator (via
+	// DjSession::loadDeckByIdentity()) at the moment a stable-ID load is
+	// submitted; the background fill worker resolves at most one pending
+	// request per stepGridHydration() call (never blocking, never gating
+	// the main candidate-table fill progress). gridAnchorsFor() is the
+	// read-only, RAM-only lookup DjSession::resolveIdentityLoad() uses at
+	// apply time - a miss (never requested, still pending, evicted, or a
+	// stale-key result) is always safe to treat as "no usable grid".
+	void requestGridHydration(uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity);
+	bool gridAnchorsFor(
+		uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity,
+		DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+	);
+
 private:
 	// Host integration harness only - grants access to the private
 	// stepping methods below (fillWorkerStep(), tickSuggestions(), etc.)
 	// so it can drive the exact real controller logic deterministically;
 	// it adds no production API surface and changes no behavior.
 	friend class DjAssistIntegrationSelfCheck;
+	// Same grant, for the separate Auto DJ + Coach composite-workflow host
+	// harness (tests/auto_dj_coach_integration_selfcheck.cpp), which needs
+	// to drive fillWorkerStep() directly to prove its production
+	// requestGridHydration() call (from autoDjLoadDeckByIdentity(), see
+	// that file's FakePort) actually resolves end-to-end - that harness
+	// has no other access to DjAssistIntegrationSelfCheck's own TU-local
+	// helper class.
+	friend class AutoDjCoachGridHydrationHarness;
 
 	DjAssistSessionPort* session_ = nullptr;
 	DjAssistEngine engine_;
@@ -145,6 +171,13 @@ private:
 	bool generationSeen_ = false;
 	uint16_t fillCursor_ = 0;
 	bool fillComplete_ = false;
+
+	// Few-slot, few-KiB, non-ps_malloc'd on-demand grid-anchor hydration
+	// cache (see DjAssistGridCache.h) - protected by the same
+	// candidateMutex_ as entries_[]/entryTotal_ above, since
+	// stepGridHydration() needs to scan entries_[] for the requested
+	// identity's libraryIndex.
+	DjAssistGridCache gridCache_;
 
 	// Main-thread-only mirror of the fill generation, used solely to
 	// notice (once per tick, via a single locked read) when a NEW
@@ -208,6 +241,7 @@ private:
 
 	static void fillWorkerStepTrampoline(void* self);
 	void fillWorkerStep();
+	void stepGridHydration();
 	bool candidateTableReady(uint32_t& outGeneration);
 	void updateRecentTracks(const DjSnapshot& snapshot);
 	DjAssistGuardSnapshot buildGuard(const DjSnapshot& snapshot) const;

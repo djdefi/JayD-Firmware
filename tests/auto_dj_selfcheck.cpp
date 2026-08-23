@@ -292,6 +292,30 @@ void testCapabilityDisabledBlocksArm(){
 	assert(planner.failReason() == AutoDjFailReason::CapabilityDisabled);
 }
 
+// -- Round-4 review fix #3: Failed is terminal and must only be left via an
+// explicit reset() - stop() must never be usable to slip Failed straight
+// to Stopping/Off (which would let Auto DJ re-arm without the caller ever
+// having acknowledged the failure, and without whatever settled-rollback
+// guarantee reset() provides at the actuator layer). --
+void testStopRejectedFromFailedRequiresReset(){
+	MockLoadPort port;
+	port.stableIdEndpoint = false;
+	DjAutoDjPlanner planner(port);
+
+	assert(!planner.arm());
+	assert(planner.state() == AutoDjState::Failed);
+
+	assert(!planner.stop());
+	assert(planner.state() == AutoDjState::Failed); // unchanged - stop() must not apply.
+
+	assert(planner.reset());
+	assert(planner.state() == AutoDjState::Off);
+
+	port.stableIdEndpoint = true;
+	assert(planner.arm());
+	assert(planner.state() == AutoDjState::Armed);
+}
+
 void testMissingConfirmationKeepsOff(){
 	MockLoadPort port;
 	port.confirmed = false;
@@ -824,6 +848,7 @@ int main(){
 	testPlannerTieBreakIsOrderIndependent();
 	testNoSafeWindowKeepsArmed();
 	testCapabilityDisabledBlocksArm();
+	testStopRejectedFromFailedRequiresReset();
 	testMissingConfirmationKeepsOff();
 	testLoadAppliedEndToEnd();
 	testLoadFailureRetryBudgetThenSkip();

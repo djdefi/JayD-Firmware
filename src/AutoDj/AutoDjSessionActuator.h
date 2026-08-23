@@ -111,12 +111,42 @@ public:
 	// whether anything here still asks it to), but reset() is an explicit
 	// deliberate abandon and should not leave a transition it no longer
 	// intends to observe running.
+	//
+	// Two cases, and only two mutate anything:
+	//  1. planner.reset() succeeds (state is Failed/Complete - the plain,
+	//     documented reset path): an explicit terminal acknowledgment, so
+	//     any straggling Coach transition is safely cancelled too and
+	//     loadSubPhase clears to Idle.
+	//  2. planner.reset() is rejected (state isn't Failed/Complete yet)
+	//     AND a Coach arm/transition is still physically live: this is the
+	//     hard-abandon case. Cancel it, but route loadSubPhase through the
+	//     SAME bounded Teardown/settled-wait path a genuine Coach-side
+	//     transition failure uses (see pollTransitionPhase()'s Teardown
+	//     branch) instead of forcing Idle immediately. Forcing Idle here
+	//     let the very next tick()'s progressPending() see an ordinary
+	//     load failure and retry right away - regardless of whether the
+	//     cancel's own rollback had actually finished - racing a fresh
+	//     load against stale rollback commands on the same deck. Routing
+	//     through Teardown reuses submitLoad()'s existing
+	//     autoDjCoachTransitionSettled() hard-reject and bounded teardown
+	//     deadline instead of a second, unreviewed safety mechanism.
+	// Any other rejected reset (no live transition to abandon: Idle,
+	// LoadInFlight, or already Teardown/Stopping) is a true no-op - zero
+	// effect on Coach or loadSubPhase.
 	bool reset(){
+		if(planner.reset()){
+			if(loadSubPhase == AutoDjLoadSubPhase::ArmInFlight || loadSubPhase == AutoDjLoadSubPhase::TransitionInFlight){
+				sessionPort.autoDjCancelCoachTransition();
+			}
+			loadSubPhase = AutoDjLoadSubPhase::Idle;
+			return true;
+		}
 		if(loadSubPhase == AutoDjLoadSubPhase::ArmInFlight || loadSubPhase == AutoDjLoadSubPhase::TransitionInFlight){
 			sessionPort.autoDjCancelCoachTransition();
+			loadSubPhase = AutoDjLoadSubPhase::Teardown;
+			teardownDeadlineUs = nowMicros() + AUTO_DJ_TEARDOWN_TIMEOUT_US;
 		}
-		loadSubPhase = AutoDjLoadSubPhase::Idle;
-		return planner.reset();
+		return false;
 	}
 	bool pinTrack(const AutoDjIdentity& identity, uint32_t artistHash, uint32_t titleHash){
 		return planner.pinTrack(identity, artistHash, titleHash);

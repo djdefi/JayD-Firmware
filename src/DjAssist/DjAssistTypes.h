@@ -126,19 +126,81 @@ struct DjAssistLibraryEntry {
 	uint32_t provenanceHash = 0;
 	uint16_t confidence = 0;
 	uint32_t downbeatCount = 0;
-	// Bounded, pre-subsampled beat-grid anchor cache: the exact same
-	// stride/confidence-filtered subsampling DjSession::buildGrid() applies
-	// to a manual path-based load, computed once here (off-thread, in
-	// DjSession::assistTrackEntry()) instead of at Auto-apply time. This is
-	// what lets a stable-ID load install its DjBeatGrid via
-	// DjBeatGrid::build(gridAnchors, gridAnchorCount) directly - zero
-	// metadataReader.readGrid() calls on DjSession::loop()'s thread. Fixed
-	// POD array, no heap. gridAnchorCount == 0 means "no usable grid" (same
-	// as buildGrid() returning false) and is always safe to pass through:
-	// DjBeatGrid::build() itself rejects an empty anchor set.
-	DjGridAnchor gridAnchors[DJ_GRID_ANCHOR_CAPACITY] = {};
-	uint16_t gridAnchorCount = 0;
+	// NOTE: this entry deliberately does NOT cache a per-track beat-grid
+	// anchor array. An earlier revision did (DjGridAnchor
+	// gridAnchors[DJ_GRID_ANCHOR_CAPACITY] on every one of
+	// DJ_ASSIST_MAX_INDEX_ENTRIES entries) and a focused review correctly
+	// flagged that this blew the PSRAM budget: ~768B/entry * 4096 entries
+	// is ~3.1MiB on top of this struct's other fields, leaving no headroom
+	// for SongList/index/audio/recording/hot-swap in a 4MiB PSRAM part -
+	// and a resulting allocation failure would silently empty the whole
+	// candidate table while callers still believed the capability was
+	// available. See DjAssistGridCache below (and DjAssistController's
+	// gridCache_ member) for the bounded, few-KiB, few-slot replacement:
+	// grid anchors are hydrated off-thread on demand, only for the handful
+	// of identities Auto DJ is actually about to load, never precomputed
+	// for the entire library.
 };
+
+// Bounded, on-demand replacement for per-entry grid-anchor caching (see
+// DjAssistLibraryEntry's doc comment above for why the entry itself no
+// longer carries this). Holds at most DJ_ASSIST_GRID_CACHE_SLOTS
+// (currently in-flight Auto DJ loads are never more than one at a time -
+// see AutoDjLoadPort's "at most one load in flight" contract - so a small
+// handful of slots is generous headroom, not a queue). Populated strictly
+// off DjSession::loop()'s thread by DjAssistController::fillWorkerStep()
+// (see its own doc comment) once AutoDjSessionActuator::submitLoad()
+// requests hydration for the exact identity/epoch it is about to load;
+// looked up read-only, RAM-only, by DjSession::resolveIdentityLoad() at
+// apply time. A cache miss (never requested, evicted, still Pending, or a
+// stale-key Ready slot) is always safe to treat as "no usable grid" - the
+// same fallback DjBeatGrid::build() and buildGrid() already use for a
+// track with no usable grid data at all - so this cache can never cause a
+// load to fail, only to proceed without quantize/sync capability.
+static const uint8_t DJ_ASSIST_GRID_CACHE_SLOTS = 4;
+
+enum class DjAssistGridCacheState : uint8_t {
+	Empty,   // never used, or evicted by a newer request.
+	Pending, // requested; fillWorkerStep() has not yet resolved it.
+	Ready,   // resolved: anchors/anchorCount are valid for this exact key.
+	Failed   // resolved but no usable grid (identity not found, read
+	         // failed, or the all-or-nothing capability gate rejected it).
+};
+
+// Fixed-size, POD (host-testable) hydration-cache entry. Keyed by the same
+// tuple DjSession::resolveIdentityLoad()/DjCommand already carry end-to-end
+// for a stable-ID load (libraryGeneration, metadataRevision, identity), so
+// no new command/queue field is needed anywhere else - apply time simply
+// looks this cache up using fields it already has.
+struct DjAssistGridCacheSlot {
+	DjAssistGridCacheState state = DjAssistGridCacheState::Empty;
+	uint32_t libraryGeneration = 0;
+	uint32_t metadataRevision = 0;
+	DjTrackIdentity identity = {};
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t anchorCount = 0;
+};
+
+// Compile-time PSRAM budget guards (see the review this addresses: an
+// earlier revision's per-entry gridAnchors[] made the candidate table alone
+// ~3.9MiB of a 4MiB PSRAM part). DJ_ASSIST_MAX_INDEX_ENTRIES *
+// sizeof(DjAssistLibraryEntry) is the single largest allocation
+// DjAssistController::begin() makes (see its ps_malloc() call); 1MiB leaves
+// generous (>2.9MiB) headroom for SongList/index/audio/recording/hot-swap.
+// DjAssistGridCacheSlot's array is a plain (non-ps_malloc'd,
+// DJ_ASSIST_GRID_CACHE_SLOTS-sized) member and must stay a "few KiB" total,
+// never scaling with library size - capped here at 16KiB as a generous
+// upper bound for a 4-slot cache.
+static_assert(
+	sizeof(DjAssistLibraryEntry) * size_t(DJ_ASSIST_MAX_INDEX_ENTRIES) <= size_t(1) * 1024 * 1024,
+	"DjAssistLibraryEntry candidate table must stay well under the PSRAM budget - "
+	"do not add another per-entry array; see DjAssistGridCache's doc comment"
+);
+static_assert(
+	sizeof(DjAssistGridCacheSlot) * size_t(DJ_ASSIST_GRID_CACHE_SLOTS) <= size_t(16) * 1024,
+	"DjAssistGridCache must stay a small, fixed, few-KiB allocation - "
+	"do not scale DJ_ASSIST_GRID_CACHE_SLOTS with library size"
+);
 
 // Compact, bounded, POD suggestion - safe to copy into a snapshot/API/browser
 // payload as-is.

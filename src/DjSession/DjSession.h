@@ -109,6 +109,16 @@ public:
 	// of whether the read itself succeeds, so callers can still detect a
 	// stale pass on a failed/corrupt record.
 	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override;
+	// On-demand grid-anchor hydration for exactly one already-indexed
+	// track (see DjAssistSessionPort.h's doc comment and
+	// DjAssistGridCache) - the PSRAM-budget-safe replacement for caching a
+	// gridAnchors[] array on every one of DJ_ASSIST_MAX_INDEX_ENTRIES
+	// candidate-table entries. Called only from
+	// DjAssistController::stepGridHydration() (background-worker thread),
+	// never from DjSession::loop().
+	bool assistTrackGridAnchors(
+		uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+	) override;
 	// Cheap, in-memory downbeat hint from the already-built beat grid,
 	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
 	// are expected to throttle the latter (see DjAssistController).

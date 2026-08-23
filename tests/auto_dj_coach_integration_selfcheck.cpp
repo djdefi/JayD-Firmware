@@ -174,6 +174,28 @@ public:
 		return true;
 	}
 
+	// Fake on-demand grid-anchor read (see DjAssistGridCache): same
+	// all-or-nothing capability gate as the real DjSession::
+	// assistTrackGridAnchors(), but returns one fixed deterministic anchor
+	// instead of a real readGrid() burst.
+	int assistTrackGridAnchorsCallCount = 0;
+	bool assistTrackGridAnchors(
+		uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+	) override{
+		++assistTrackGridAnchorsCallCount;
+		outRevision = metadataRevision;
+		outAnchorCount = 0;
+		if(index >= entryCount) return false;
+		const DjAssistLibraryEntry& entry = entries[index].entry;
+		const uint16_t required = DJ_METADATA_HAS_GRID | DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_BPM;
+		if((entry.capabilities & required) != required) return false;
+		if(outAnchors == nullptr) return false;
+		outAnchors[0].frame = 0;
+		outAnchors[0].quarterBeat = 0;
+		outAnchorCount = 1;
+		return true;
+	}
+
 	bool mediaPresent() const override{ return media; }
 
 	uint64_t deckElapsedFrames(uint8_t deck) const override{
@@ -243,7 +265,14 @@ public:
 		command.metadataRevision = identityMetadataRevision;
 		command.trackIdentity = identity;
 		command.autoDjOwned = true;
-		return submit(command);
+		const DjSubmitResult result = submit(command);
+		// Mirrors DjSession::loadDeckByIdentity(): fire-and-forget grid-
+		// anchor hydration request for this exact key, submitted only
+		// after a successful admit - see DjAssistGridCache's doc comment.
+		if(result.status == DJ_COMMAND_ACCEPTED && controller != nullptr){
+			controller->requestGridHydration(identityLibraryGeneration, identityMetadataRevision, identity);
+		}
+		return result;
 	}
 
 	void autoDjTrackCommand(uint32_t commandId) override{
@@ -912,11 +941,101 @@ void testCoachFailureRollbackSettlesBeforeAutoDjRetries(){
 
 } // namespace
 
+// Host harness only - grants access to DjAssistController::fillWorkerStep()
+// (via the `friend class AutoDjCoachGridHydrationHarness;` grant in
+// DjAssistController.h) so this file's hydration test can deterministically
+// resolve the bounded on-demand grid-anchor cache (DjAssistGridCache)
+// without needing a real background thread. Adds no production API
+// surface; every other test in this file drives the controller through its
+// public API exactly as before.
+class AutoDjCoachGridHydrationHarness {
+public:
+	static void stepFill(DjAssistController& controller){
+		controller.fillWorkerStep();
+	}
+};
+
+namespace {
+
+// -- round 4, issue #1 (PSRAM budget): proves the PRODUCTION call path -
+// -- FakePort::autoDjLoadDeckByIdentity() (a faithful copy of DjSession::
+// -- loadDeckByIdentity()'s body, see that method's own definition above) -
+// -- actually fires DjAssistController::requestGridHydration() on a
+// -- successful Auto DJ load submit, and that the bounded background
+// -- hydration step then makes the anchors available via gridAnchorsFor(),
+// -- exactly as DjSession::resolveIdentityLoad() would look them up at
+// -- apply time. Not merely a unit test of DjAssistGridCache in isolation -
+// -- this goes through the real AutoDjSessionActuator's submitLoad() and
+// -- the real DjAssistController together, as production wires them.
+void testAutoDjLoadTriggersGridHydrationEndToEnd(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x44);
+	port.entries[0].entry.capabilities = DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_GRID;
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+
+	// Wait for the LOAD_DECK command to actually apply - that is the exact
+	// moment autoDjLoadDeckByIdentity() (and, inside it, the fire-and-
+	// forget requestGridHydration() call) runs.
+	loopUntil(port, controller, actuator, [&]{
+		return port.snapshot.decks[1].loaded;
+	});
+	const DjTrackIdentity loaded = port.entries[0].entry.identity;
+
+	// Not resolved yet - stepGridHydration() only advances via
+	// fillWorkerStep(), which loopOnce()/tick() never calls (see
+	// DjAssistFillWorker's host manual-stepping default).
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t anchorCount = 0;
+	assert(!controller.gridAnchorsFor(port.libraryGeneration, port.metadataRevision, loaded, anchors, anchorCount));
+
+	// The main candidate table must finish a full fill pass before
+	// stepGridHydration() will trust entries_[] enough to resolve a
+	// pending request against it (see stepGridHydration()'s doc comment) -
+	// bounded by entryCount+margin calls, exactly like
+	// DjAssistIntegrationSelfCheck::fillCandidateTableToReady().
+	for(int i = 0; i < 16 && controller.candidateCount() == 0; ++i){
+		AutoDjCoachGridHydrationHarness::stepFill(controller);
+	}
+	assert(controller.candidateCount() == port.entryCount);
+
+	// One more bounded call resolves the still-pending hydration request
+	// now that the table is current and complete.
+	AutoDjCoachGridHydrationHarness::stepFill(controller);
+	assert(port.assistTrackGridAnchorsCallCount == 1);
+
+	assert(controller.gridAnchorsFor(port.libraryGeneration, port.metadataRevision, loaded, anchors, anchorCount));
+	assert(anchorCount == 1);
+
+	controller.end();
+}
+
+} // namespace
+
 int main(){
 	testFullTwoEntryRunThroughRealPorts();
 	testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj();
 	testManualMixDuringTransitionPurgesQueuedCoachStep();
 	testRealCoachGuardRejectionAtArmRetriesThenSucceeds();
 	testCoachFailureRollbackSettlesBeforeAutoDjRetries();
+	testAutoDjLoadTriggersGridHydrationEndToEnd();
 	return 0;
 }

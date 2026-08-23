@@ -414,10 +414,17 @@ void testManualTakeoverDuringRunningTransitionCancelsCoach(){
 	assert(actuator.state() == AutoDjState::Paused);
 }
 
-// -- Test 3d (fix #5 review): reset() (a hard, immediate abandon) must
-// proactively cancel a live Coach arm/transition too, not only rely on the
-// planner's own bookkeeping being forgotten - see reset()'s doc comment. --
-void testResetDuringTransitionCancelsCoach(){
+// -- Test 3d (fix #5 review, refined by round-4 review fix #2): reset()
+// (a hard, immediate abandon) must proactively cancel a live Coach
+// arm/transition too, not only rely on the planner's own bookkeeping being
+// forgotten - see reset()'s doc comment. But the abandon must route through
+// the SAME bounded Teardown/settled-wait path a genuine Coach-side
+// transition failure uses, rather than forcing loadSubPhase straight back
+// to Idle: forcing Idle immediately let the very next tick() treat this as
+// an ordinary load failure and retry (submit a fresh load) right away,
+// regardless of whether the cancel's own rollback had actually finished -
+// racing a new load against stale rollback commands on the same deck. --
+void testResetDuringTransitionCancelsCoachThenWaitsForSettlement(){
 	FakeSessionPort port;
 	port.entryCount = 1;
 	port.entries[0].entry = makeEntry(0xD2);
@@ -436,21 +443,32 @@ void testResetDuringTransitionCancelsCoach(){
 	assert(port.lastArmCalled);
 	assert(!port.cancelCalled);
 
-	actuator.reset();
+	// Coach's own rollback has NOT settled yet at the moment of the
+	// abandon request - the realistic case this fix protects against.
+	port.coachTransitionSettled = false;
+	assert(!actuator.reset()); // not a plain reset - state is still Running.
 	assert(port.cancelCalled);
+	assert(actuator.state() == AutoDjState::Running); // unchanged: reset() was rejected.
 
-	// The sub-phase must actually be forgotten (not just the cancel call
-	// made), so a stale command id can never be mistaken for a still-live
-	// phase: the planner's own pendingPhase is still WaitingOutcome here
-	// (reset() only applies the state-machine transition from Failed/
-	// Complete, and this actuator is still Running), so the very next
-	// tick's progressPending() calls pollLoad() again - it must now see
-	// AutoDjLoadSubPhase::Idle (uniformly Failed) rather than resuming the
-	// abandoned arm/transition, proving the phase reset actually stuck.
+	// Bounded number of ticks while rollback stays unsettled: must never
+	// resubmit a fresh load in the meantime (the exact race this fix
+	// closes) and must never cancel a second time.
 	port.cancelCalled = false;
-	port.lastArmCalled = false;
-	actuator.tick();
-	assert(!port.cancelCalled); // nothing stale left to cancel a second time.
+	port.lastLoadCalled = false;
+	for(int i = 0; i < 4; i++){
+		actuator.tick();
+		assert(!port.lastLoadCalled);
+		assert(!port.cancelCalled);
+	}
+
+	// Once the rollback genuinely settles, the abandoned attempt resolves
+	// exactly like any other failed load: within its retry budget, a fresh
+	// load is submitted safely (no stale command left in flight anymore).
+	port.coachTransitionSettled = true;
+	actuator.tick(); // Teardown settles -> Failed -> handleLoadFailure() (retry kept).
+	assert(!port.lastLoadCalled);
+	actuator.tick(); // next one-shot tick: currentTrackAtEnd() still true -> retries.
+	assert(port.lastLoadCalled);
 }
 
 // -- Test 4: generation1 X submitted -> load fails (attempt kept, within
@@ -722,6 +740,55 @@ void testCoachTransitionFailureFailsAttemptWithinBudget(){
 	assert(after.historySize == 1);
 }
 
+// -- Round-4 review fix #2: reset() must be transactional. Calling it
+// while Running with no live Coach arm/transition to abandon (loadSubPhase
+// is only LoadInFlight - the stable-ID deck load itself, before Coach is
+// even engaged) must be a pure no-op: planner.reset() rejects (only
+// Failed/Complete are eligible) and there is nothing to cancel, so it must
+// not touch loadSubPhase or call autoDjCancelCoachTransition(). Proven by
+// continuing the same in-flight load to a normal Applied/history-recorded
+// completion afterward - if reset() had mutated anything, this would hang
+// or double-submit. (Contrast with
+// testResetDuringTransitionCancelsCoachThenWaitsForSettlement(), where a
+// live Coach arm/transition IS abandoned - deliberately, and safely via
+// Teardown - because reset() is meant to work as a hard abandon in that
+// case.) --
+void testRejectedResetDuringLoadInFlightHasNoSideEffects(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xC5);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits the load -> LoadInFlight.
+	assert(port.lastLoadCalled);
+	assert(actuator.state() == AutoDjState::Running);
+
+	// reset() while Running with no live Coach transition must be a true
+	// no-op: rejected, no cancel, no loadSubPhase mutation.
+	assert(!actuator.reset());
+	assert(actuator.state() == AutoDjState::Running);
+	assert(!port.cancelCalled);
+
+	// The rejected reset changed nothing: the same in-flight load proceeds
+	// and completes exactly as it would have without the reset() call ever
+	// happening.
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	completeCoachArmAndTransition(port, actuator, port.targetDeck);
+
+	AutoDjSnapshot after;
+	actuator.copySnapshot(after);
+	assert(after.historySize == 1);
+	assert(after.queueDepth == 0);
+	assert(!port.cancelCalled); // never cancelled at any point in this run.
+}
+
 // -- Round-3 review fix #2: if Coach's own rollback (mix/sync/stop-deck
 // restore) does not settle within the actuator's OWN bounded
 // AUTO_DJ_TEARDOWN_TIMEOUT_US - independent of, and much shorter than, the
@@ -778,6 +845,14 @@ void testTeardownTimeoutBecomesTerminalFailureNotRetry(){
 	assert(actuator.state() == AutoDjState::Failed);
 	assert(actuator.failReason() == AutoDjFailReason::TeardownTimeout);
 
+	// Failed is terminal: neither stop() nor arm() may be used to move out
+	// of it while rollback remains unsettled - only reset() (itself gated
+	// on settlement, proven below) may leave Failed.
+	assert(!actuator.stop());
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(!actuator.arm());
+	assert(actuator.state() == AutoDjState::Failed);
+
 	AutoDjSnapshot afterFail;
 	actuator.copySnapshot(afterFail);
 	assert(afterFail.queueDepth == 1); // left untouched - never popped/skipped.
@@ -806,6 +881,11 @@ void testTeardownTimeoutBecomesTerminalFailureNotRetry(){
 	assert(actuator.submitLoad(anyIdentity));
 	assert(actuator.reset());
 	assert(actuator.state() == AutoDjState::Off);
+
+	// Off is no longer terminal: re-arming now works normally.
+	port.physicalConfirmationPending = true;
+	assert(actuator.arm());
+	assert(actuator.state() == AutoDjState::Armed);
 }
 
 // -- Same regression, but the outer stop() request arrives before the
@@ -1012,13 +1092,14 @@ int main(){
 	testManualTakeoverPauses();
 	testManualTakeoverDuringTransitionCancelsCoach();
 	testManualTakeoverDuringRunningTransitionCancelsCoach();
-	testResetDuringTransitionCancelsCoach();
+	testResetDuringTransitionCancelsCoachThenWaitsForSettlement();
 	testLibraryGenerationInvalidation();
 	testLibraryGenerationInvalidationWhileStopping();
 	testMetadataRevisionInvalidation();
 	testMetadataRevisionInvalidationWhileStopping();
 	testCoachArmRejectionRetriesFromLoadThenResolves();
 	testCoachTransitionFailureFailsAttemptWithinBudget();
+	testRejectedResetDuringLoadInFlightHasNoSideEffects();
 	testTeardownTimeoutBecomesTerminalFailureNotRetry();
 	testTeardownTimeoutBecomesTerminalFailureWhileStopping();
 	testNoSafeWindowWithoutTrustworthyDuration();

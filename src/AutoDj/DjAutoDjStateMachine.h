@@ -72,8 +72,15 @@ public:
 		return true;
 	}
 
+	// Only Armed/Running/Paused may transition to Stopping (see the state
+	// graph above). Off/Stopping/Complete are correctly excluded by not
+	// being in that list, and so is Failed: Failed is a terminal state
+	// that must go through reset() (which itself requires
+	// Coach rollback/teardown to have settled) before Auto DJ can run
+	// again - stop() must never be usable to escape Failed back to Off
+	// without that settled-rollback guarantee.
 	bool stop(){
-		if(current == AutoDjState::Off || current == AutoDjState::Complete || current == AutoDjState::Stopping){
+		if(current != AutoDjState::Armed && current != AutoDjState::Running && current != AutoDjState::Paused){
 			return false;
 		}
 		current = AutoDjState::Stopping;

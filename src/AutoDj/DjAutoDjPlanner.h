@@ -102,9 +102,17 @@ public:
 		return machine.stop();
 	}
 
+	// Transactional: the state machine's own reset() only mutates state
+	// when current is Failed/Complete, but cancelPending() has no such
+	// gate of its own - if it ran first and the machine then rejected the
+	// reset, a legitimate reset() call elsewhere (e.g. from Running) would
+	// have silently discarded live pending-load bookkeeping for nothing.
+	// Check eligibility (via the machine) before mutating any planner
+	// state, so a rejected reset is guaranteed to be a no-op.
 	bool reset(){
+		if(!machine.reset()) return false;
 		cancelPending();
-		return machine.reset();
+		return true;
 	}
 
 	// One-shot runtime step. Safe to call on any fixed cadence (e.g. once

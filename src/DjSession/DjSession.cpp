@@ -197,7 +197,23 @@ DjSubmitResult DjSession::loadDeckByIdentity(
 	// command.path is left empty (DjCommand{} zero-initializes char[]) -
 	// the sole signal to validate()/applyLoad() that this is a stable-ID
 	// load to be resolved internally, never a caller-supplied path.
-	return submit(command);
+	const DjSubmitResult result = submit(command);
+	if(result.status == DJ_COMMAND_ACCEPTED){
+		// Fire-and-forget grid-anchor hydration request for this exact
+		// key, submitted at the same moment as the load itself (never
+		// blocking submit()/this call on it - see DjAssistGridCache's doc
+		// comment). The command queue's own multi-tick latency before
+		// DjSession::loop() actually pops and applies this LOAD_DECK
+		// command gives DjAssistController::stepGridHydration()'s ~20ms-
+		// cadence background worker a real window to resolve it before
+		// apply time; if it isn't ready yet, resolveIdentityLoad()'s
+		// lookup simply misses and the load proceeds with anchorCount ==
+		// 0, the same pre-existing "no usable grid" fallback. Requested
+		// only after a successful submit - a rejected/superseded command
+		// will never reach apply, so there is nothing to hydrate for.
+		assistController.requestGridHydration(identityLibraryGeneration, identityMetadataRevision, identity);
+	}
+	return result;
 }
 
 
@@ -739,14 +755,20 @@ bool DjSession::resolveIdentityLoad(
 	metadata.confidence = matchedEntry.confidence;
 	metadata.capabilities = matchedEntry.capabilities;
 
-	// Cached anchor copy: matchedEntry.gridAnchorCount is already the same
-	// all-or-nothing gated result buildGrid() would compute for a manual
-	// load of this exact track (see assistTrackEntry()'s doc comment), so a
-	// stable-ID load's DjBeatGrid can be installed directly from this POD
-	// array with zero further metadataReader calls.
-	outAnchorCount = matchedEntry.gridAnchorCount > DJ_GRID_ANCHOR_CAPACITY
-		? DJ_GRID_ANCHOR_CAPACITY : matchedEntry.gridAnchorCount;
-	for(uint16_t i = 0; i < outAnchorCount; ++i) outAnchors[i] = matchedEntry.gridAnchors[i];
+	// Grid anchors are no longer cached on the candidate entry itself (see
+	// DjAssistLibraryEntry's doc comment for the PSRAM-budget reason) - a
+	// RAM-only lookup into DjAssistController's small, few-slot
+	// DjAssistGridCache is the replacement. AutoDjSessionActuator::
+	// submitLoad() already requested hydration for this exact key when it
+	// submitted this command; if the background worker hasn't resolved it
+	// yet (or it was requested too late/evicted), the lookup simply misses
+	// and outAnchorCount stays 0 - the same "no usable grid" fallback
+	// buildGrid() already uses for a track with no usable grid data at
+	// all, so a miss here can never fail this load, only proceed without
+	// quantize/sync capability. Either way: zero metadataReader/SD calls.
+	assistController.gridAnchorsFor(
+		command.libraryGeneration, liveRevision, matchedEntry.identity, outAnchors, outAnchorCount
+	);
 	return true;
 }
 
@@ -997,17 +1019,12 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 		// so one bad track's grid/phrase data never blocks the rest of
 		// the library from filling - the other already-cached scalar
 		// fields above stay intact for Coach's own (non-grid) scoring.
-		// Same bounded stride DjSession::buildGrid() uses to subsample the
-		// ordered grid section down to DJ_GRID_ANCHOR_CAPACITY anchors -
-		// computed once here (off-thread) instead of at Auto-apply time, so
-		// a stable-ID load's DjBeatGrid can be built directly from this
-		// cached array (see gridAnchors' doc comment) with zero
-		// metadataReader calls on DjSession::loop()'s thread. A manual
-		// path-based load still calls buildGrid() unchanged and re-derives
-		// its own anchors from a fresh readGrid() burst, so this cache is
-		// purely additive.
-		const uint32_t gridStride = track.gridCount == 0 ? 1 :
-			(track.gridCount + DJ_GRID_ANCHOR_CAPACITY - 1) / DJ_GRID_ANCHOR_CAPACITY;
+		// confidence/downbeatCount only - this entry no longer caches a
+		// per-track anchor array (see DjAssistLibraryEntry's doc comment):
+		// the anchors themselves are hydrated on demand, only for the
+		// handful of identities Auto DJ is about to load, by
+		// assistTrackGridAnchors() below via DjAssistController's
+		// DjAssistGridCache, not precomputed here for the entire library.
 		bool gridPhraseOk = true;
 		for(uint32_t i = 0; i < track.gridCount && gridPhraseOk; ++i){
 			JaydMetadata::Grid grid;
@@ -1017,14 +1034,6 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 			}
 			if(grid.beatNumber == 1) ++outEntry.downbeatCount;
 			if(grid.confidence > outEntry.confidence) outEntry.confidence = grid.confidence;
-			if(grid.confidence >= DJ_GRID_MIN_CONFIDENCE &&
-			   outEntry.gridAnchorCount < DJ_GRID_ANCHOR_CAPACITY &&
-			   (i % gridStride) == 0){
-				DjGridAnchor& anchor = outEntry.gridAnchors[outEntry.gridAnchorCount];
-				anchor.frame = grid.positionFrames;
-				anchor.quarterBeat = int64_t(i) * DJ_BEAT_QUARTER_BEATS;
-				++outEntry.gridAnchorCount;
-			}
 		}
 		for(uint32_t i = 0; i < track.phraseCount && gridPhraseOk; ++i){
 			JaydMetadata::Phrase phrase;
@@ -1038,23 +1047,80 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 			outEntry.state = DJ_METADATA_CORRUPT;
 			outEntry.confidence = 0;
 			outEntry.downbeatCount = 0;
-			outEntry.gridAnchorCount = 0;
-		}else{
-			if(outEntry.downbeatCount) outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
-			// Mirror buildGrid()'s all-or-nothing gate exactly: an anchor
-			// cache computed under a capability/confidence combination that
-			// wouldn't have let a manual load build a grid either must never
-			// be handed to a stable-ID load as if it were usable.
-			if(!(outEntry.capabilities & DJ_METADATA_HAS_GRID) ||
-			   !(outEntry.capabilities & DJ_METADATA_HAS_SOURCE_FRAMES) ||
-			   !(outEntry.capabilities & DJ_METADATA_HAS_BPM) ||
-			   outEntry.confidence < DJ_GRID_MIN_CONFIDENCE){
-				outEntry.gridAnchorCount = 0;
-			}
+		}else if(outEntry.downbeatCount){
+			outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
 		}
 	}
 	metadataMutex.unlock();
 	return ok;
+}
+
+// On-demand replacement for the old per-entry gridAnchors[] cache (see
+// DjAssistLibraryEntry's doc comment and DjAssistGridCache): computes the
+// bounded, subsampled anchor array for exactly ONE already-indexed track,
+// only when DjAssistController::stepGridHydration() asks for it (i.e. only
+// for identities Auto DJ actually requested hydration for), never for the
+// whole library. Runs strictly off DjSession::loop()'s thread - same
+// background-worker-only contract as assistTrackEntry() - and mirrors
+// buildGrid()'s exact stride/confidence/all-or-nothing capability gate, so
+// a stable-ID load can never install an anchor set less trustworthy than
+// what a manual path-based load's buildGrid() would have produced for the
+// same track.
+bool DjSession::assistTrackGridAnchors(
+	uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+){
+	outAnchorCount = 0;
+	metadataMutex.lock();
+	if(!metadataInitialized || metadataReaderStatus != JaydMetadata::Status::Ready){
+		outRevision = metadataRevision;
+		metadataMutex.unlock();
+		return false;
+	}
+	outRevision = metadataRevision;
+	JaydMetadata::Track track;
+	const bool ok = metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
+	if(!ok){
+		metadataMutex.unlock();
+		return false;
+	}
+
+	uint16_t capabilities = 0;
+	if(track.sampleRate > 0 && track.durationFrames > 0) capabilities |= DJ_METADATA_HAS_SOURCE_FRAMES;
+	if(track.bpmMilli > 0) capabilities |= DJ_METADATA_HAS_BPM;
+	if(track.gridCount > 0) capabilities |= DJ_METADATA_HAS_GRID;
+
+	const uint32_t gridStride = track.gridCount == 0 ? 1 :
+		(track.gridCount + DJ_GRID_ANCHOR_CAPACITY - 1) / DJ_GRID_ANCHOR_CAPACITY;
+	uint16_t anchorCount = 0;
+	uint16_t confidence = 0;
+	bool gridOk = true;
+	for(uint32_t i = 0; i < track.gridCount && gridOk; ++i){
+		JaydMetadata::Grid grid;
+		if(!metadataReader.readGrid(track, i, grid)){
+			gridOk = false;
+			break;
+		}
+		if(grid.confidence > confidence) confidence = grid.confidence;
+		if(grid.confidence >= DJ_GRID_MIN_CONFIDENCE && anchorCount < DJ_GRID_ANCHOR_CAPACITY &&
+		   (i % gridStride) == 0){
+			outAnchors[anchorCount].frame = grid.positionFrames;
+			outAnchors[anchorCount].quarterBeat = int64_t(i) * DJ_BEAT_QUARTER_BEATS;
+			++anchorCount;
+		}
+	}
+	metadataMutex.unlock();
+
+	// Mirror buildGrid()'s all-or-nothing gate exactly: an anchor set
+	// computed under a capability/confidence combination that wouldn't
+	// have let a manual load build a grid either must never be handed to
+	// a stable-ID load as if it were usable.
+	if(!gridOk || !(capabilities & DJ_METADATA_HAS_GRID) || !(capabilities & DJ_METADATA_HAS_SOURCE_FRAMES) ||
+	   !(capabilities & DJ_METADATA_HAS_BPM) || confidence < DJ_GRID_MIN_CONFIDENCE || anchorCount == 0){
+		outAnchorCount = 0;
+		return false;
+	}
+	outAnchorCount = anchorCount;
+	return true;
 }
 
 bool DjSession::copyAssistSnapshot(DjAssistSnapshot& snapshot) const{
