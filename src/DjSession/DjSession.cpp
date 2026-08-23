@@ -7,6 +7,7 @@
 #include <Loop/LoopManager.h>
 #include <SD.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 // DjBeatEngine.h's DJ_RATE_* constants are plain values (kept dependency-free
 // for host testing) but must exactly mirror SpeedModifier's Q16.16 rate
@@ -629,10 +630,12 @@ bool DjSession::resolveIdentityLoad(
 	const DjCommand& command,
 	char* outPath, size_t outCapacity,
 	JaydMetadata::Track& track,
-	DjTrackMetadataSnapshot& metadata
+	DjTrackMetadataSnapshot& metadata,
+	DjGridAnchor* outAnchors, uint16_t& outAnchorCount
 ){
 	track = {};
 	metadata = {};
+	outAnchorCount = 0;
 	if(outCapacity == 0) return false;
 	outPath[0] = '\0';
 	if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
@@ -735,6 +738,15 @@ bool DjSession::resolveIdentityLoad(
 	metadata.downbeatCount = uint16_t(matchedEntry.downbeatCount);
 	metadata.confidence = matchedEntry.confidence;
 	metadata.capabilities = matchedEntry.capabilities;
+
+	// Cached anchor copy: matchedEntry.gridAnchorCount is already the same
+	// all-or-nothing gated result buildGrid() would compute for a manual
+	// load of this exact track (see assistTrackEntry()'s doc comment), so a
+	// stable-ID load's DjBeatGrid can be installed directly from this POD
+	// array with zero further metadataReader calls.
+	outAnchorCount = matchedEntry.gridAnchorCount > DJ_GRID_ANCHOR_CAPACITY
+		? DJ_GRID_ANCHOR_CAPACITY : matchedEntry.gridAnchorCount;
+	for(uint16_t i = 0; i < outAnchorCount; ++i) outAnchors[i] = matchedEntry.gridAnchors[i];
 	return true;
 }
 
@@ -985,6 +997,17 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 		// so one bad track's grid/phrase data never blocks the rest of
 		// the library from filling - the other already-cached scalar
 		// fields above stay intact for Coach's own (non-grid) scoring.
+		// Same bounded stride DjSession::buildGrid() uses to subsample the
+		// ordered grid section down to DJ_GRID_ANCHOR_CAPACITY anchors -
+		// computed once here (off-thread) instead of at Auto-apply time, so
+		// a stable-ID load's DjBeatGrid can be built directly from this
+		// cached array (see gridAnchors' doc comment) with zero
+		// metadataReader calls on DjSession::loop()'s thread. A manual
+		// path-based load still calls buildGrid() unchanged and re-derives
+		// its own anchors from a fresh readGrid() burst, so this cache is
+		// purely additive.
+		const uint32_t gridStride = track.gridCount == 0 ? 1 :
+			(track.gridCount + DJ_GRID_ANCHOR_CAPACITY - 1) / DJ_GRID_ANCHOR_CAPACITY;
 		bool gridPhraseOk = true;
 		for(uint32_t i = 0; i < track.gridCount && gridPhraseOk; ++i){
 			JaydMetadata::Grid grid;
@@ -994,6 +1017,14 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 			}
 			if(grid.beatNumber == 1) ++outEntry.downbeatCount;
 			if(grid.confidence > outEntry.confidence) outEntry.confidence = grid.confidence;
+			if(grid.confidence >= DJ_GRID_MIN_CONFIDENCE &&
+			   outEntry.gridAnchorCount < DJ_GRID_ANCHOR_CAPACITY &&
+			   (i % gridStride) == 0){
+				DjGridAnchor& anchor = outEntry.gridAnchors[outEntry.gridAnchorCount];
+				anchor.frame = grid.positionFrames;
+				anchor.quarterBeat = int64_t(i) * DJ_BEAT_QUARTER_BEATS;
+				++outEntry.gridAnchorCount;
+			}
 		}
 		for(uint32_t i = 0; i < track.phraseCount && gridPhraseOk; ++i){
 			JaydMetadata::Phrase phrase;
@@ -1007,8 +1038,19 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 			outEntry.state = DJ_METADATA_CORRUPT;
 			outEntry.confidence = 0;
 			outEntry.downbeatCount = 0;
-		}else if(outEntry.downbeatCount){
-			outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
+			outEntry.gridAnchorCount = 0;
+		}else{
+			if(outEntry.downbeatCount) outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
+			// Mirror buildGrid()'s all-or-nothing gate exactly: an anchor
+			// cache computed under a capability/confidence combination that
+			// wouldn't have let a manual load build a grid either must never
+			// be handed to a stable-ID load as if it were usable.
+			if(!(outEntry.capabilities & DJ_METADATA_HAS_GRID) ||
+			   !(outEntry.capabilities & DJ_METADATA_HAS_SOURCE_FRAMES) ||
+			   !(outEntry.capabilities & DJ_METADATA_HAS_BPM) ||
+			   outEntry.confidence < DJ_GRID_MIN_CONFIDENCE){
+				outEntry.gridAnchorCount = 0;
+			}
 		}
 	}
 	metadataMutex.unlock();
@@ -1228,7 +1270,16 @@ bool DjSession::autoDjCoachTransitionSettled(){
 }
 
 uint64_t DjSession::autoDjNowMicros() const{
-	return uint64_t(micros());
+	// esp_timer_get_time() is ESP-IDF's true 64-bit microsecond-since-boot
+	// monotonic clock - unlike a bare Arduino micros() (32-bit, wraps every
+	// ~71.6 minutes) widened to 64 bits after the fact, which loses
+	// monotonicity across each wrap since the widen can't recover how many
+	// times the underlying 32-bit counter already rolled over. Auto DJ's
+	// wall-clock deadlines (DjAutoDjPlanner's composite-attempt budget,
+	// AutoDjSessionActuator's Teardown budget) both rely on this being
+	// genuinely monotonic for the lifetime of the session, not just within
+	// a single ~71-minute window.
+	return uint64_t(esp_timer_get_time());
 }
 
 // -- Auto DJ thin public wrappers (physical bank / browser API v2) --
@@ -1712,8 +1763,11 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	const char* loadPath = command.path;
 	JaydMetadata::Track candidateTrack{};
 	DjTrackMetadataSnapshot candidateMetadata{};
+	DjGridAnchor candidateAnchors[DJ_GRID_ANCHOR_CAPACITY];
+	uint16_t candidateAnchorCount = 0;
 	if(identityLoad){
-		if(!resolveIdentityLoad(command, resolvedPath, sizeof(resolvedPath), candidateTrack, candidateMetadata)){
+		if(!resolveIdentityLoad(command, resolvedPath, sizeof(resolvedPath), candidateTrack, candidateMetadata,
+								 candidateAnchors, candidateAnchorCount)){
 			error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
 			return false;
 		}
@@ -1791,9 +1845,16 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	// Successful hot-load: old loop bounds/anchors belonged to the previous
 	// track and are meaningless now, so always clear and rebuild from
 	// scratch. A failed load (handled above, before this point) leaves both
-	// untouched.
+	// untouched. Identity (Auto DJ) loads install the anchor cache
+	// resolveIdentityLoad() already resolved from RAM above - zero
+	// metadataReader.readGrid() calls here. Manual path-based loads still
+	// call buildGrid(), which is allowed to hit SD for an explicit load.
 	loopEngines[command.deck].disengage();
-	buildGrid(command.deck);
+	if(identityLoad){
+		installCachedGrid(command.deck, candidateAnchors, candidateAnchorCount, candidateMetadata);
+	}else{
+		buildGrid(command.deck);
+	}
 	cues.clearDeck(command.deck);
 
 	system->setVolume(command.deck, gains[command.deck]);
@@ -1866,6 +1927,21 @@ bool DjSession::buildGrid(uint8_t deck){
 	metadataMutex.unlock();
 
 	if(anchorCount == 0) return false;
+	return grids[deck].build(metadata.sourceSampleRate, metadata.bpmMilli,
+							  metadata.sourceDurationFrames, anchors, anchorCount);
+}
+
+// Stable-ID load counterpart to buildGrid(): installs a DjBeatGrid directly
+// from an anchor cache the caller already resolved entirely from RAM (see
+// resolveIdentityLoad()/DjAssistLibraryEntry::gridAnchors) - zero
+// metadataReader/SD calls here or in the caller. anchorCount == 0 (no usable
+// grid, same gate buildGrid() applies) leaves grids[deck] reset/invalid,
+// exactly like buildGrid() returning false.
+bool DjSession::installCachedGrid(uint8_t deck, const DjGridAnchor* anchors, uint16_t anchorCount,
+								   const DjTrackMetadataSnapshot& metadata){
+	if(deck >= DJ_DECK_COUNT) return false;
+	grids[deck].reset();
+	if(anchorCount == 0 || anchors == nullptr) return false;
 	return grids[deck].build(metadata.sourceSampleRate, metadata.bpmMilli,
 							  metadata.sourceDurationFrames, anchors, anchorCount);
 }

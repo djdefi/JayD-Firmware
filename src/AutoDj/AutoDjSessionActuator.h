@@ -148,6 +148,15 @@ public:
 	}
 
 	bool submitLoad(const AutoDjIdentity& identity) override{
+		// Hard, unconditional reject while Coach's own rollback (mix/sync/
+		// stop-deck restore after a failed/cancelled transition) is still
+		// unsettled - independent of loadSubPhase, so this guard holds even
+		// if a future caller reaches submitLoad() through a path other than
+		// the planner's own Teardown/Settling handling (see
+		// AutoDjLoadOutcome::Settling/FailedTerminal doc comments). A fresh
+		// load must never be able to race an in-flight rollback's own
+		// commands against the same deck.
+		if(!sessionPort.autoDjCoachTransitionSettled()) return false;
 		DjTrackIdentity trackIdentity;
 		trackIdentity.flags = identity.flags & (DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE);
 		memcpy(trackIdentity.fingerprint, identity.fingerprint, sizeof(trackIdentity.fingerprint));
@@ -326,6 +335,7 @@ private:
 				return AutoDjLoadOutcome::Applied;
 			default: // DJ_ASSIST_MODE_OFF / DJ_ASSIST_MODE_COACH / DJ_ASSIST_MODE_TRANSITION_FAILED
 				loadSubPhase = AutoDjLoadSubPhase::Teardown;
+				teardownDeadlineUs = nowMicros() + AUTO_DJ_TEARDOWN_TIMEOUT_US;
 				return pollTeardownPhase();
 		}
 	}
@@ -333,20 +343,34 @@ private:
 	// Coach reported the transition as no longer running (failed, guard
 	// cancel, media/recording conflict, etc.) and is now unwinding its own
 	// rollback (mix -> sync -> stop-deck restore - see
-	// DjAssistController::tickRollback()). This must keep reporting Pending
-	// - never Failed - until AutoDjSessionPort::autoDjCoachTransitionSettled()
-	// confirms rollback has actually finished. Resolving Failed early would
-	// let the planner treat this attempt as terminally done and retry (a
-	// fresh Coach arm) while the OLD rollback's own commands are still in
-	// flight; DjAssistController::armTransition() rejects such a re-arm as
-	// well (see its own doc comment), so at worst this would stall a retry
-	// rather than corrupt state - but waiting here is what lets that retry
-	// actually succeed as soon as rollback settles, instead of bouncing
-	// off the controller's rejection every attempt.
+	// DjAssistController::tickRollback()). This must keep reporting
+	// Settling - never Pending, and never Failed - until
+	// AutoDjSessionPort::autoDjCoachTransitionSettled() confirms rollback
+	// has actually finished. Settling (rather than Pending) is deliberate:
+	// it tells the planner not to apply the outer composite-attempt
+	// deadline here (see AutoDjLoadOutcome::Settling's doc comment), since
+	// that deadline may already be nearly or fully consumed by the
+	// transition that just failed. Instead this phase owns its own bounded
+	// teardownDeadlineUs (set when entering Teardown, above): if rollback
+	// still has not settled by then, this resolves to the terminal
+	// FailedTerminal outcome rather than ever letting a retry submit a
+	// fresh load while the old rollback's commands may still be in flight.
 	AutoDjLoadOutcome pollTeardownPhase(){
-		if(!sessionPort.autoDjCoachTransitionSettled()) return AutoDjLoadOutcome::Pending;
-		loadSubPhase = AutoDjLoadSubPhase::Idle;
-		return AutoDjLoadOutcome::Failed;
+		if(sessionPort.autoDjCoachTransitionSettled()){
+			loadSubPhase = AutoDjLoadSubPhase::Idle;
+			return AutoDjLoadOutcome::Failed;
+		}
+		if(djAutoDjDeadlinePassed(nowMicros(), teardownDeadlineUs)){
+			// Deliberately stays in Teardown (not reset to Idle): the
+			// rollback may genuinely still be in flight on real hardware
+			// even though this bounded wait gave up on it, and
+			// submitLoad()'s own autoDjCoachTransitionSettled() guard above
+			// keeps rejecting any future load attempt regardless of
+			// loadSubPhase until it actually settles - reset() is the only
+			// sanctioned way back to Idle from here (see its doc comment).
+			return AutoDjLoadOutcome::FailedTerminal;
+		}
+		return AutoDjLoadOutcome::Settling;
 	}
 
 	// The deck currently playing is "active" (the one about to run out);
@@ -531,6 +555,11 @@ private:
 	uint32_t trackedCommandId = 0; // single tracked slot, reused sequentially for load then arm.
 	uint8_t inFlightToDeck = 0;
 	DjTrackIdentity inFlightIdentity = {};
+	// Valid only while loadSubPhase == Teardown - see pollTeardownPhase()'s
+	// doc comment for why this is a separate, independently-bounded
+	// deadline rather than reusing the planner's own composite-attempt
+	// budget.
+	uint64_t teardownDeadlineUs = 0;
 
 	bool scanInProgress = false;
 	uint32_t scanCursor = 0;

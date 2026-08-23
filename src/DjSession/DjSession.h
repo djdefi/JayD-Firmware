@@ -363,8 +363,11 @@ private:
 		const DjCommand& command,
 		char* outPath, size_t outCapacity,
 		JaydMetadata::Track& track,
-		DjTrackMetadataSnapshot& metadata
+		DjTrackMetadataSnapshot& metadata,
+		DjGridAnchor* outAnchors, uint16_t& outAnchorCount
 	);
+	bool installCachedGrid(uint8_t deck, const DjGridAnchor* anchors, uint16_t anchorCount,
+							const DjTrackMetadataSnapshot& metadata);
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;

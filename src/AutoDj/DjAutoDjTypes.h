@@ -33,9 +33,36 @@ static constexpr uint8_t AUTO_DJ_RETRY_BUDGET = 2; // retries allowed after the 
 // slow-tempo (e.g. 70 BPM) worst-case phrase-boundary wait (~32 beats,
 // ~27s) plus a 32-beat crossfade (~27s) plus load I/O.
 static constexpr uint64_t AUTO_DJ_LOAD_TIMEOUT_US = 150000000ULL; // 150s
+// Bounded budget for the Teardown sub-phase specifically (waiting for
+// Coach's own rollback - mix/sync/stop-deck restore - to actually settle
+// after a failed/cancelled transition; see AutoDjSessionActuator's
+// AutoDjLoadSubPhase::Teardown and AutoDjLoadOutcome::Settling doc
+// comments). Deliberately separate from, and much shorter than,
+// AUTO_DJ_LOAD_TIMEOUT_US: that outer budget covers an entire composite
+// load->arm->transition attempt and may already be mostly consumed by the
+// time a transition fails and rollback begins, so it cannot be relied on to
+// bound this specific wait - a Teardown that outlives ITS OWN deadline must
+// resolve deterministically (AutoDjLoadOutcome::FailedTerminal) regardless
+// of how much of the outer budget happens to remain. Coach's own rollback
+// is at most 3 short commands (mix/sync/stop-deck), so a generous few
+// seconds is more than sufficient without masking a genuinely stuck
+// rollback for long.
+static constexpr uint64_t AUTO_DJ_TEARDOWN_TIMEOUT_US = 10000000ULL; // 10s
 static constexpr uint8_t AUTO_DJ_DEFAULT_RECENT_EXCLUSION = 8;
 static constexpr uint8_t AUTO_DJ_DEFAULT_ARTIST_EXCLUSION = 4;
 static constexpr uint8_t AUTO_DJ_DEFAULT_TITLE_EXCLUSION = 6;
+
+// Wraparound-safe "has the deadline passed" check, shared by every
+// wall-clock deadline in this layer (DjAutoDjPlanner's composite-attempt
+// budget, AutoDjSessionActuator's Teardown budget): computing the
+// difference as an unsigned 64-bit subtraction and comparing it against
+// half the value range tolerates a nowMicros() implementation that wraps
+// (e.g. widening a real 32-bit micros() read), so every caller gets
+// identical, single-source-of-truth wraparound handling rather than each
+// reimplementing (and potentially disagreeing on) the same check.
+static inline bool djAutoDjDeadlinePassed(uint64_t now, uint64_t deadline){
+	return (now - deadline) < (UINT64_C(1) << 63);
+}
 
 enum AutoDjIdentityFlag : uint8_t {
 	AUTO_DJ_IDENTITY_FINGERPRINT = 1 << 0,
@@ -131,7 +158,15 @@ enum class AutoDjFailReason : uint8_t {
 	None,
 	CapabilityDisabled,
 	RetryBudgetExhausted,
-	RecordingFailure
+	RecordingFailure,
+	// Coach's rollback (mix/sync/stop-deck restore) after a failed/cancelled
+	// transition did not settle within AUTO_DJ_TEARDOWN_TIMEOUT_US. Terminal
+	// and deliberately not retried/skipped through: an unsettled rollback
+	// may still have commands in flight against the deck this attempt
+	// targeted, so submitting a fresh load could race them. Requires an
+	// explicit reset() (and, in practice, human verification of real deck
+	// state) before Auto DJ can arm again.
+	TeardownTimeout
 };
 
 #endif //JAYD_FIRMWARE_DJ_AUTO_DJ_TYPES_H

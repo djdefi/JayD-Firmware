@@ -185,14 +185,12 @@ private:
 		pendingAttempts++;
 	}
 
-	// Wraparound-safe "has the deadline passed" check: computing the
-	// difference as an unsigned 64-bit subtraction and comparing it against
-	// half the value range tolerates a nowMicros() implementation that
-	// wraps (e.g. widening a real 32-bit micros() read), matching the
-	// existing tolerance DjAssistController's own micros()-based ramp
-	// timing already relies on elsewhere in this codebase.
+	// Wraparound-safe "has the deadline passed" check - shared with
+	// AutoDjSessionActuator's own Teardown-phase deadline via
+	// djAutoDjDeadlinePassed() (DjAutoDjTypes.h) so both use identical
+	// wraparound handling.
 	static bool deadlinePassed(uint64_t now, uint64_t deadline){
-		return (now - deadline) < (UINT64_C(1) << 63);
+		return djAutoDjDeadlinePassed(now, deadline);
 	}
 
 	void progressPending(){
@@ -207,6 +205,30 @@ private:
 			pendingPhase = AutoDjPendingPhase::None;
 			pendingAttempts = 0;
 			pendingDeadlineUs = 0;
+			return;
+		}
+
+		// Settling: the port is waiting for Coach's own rollback to settle
+		// after a failed/cancelled transition and owns its own bounded
+		// deadline for that wait (see AutoDjLoadOutcome::Settling's doc
+		// comment) - this composite attempt's outer pendingDeadlineUs must
+		// NOT be applied here (it may already be exhausted by the
+		// transition that just failed), so this is deliberately a pure
+		// no-op poll: neither a retry nor a terminal decision until the
+		// port itself resolves to Applied/Failed/FailedTerminal.
+		if(outcome == AutoDjLoadOutcome::Settling) return;
+
+		if(outcome == AutoDjLoadOutcome::FailedTerminal){
+			// Unsafe to retry or skip - see AutoDjFailReason::TeardownTimeout.
+			// Deliberately does NOT call removeResolvedEntry()/touch the
+			// queue: an unsettled rollback may still reference the deck
+			// this attempt targeted, so the queue/pendingEntry are left
+			// exactly as they were rather than risk a fresh submitLoad()
+			// racing it. machine.fail() is terminal until an explicit
+			// reset(), which also clears pendingEntry (see reset()).
+			pendingPhase = AutoDjPendingPhase::None;
+			pendingDeadlineUs = 0;
+			machine.fail(AutoDjFailReason::TeardownTimeout);
 			return;
 		}
 
@@ -232,13 +254,24 @@ private:
 
 	// While Stopping, an in-flight load is allowed to resolve exactly once
 	// more (or time out) but is never retried - we're shutting down, not
-	// continuing the session.
+	// continuing the session. A Settling outcome still defers entirely to
+	// the port's own Teardown deadline (see progressPending()); a
+	// FailedTerminal outcome still escalates to the terminal Failed state
+	// rather than silently finishing the stop, since an unsettled rollback
+	// must not be treated as "safely stopped".
 	void resolvePendingWhileStopping(){
 		const AutoDjLoadOutcome outcome = port.pollLoad();
 		if(outcome == AutoDjLoadOutcome::Pending || outcome == AutoDjLoadOutcome::Accepted){
 			if(!deadlinePassed(port.nowMicros(), pendingDeadlineUs)) return;
 		} else if(outcome == AutoDjLoadOutcome::Applied){
 			removeResolvedEntry(true /* recordHistory */);
+		} else if(outcome == AutoDjLoadOutcome::Settling){
+			return;
+		} else if(outcome == AutoDjLoadOutcome::FailedTerminal){
+			pendingPhase = AutoDjPendingPhase::None;
+			pendingDeadlineUs = 0;
+			machine.fail(AutoDjFailReason::TeardownTimeout);
+			return;
 		}
 		cancelPending();
 	}

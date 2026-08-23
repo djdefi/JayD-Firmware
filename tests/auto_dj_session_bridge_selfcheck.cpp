@@ -722,6 +722,133 @@ void testCoachTransitionFailureFailsAttemptWithinBudget(){
 	assert(after.historySize == 1);
 }
 
+// -- Round-3 review fix #2: if Coach's own rollback (mix/sync/stop-deck
+// restore) does not settle within the actuator's OWN bounded
+// AUTO_DJ_TEARDOWN_TIMEOUT_US - independent of, and much shorter than, the
+// planner's outer AUTO_DJ_LOAD_TIMEOUT_US composite-attempt budget, which
+// may already be nearly exhausted by the transition that just failed -
+// this must resolve to the terminal FailedTerminal outcome (planner ->
+// AutoDjState::Failed / AutoDjFailReason::TeardownTimeout) and NEVER
+// retry/skip a fresh load while the old rollback's own commands may still
+// be in flight against the deck this attempt targeted. Also proves
+// submitLoad() independently hard-rejects while unsettled, regardless of
+// loadSubPhase/planner bookkeeping (defense in depth). --
+void testTeardownTimeoutBecomesTerminalFailureNotRetry(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xEF);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits the load.
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits the Coach arm.
+	assert(port.lastArmCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED; // arm applies.
+	actuator.tick(); // arm APPLIED -> TransitionInFlight.
+
+	// Coach's transition fails AND its own rollback gets stuck (never
+	// settles - e.g. a wedged mix/sync/stop-deck command on real hardware).
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_FAILED;
+	port.coachTransitionSettled = false;
+	actuator.tick(); // enters Teardown and records its own bounded deadline.
+	assert(actuator.state() == AutoDjState::Running); // not yet resolved either way.
+
+	port.lastLoadCalled = false;
+
+	// Advance the fake wall clock past the actuator's own teardown
+	// deadline while rollback is still unsettled.
+	port.fakeNowUs += AUTO_DJ_TEARDOWN_TIMEOUT_US + 1;
+
+	// Bounded: a fixed number of ticks must resolve to the terminal Failed
+	// state, and a fresh LOAD_DECK must never be resubmitted at any point.
+	for(int i = 0; i < 4 && actuator.state() == AutoDjState::Running; i++){
+		actuator.tick();
+		assert(!port.lastLoadCalled);
+	}
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(actuator.failReason() == AutoDjFailReason::TeardownTimeout);
+
+	AutoDjSnapshot afterFail;
+	actuator.copySnapshot(afterFail);
+	assert(afterFail.queueDepth == 1); // left untouched - never popped/skipped.
+	assert(afterFail.historySize == 0); // never recorded as resolved.
+
+	// A handful more idle ticks: Failed is terminal, must not spin/retry.
+	for(int i = 0; i < 4; i++){
+		actuator.tick();
+		assert(!port.lastLoadCalled);
+		assert(actuator.state() == AutoDjState::Failed);
+	}
+
+	// Direct hard-reject proof, bypassing the planner entirely: submitLoad()
+	// itself refuses while rollback remains unsettled, regardless of
+	// loadSubPhase/state bookkeeping.
+	AutoDjIdentity anyIdentity;
+	anyIdentity.flags = AUTO_DJ_IDENTITY_FINGERPRINT;
+	memset(anyIdentity.fingerprint, 0xEF, sizeof(anyIdentity.fingerprint));
+	assert(!actuator.submitLoad(anyIdentity));
+	assert(!port.lastLoadCalled);
+
+	// Once rollback genuinely settles, the hard-reject lifts (it only
+	// blocks while genuinely unsettled, never permanently) - reset() is
+	// still required to leave the terminal Failed state itself.
+	port.coachTransitionSettled = true;
+	assert(actuator.submitLoad(anyIdentity));
+	assert(actuator.reset());
+	assert(actuator.state() == AutoDjState::Off);
+}
+
+// -- Same regression, but the outer stop() request arrives before the
+// stuck rollback resolves: resolvePendingWhileStopping() must escalate to
+// the same terminal Failed state (never silently finish "stopping" over an
+// unsettled rollback, which would misreport an unsafe state as safely
+// idle). --
+void testTeardownTimeoutBecomesTerminalFailureWhileStopping(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xF1);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits the load.
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits the Coach arm.
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // arm APPLIED -> TransitionInFlight.
+
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_FAILED;
+	port.coachTransitionSettled = false;
+	actuator.tick(); // enters Teardown.
+
+	assert(actuator.stop());
+	assert(actuator.state() == AutoDjState::Stopping);
+
+	port.lastLoadCalled = false;
+	port.fakeNowUs += AUTO_DJ_TEARDOWN_TIMEOUT_US + 1;
+	for(int i = 0; i < 4 && actuator.state() == AutoDjState::Stopping; i++){
+		actuator.tick();
+		assert(!port.lastLoadCalled);
+	}
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(actuator.failReason() == AutoDjFailReason::TeardownTimeout);
+}
+
 // -- Test 5: currentTrackAtEnd()/currentDurationTrustworthy() are false
 // (never guessed) when no deck is playing or timing is unavailable. --
 void testNoSafeWindowWithoutTrustworthyDuration(){
@@ -892,6 +1019,8 @@ int main(){
 	testMetadataRevisionInvalidationWhileStopping();
 	testCoachArmRejectionRetriesFromLoadThenResolves();
 	testCoachTransitionFailureFailsAttemptWithinBudget();
+	testTeardownTimeoutBecomesTerminalFailureNotRetry();
+	testTeardownTimeoutBecomesTerminalFailureWhileStopping();
 	testNoSafeWindowWithoutTrustworthyDuration();
 	testRecordingFailureFailsRun();
 	testPinTrackTranslatesIdentity();

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../DjSession/DjSessionState.h"
+#include "../DjSession/DjBeatEngine.h" // DjGridAnchor/DJ_GRID_ANCHOR_CAPACITY: also Arduino-free.
 
 // Coach/suggestions/one-shot-transition layer. Deliberately hardware/Arduino
 // free (mirrors DjSessionState.h) so it stays host-testable and decoupled
@@ -125,6 +126,18 @@ struct DjAssistLibraryEntry {
 	uint32_t provenanceHash = 0;
 	uint16_t confidence = 0;
 	uint32_t downbeatCount = 0;
+	// Bounded, pre-subsampled beat-grid anchor cache: the exact same
+	// stride/confidence-filtered subsampling DjSession::buildGrid() applies
+	// to a manual path-based load, computed once here (off-thread, in
+	// DjSession::assistTrackEntry()) instead of at Auto-apply time. This is
+	// what lets a stable-ID load install its DjBeatGrid via
+	// DjBeatGrid::build(gridAnchors, gridAnchorCount) directly - zero
+	// metadataReader.readGrid() calls on DjSession::loop()'s thread. Fixed
+	// POD array, no heap. gridAnchorCount == 0 means "no usable grid" (same
+	// as buildGrid() returning false) and is always safe to pass through:
+	// DjBeatGrid::build() itself rejects an empty anchor set.
+	DjGridAnchor gridAnchors[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t gridAnchorCount = 0;
 };
 
 // Compact, bounded, POD suggestion - safe to copy into a snapshot/API/browser

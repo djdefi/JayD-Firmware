@@ -7,7 +7,27 @@ enum class AutoDjLoadOutcome : uint8_t {
 	Pending,  // submitted, no result yet
 	Accepted, // acknowledged but not yet applied
 	Applied,  // the deck is now playing this identity
-	Failed    // rejected or the load attempt errored out
+	// Waiting on Coach's own rollback to settle after a failed/cancelled
+	// transition (see AutoDjSessionActuator::AutoDjLoadSubPhase::Teardown).
+	// Deliberately distinct from Pending: the composite attempt's outer
+	// deadline (AUTO_DJ_LOAD_TIMEOUT_US, tracked by DjAutoDjPlanner) does
+	// NOT apply once this settling wait has begun, because it may already
+	// be mostly consumed by the transition that just failed. The actuator
+	// owns its own bounded AUTO_DJ_TEARDOWN_TIMEOUT_US deadline for this
+	// phase instead and resolves to FailedTerminal if it elapses.
+	Settling,
+	// Rejected or the load attempt errored out, but is still safe to
+	// retry/skip through the planner's ordinary bounded-retry policy (e.g.
+	// Coach's transition genuinely failed and its rollback already
+	// finished cleanly before this was reported).
+	Failed,
+	// A load attempt is unsafe to retry, skip, or otherwise resolve
+	// automatically - see AutoDjFailReason::TeardownTimeout. The planner
+	// must transition straight to the terminal Failed state (never
+	// touching the queue/pendingEntry, which are left exactly as they were
+	// so nothing else races whatever the unsettled rollback may still be
+	// doing) and require an explicit reset() before arming again.
+	FailedTerminal
 };
 
 // Seam between the planner and the rest of the firmware. Until the final
