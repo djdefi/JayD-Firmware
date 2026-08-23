@@ -17,9 +17,18 @@ public:
 	virtual ~DjAssistSessionPort() {}
 
 	// Actuator surface (DjAssistSessionActuator, DjAssistController.cpp).
-	virtual DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) = 0;
-	virtual DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) = 0;
-	virtual DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) = 0;
+	// autoDjOwned tags the resulting DjCommand exactly like Auto DJ's own
+	// load/arm commands are tagged - see DjCommand::autoDjOwned and
+	// DjAssistTransitionStep::autoDjOwned for why: only a command tagged
+	// this way is found by a manual takeover's removeAutoDjOwned() purge,
+	// and Coach's own internal commands must be purgeable too whenever the
+	// transition driving them was armed BY Auto DJ (never for a direct
+	// user Coach gesture, where this stays false).
+	virtual DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false) = 0;
+	virtual DjSubmitResult setSync(
+		uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false
+	) = 0;
+	virtual DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false) = 0;
 	virtual void assistTrackCommand(uint32_t commandId) = 0;
 	virtual DjCommandStatus assistTrackedStatus(uint32_t commandId) = 0;
 	virtual bool copySnapshot(DjSnapshot& snapshot) = 0;
@@ -39,6 +48,26 @@ public:
 	virtual uint32_t assistMetadataRevision() = 0;
 	virtual uint32_t assistTrackCount() = 0;
 	virtual bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) = 0;
+
+	// On-demand beat-grid-anchor hydration (DjAssistController::
+	// stepGridHydration(), called strictly off DjSession::loop()'s thread -
+	// see DjAssistGridCache's doc comment). Mirrors assistTrackEntry()'s
+	// own locking/trackByIndex()/readGrid() pattern, but computes ONLY the
+	// bounded, subsampled anchor array for ONE specific already-indexed
+	// track, on request, instead of for every one of
+	// DJ_ASSIST_MAX_INDEX_ENTRIES tracks unconditionally - this is the
+	// review-flagged PSRAM-budget fix: caching gridAnchors[] on every
+	// candidate-table entry cost ~3.9MiB of a 4MiB PSRAM part.
+	// outRevision reports the exact metadataRevision this read was
+	// performed under (same discipline as assistTrackEntry()'s
+	// outRevision), so the caller can reject a result computed under a
+	// now-stale revision instead of trusting it blindly. Returns false
+	// (outAnchorCount left at 0) for a missing/unreadable index or when
+	// the same all-or-nothing capability/confidence gate buildGrid() uses
+	// would also reject this track - never a partial anchor set.
+	virtual bool assistTrackGridAnchors(
+		uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+	) = 0;
 
 	// Boundary/guard inputs (DjAssistController::buildGuard()/resolveBoundary()).
 	virtual bool mediaPresent() const = 0;

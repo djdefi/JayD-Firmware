@@ -1,0 +1,90 @@
+#ifndef JAYD_FIRMWARE_DJ_AUTO_DJ_LOAD_PORT_H
+#define JAYD_FIRMWARE_DJ_AUTO_DJ_LOAD_PORT_H
+
+#include "DjAutoDjTypes.h"
+
+enum class AutoDjLoadOutcome : uint8_t {
+	Pending,  // submitted, no result yet
+	Accepted, // acknowledged but not yet applied
+	Applied,  // the deck is now playing this identity
+	// Waiting on Coach's own rollback to settle after a failed/cancelled
+	// transition (see AutoDjSessionActuator::AutoDjLoadSubPhase::Teardown).
+	// Deliberately distinct from Pending: the composite attempt's outer
+	// deadline (AUTO_DJ_LOAD_TIMEOUT_US, tracked by DjAutoDjPlanner) does
+	// NOT apply once this settling wait has begun, because it may already
+	// be mostly consumed by the transition that just failed. The actuator
+	// owns its own bounded AUTO_DJ_TEARDOWN_TIMEOUT_US deadline for this
+	// phase instead and resolves to FailedTerminal if it elapses.
+	Settling,
+	// Rejected or the load attempt errored out, but is still safe to
+	// retry/skip through the planner's ordinary bounded-retry policy (e.g.
+	// Coach's transition genuinely failed and its rollback already
+	// finished cleanly before this was reported).
+	Failed,
+	// A load attempt is unsafe to retry, skip, or otherwise resolve
+	// automatically - see AutoDjFailReason::TeardownTimeout. The planner
+	// must transition straight to the terminal Failed state (never
+	// touching the queue/pendingEntry, which are left exactly as they were
+	// so nothing else races whatever the unsettled rollback may still be
+	// doing) and require an explicit reset() before arming again.
+	FailedTerminal
+};
+
+// Seam between the planner and the rest of the firmware. Until the final
+// Coach/DjSession/browser-control interfaces are rebased in, this is
+// implemented only by a test double; production wiring plugs in an adapter
+// over the authoritative DjSession command queue + physical/browser control
+// state once that lands. Runtime playback control must only ever happen
+// through this one-shot submit/poll pair and a stable-ID `AutoDjIdentity` -
+// never a raw path.
+class AutoDjLoadPort {
+public:
+	virtual ~AutoDjLoadPort() = default;
+
+	// Checked once at arm() time. If the firmware build has no stable-ID
+	// load endpoint at all, Auto DJ must never be armable.
+	virtual bool hasStableIdEndpoint() const = 0;
+
+	// Non-blocking. At most one load may be in flight; the planner never
+	// calls this again before the previous one resolves via pollLoad().
+	virtual bool submitLoad(const AutoDjIdentity& identity) = 0;
+
+	virtual AutoDjLoadOutcome pollLoad() = 0;
+
+	// True while the user is actively driving transport, crossfader, rate,
+	// load, cue, or loop controls directly - Auto DJ must yield immediately
+	// and deterministically rather than fight the user for control.
+	virtual bool manualTakeoverActive() const = 0;
+
+	// True only when the remaining time on the current deck is known with
+	// confidence (e.g. real decoded duration + timing source available).
+	// The planner is not allowed to guess a crossfade point otherwise.
+	virtual bool currentDurationTrustworthy() const = 0;
+
+	virtual bool currentTrackAtEnd() const = 0;
+
+	// True if recording is active and has failed. Auto DJ never starts or
+	// stops a recording itself; a failure here only ever causes a pause so
+	// the user can decide what to do.
+	virtual bool recordingFailed() const = 0;
+
+	// Physical or authenticated confirmation gate for arm()/resume().
+	virtual bool physicalConfirmationPresent() const = 0;
+
+	// Monotonic wall-clock read (microseconds), used solely to bound how
+	// long a single submitted attempt is allowed to stay pending before
+	// DjAutoDjPlanner treats it as timed out (AUTO_DJ_LOAD_TIMEOUT_US -
+	// see DjAutoDjTypes.h). Deliberately NOT a loop/tick counter: the
+	// composite load->arm->transition attempt this now spans can take a
+	// materially different number of DjSession::loop() iterations to
+	// resolve depending on real audio-thread scheduling, so counting
+	// ticks no longer bounds a fixed wall-clock duration the way it did
+	// for a bare single-command load. Routed through the port (not called
+	// directly by the planner) so DjAutoDjPlanner - and its own dedicated
+	// host self-check - stay Arduino-free and fully deterministic under a
+	// fake clock; production implementations return a real micros() read,
+	// test doubles return a fully controllable counter.
+	virtual uint64_t nowMicros() const = 0;
+};
+
+#endif //JAYD_FIRMWARE_DJ_AUTO_DJ_LOAD_PORT_H

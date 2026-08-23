@@ -7,6 +7,7 @@
 #include <Loop/LoopManager.h>
 #include <SD.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 // DjBeatEngine.h's DJ_RATE_* constants are plain values (kept dependency-free
 // for host testing) but must exactly mirror SpeedModifier's Q16.16 rate
@@ -59,7 +60,7 @@ void DjSession::end(){
 }
 
 DjSession::DjSession(uint8_t leftGain, uint8_t rightGain, uint8_t initialMix) :
-		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter){
+		gains{ leftGain, rightGain }, mix(initialMix), sessionId(++sessionCounter), autoDjActuator(*this){
 	system = new MixSystem();
 	if(!orphanRecoveryDone){
 		orphanRecoveryDone = true;
@@ -98,8 +99,48 @@ DjSubmitResult DjSession::submit(DjCommand command){
 		return { command.id, DJ_COMMAND_REJECTED, error };
 	}
 
+	// Manual takeover: synchronously purge every still-queued Auto-owned
+	// command (its own stable-ID load, or an internal Coach-arm) and mark
+	// each SUPERSEDED BEFORE this command is admitted - see
+	// djIsAutoDjTakeoverSignal()'s and DjCommand::autoDjOwned's doc
+	// comments. Without this, DjSession::loop()'s FIFO can pop and apply a
+	// stale Auto-owned command on the very next tick, ahead of
+	// tickAutoDj() (called last in that same loop()) ever observing the
+	// generation bump djBumpAutoDjManualIntent() records below - the exact
+	// race the independent review flagged. No direct autoDjActuator.pause()
+	// call is needed here: marking the entry SUPERSEDED is enough for the
+	// planner's own next poll (AutoDjSessionActuator::pollLoad()) to see a
+	// Failed outcome and resolve it through the existing, already-approved
+	// retry/terminal-skip path, and the generation bump below still drives
+	// tick()'s own manualTakeoverActive()-gated pause()+cancelPending() on
+	// its next call exactly as before - calling pause() directly here,
+	// ahead of that, would skip cancelPending() and could leave a stale
+	// pendingEntry to be resurrected after a resume().
+	if(command.origin != DJ_ORIGIN_SYSTEM && djIsAutoDjTakeoverSignal(command)){
+		uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+		const uint8_t removedCount = commandQueue.removeAutoDjOwned(removedIds, DJ_COMMAND_CAPACITY);
+		for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
+			commandResults.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+			if(autoDjTracked.tracked && autoDjTracked.id == removedIds[i]) autoDjTracked.status = DJ_COMMAND_SUPERSEDED;
+			// A purged entry can equally be one of Coach's own internal
+			// transition-step commands (tagged autoDjOwned by armTransition()
+			// when Auto is the arming origin - see DjAssistTransitionPlan's
+			// autoDjOwned field). assistTracked is the single-slot status
+			// DjAssistSessionActuator::poll() reads for that exact command id
+			// (assistTrackedStatus()); without this mirror update it would be
+			// left stale at ACCEPTED. Harmless in practice today (guardOk()'s
+			// own mix/play/sync generation and identity checks independently
+			// fail the transition on the same/next tick for anything Coach's
+			// guard cares about), but keeping both tracked slots consistent
+			// with the queue's ground truth is cheap and removes any future
+			// dependence on that coincidence.
+			if(assistTracked.tracked && assistTracked.id == removedIds[i]) assistTracked.status = DJ_COMMAND_SUPERSEDED;
+		}
+	}
+
 	const DjSubmitResult result = admitAssistCommand(
 		command, commandQueue, commandResults, assistTracked, assistIntentGenerations);
+	if(result.status == DJ_COMMAND_ACCEPTED) djBumpAutoDjManualIntent(autoDjManualIntentGenerations, command);
 	if(result.error == DJ_COMMAND_ERROR_QUEUE_FULL) queueDrops++;
 	commandMutex.unlock();
 	return result;
@@ -127,12 +168,62 @@ DjSubmitResult DjSession::loadDeck(
 	return submit(command);
 }
 
-DjSubmitResult DjSession::setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin){
+DjSubmitResult DjSession::loadDeckByIdentity(
+	uint8_t deck, const DjTrackIdentity& identity,
+	uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+){
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_LOAD_DECK;
+	command.deck = deck;
+	// libraryGeneration/metadataRevision are the exact epoch the caller
+	// (Auto DJ) captured this identity under at selection time - never a
+	// live re-read here, otherwise the whole "reject a load whose
+	// candidate has since been superseded" contract is tautological (the
+	// live values always match themselves). libraryKey has no Auto DJ-side
+	// captured equivalent (AutoDjIdentity doesn't carry it) so it is still
+	// read live, same as every other caller of loadDeck().
+	command.libraryGeneration = identityLibraryGeneration;
+	command.metadataRevision = identityMetadataRevision;
+	metadataMutex.lock();
+	command.libraryKey = libraryKey;
+	metadataMutex.unlock();
+	command.trackIdentity = identity;
+	// Sole caller is autoDjLoadDeckByIdentity() (the AutoDjSessionPort
+	// implementation below) - always Auto DJ's own command, so the
+	// takeover-purge tag is set unconditionally here rather than at each
+	// call site.
+	command.autoDjOwned = true;
+	// command.path is left empty (DjCommand{} zero-initializes char[]) -
+	// the sole signal to validate()/applyLoad() that this is a stable-ID
+	// load to be resolved internally, never a caller-supplied path.
+	const DjSubmitResult result = submit(command);
+	if(result.status == DJ_COMMAND_ACCEPTED){
+		// Fire-and-forget grid-anchor hydration request for this exact
+		// key, submitted at the same moment as the load itself (never
+		// blocking submit()/this call on it - see DjAssistGridCache's doc
+		// comment). The command queue's own multi-tick latency before
+		// DjSession::loop() actually pops and applies this LOAD_DECK
+		// command gives DjAssistController::stepGridHydration()'s ~20ms-
+		// cadence background worker a real window to resolve it before
+		// apply time; if it isn't ready yet, resolveIdentityLoad()'s
+		// lookup simply misses and the load proceeds with anchorCount ==
+		// 0, the same pre-existing "no usable grid" fallback. Requested
+		// only after a successful submit - a rejected/superseded command
+		// will never reach apply, so there is nothing to hydrate for.
+		assistController.requestGridHydration(identityLibraryGeneration, identityMetadataRevision, identity);
+	}
+	return result;
+}
+
+
+DjSubmitResult DjSession::setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_PLAYING;
 	command.deck = deck;
 	command.value = playing;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -154,11 +245,12 @@ DjSubmitResult DjSession::setGain(uint8_t deck, uint8_t gain, DjCommandOrigin or
 	return submit(command);
 }
 
-DjSubmitResult DjSession::setMix(uint8_t value, DjCommandOrigin origin){
+DjSubmitResult DjSession::setMix(uint8_t value, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_MIX;
 	command.value = value;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -224,7 +316,7 @@ DjSubmitResult DjSession::loopReloop(uint8_t deck, DjCommandOrigin origin){
 	return submit(command);
 }
 
-DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin){
+DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned){
 	DjCommand command = {};
 	command.origin = origin;
 	command.type = DJ_COMMAND_SET_SYNC;
@@ -232,6 +324,7 @@ DjSubmitResult DjSession::setSync(uint8_t deck, bool armed, int8_t masterDeck, D
 	command.value = armed;
 	// 0 = auto-master, 1..DJ_DECK_COUNT = explicit deck index + 1.
 	command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+	command.autoDjOwned = autoDjOwned;
 	return submit(command);
 }
 
@@ -326,7 +419,7 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		return DJ_COMMAND_ERROR_STALE_IDENTITY;
 	}
 #else
-	if(command.type > DJ_COMMAND_ASSIST_CANCEL_TRANSITION) return DJ_COMMAND_ERROR_INVALID_VALUE;
+	if(command.type > DJ_COMMAND_AUTODJ_RESET) return DJ_COMMAND_ERROR_INVALID_VALUE;
 #endif
 
 	const bool deckCommand = command.type == DJ_COMMAND_LOAD_DECK ||
@@ -361,7 +454,14 @@ DjCommandError DjSession::validate(const DjCommand& command) const{
 		command.type == DJ_COMMAND_SET_EFFECT_INTENSITY) &&
 	   command.value > 255) return DJ_COMMAND_ERROR_INVALID_VALUE;
 	if(command.type == DJ_COMMAND_LOAD_DECK){
-		if(command.path[0] == '\0' || memchr(command.path, '\0', DJ_PATH_CAPACITY) == nullptr){
+		if(command.path[0] == '\0'){
+			// Stable-ID load (see DjSession::loadDeckByIdentity()): valid
+			// only with fingerprint evidence to resolve against - an empty
+			// path AND no identity is never accepted as "load nothing".
+			if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)){
+				return DJ_COMMAND_ERROR_INVALID_PATH;
+			}
+		}else if(memchr(command.path, '\0', DJ_PATH_CAPACITY) == nullptr){
 			return DJ_COMMAND_ERROR_INVALID_PATH;
 		}
 	}
@@ -518,6 +618,162 @@ void DjSession::invalidateLibraryMetadata(){
 	}
 	metadataMutex.unlock();
 	publishSnapshot();
+}
+
+// Resolves a stable-ID (Auto DJ) load ENTIRELY from RAM: the path AND the
+// full DjTrackMetadataSnapshot/JaydMetadata::Track pair applyLoad() needs,
+// with zero metadataReader/SD calls on this (DjSession::loop()) thread. This
+// replaces the previous resolveIdentityPath()+resolveMetadata() pair for
+// identity loads specifically - manual path-based loads still go through
+// resolveMetadata() unchanged, since an explicit path load is legitimately
+// allowed to hit SD.
+//
+// Every field this needs (path, grid/phrase offsets+counts, precomputed
+// confidence/downbeatCount, provenanceHash, and every scalar
+// DjTrackMetadataSnapshot already carried) is populated once, off-thread, by
+// DjSession::assistTrackEntry() - the same background DjAssistFillWorker
+// pass that fills every other DjAssistLibraryEntry field - and cached in the
+// PSRAM-backed candidate table (see DjAssistLibraryEntry's doc comment).
+// Fingerprint -> entry is a bounded RAM-only scan over that same table
+// (DjAssistController::candidateEntry(), capped at
+// DJ_ASSIST_MAX_INDEX_ENTRIES POD comparisons) - never a linear SD scan.
+// Ambiguous (more than one match) or missing is rejected outright: never
+// guess. A matched entry whose own state isn't DJ_METADATA_VALID (the
+// background scan itself hit a corrupt/unreadable record, or hasn't been
+// filled yet) is rejected too - this function never partially trusts a
+// degraded cache entry.
+bool DjSession::resolveIdentityLoad(
+	const DjCommand& command,
+	char* outPath, size_t outCapacity,
+	JaydMetadata::Track& track,
+	DjTrackMetadataSnapshot& metadata,
+	DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+){
+	track = {};
+	metadata = {};
+	outAnchorCount = 0;
+	if(outCapacity == 0) return false;
+	outPath[0] = '\0';
+	if(!(command.trackIdentity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
+
+	metadataMutex.lock();
+	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+	   command.libraryGeneration != libraryGeneration ||
+	   command.libraryKey != libraryKey ||
+	   command.metadataRevision != metadataRevision){
+		// Reject stale/missing generation outright rather than resolve
+		// against a library snapshot the caller no longer agrees with.
+		// metadataRevision catches a same-generation metadata replacement
+		// that libraryGeneration/libraryKey alone would miss - see
+		// AutoDjIdentity::metadataRevision's doc comment.
+		metadataMutex.unlock();
+		return false;
+	}
+	const uint32_t liveRevision = metadataRevision;
+	metadataMutex.unlock();
+
+	const uint32_t candidateTotal = assistController.candidateCount();
+	bool matched = false;
+	bool ambiguous = false;
+	DjAssistLibraryEntry matchedEntry;
+	for(uint32_t i = 0; i < candidateTotal; ++i){
+		DjAssistLibraryEntry entry;
+		uint32_t entryRevision = 0;
+		if(!assistController.candidateEntry(i, entry, entryRevision)) continue;
+		// The candidate table can (briefly) still hold entries filled
+		// under an older metadataRevision while a fresh fill pass catches
+		// up after a same-generation metadata replacement - never trust
+		// one of those, even if its fingerprint happens to still match.
+		if(entryRevision != liveRevision) continue;
+		// Exact stable-identity match only (see djTrackIdentityExactMatch's
+		// doc comment, DjSessionState.h) - a bare fingerprint memcmp here
+		// previously ignored sourceId entirely, so two entries sharing a
+		// fingerprint but carrying different sourceId bytes could resolve
+		// to each other's cached path/grid/metadata.
+		if(!djTrackIdentityExactMatch(entry.identity, command.trackIdentity)) continue;
+		if(matched){
+			ambiguous = true;
+			break;
+		}
+		matched = true;
+		matchedEntry = entry;
+	}
+	if(!matched || ambiguous) return false;
+	if(matchedEntry.state != DJ_METADATA_VALID) return false;
+
+	// Re-check the live generation/revision one last time, immediately
+	// before committing to this entry - belt-and-suspenders against a
+	// refresh landing in the gap between the RAM scan above and here.
+	metadataMutex.lock();
+	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+	   command.libraryGeneration != libraryGeneration ||
+	   command.libraryKey != libraryKey ||
+	   command.metadataRevision != metadataRevision ||
+	   metadataRevision != liveRevision){
+		metadataMutex.unlock();
+		return false;
+	}
+	metadataMutex.unlock();
+
+	// Index-stored paths never carry the leading '/' (see
+	// Reader::validateTrack()'s rejection of any stored path that does);
+	// reconstruct the real SD path here from the cached, null-terminated
+	// path string - no readString() call.
+	const size_t pathLen = strnlen(matchedEntry.path, sizeof(matchedEntry.path));
+	if(pathLen == 0 || outCapacity < pathLen + 2) return false;
+	outPath[0] = '/';
+	memcpy(outPath + 1, matchedEntry.path, pathLen);
+	outPath[pathLen + 1] = '\0';
+
+	// Reconstruct exactly the JaydMetadata::Track fields readGrid()/
+	// readPhrase() need (see their validateGrid()/validatePhrase() call
+	// sites) purely from cached scalars - never a trackByIndex() call.
+	track.index = matchedEntry.libraryIndex;
+	memcpy(track.fingerprint, matchedEntry.identity.fingerprint, 16);
+	if(matchedEntry.identity.flags & DJ_TRACK_IDENTITY_SOURCE){
+		memcpy(track.sourceId, matchedEntry.identity.sourceId, 16);
+	}
+	track.firstGrid = matchedEntry.firstGrid;
+	track.gridCount = matchedEntry.gridCount;
+	track.firstPhrase = matchedEntry.firstPhrase;
+	track.phraseCount = matchedEntry.phraseCount;
+	track.cueCount = matchedEntry.cueCount;
+	track.sampleRate = matchedEntry.sampleRate;
+	track.durationFrames = matchedEntry.durationFrames;
+	track.bpmMilli = matchedEntry.bpmMilli;
+	track.key = matchedEntry.key;
+	track.rating = matchedEntry.rating;
+
+	metadata.state = DJ_METADATA_VALID;
+	metadata.libraryGeneration = libraryGeneration;
+	metadata.provenanceHash = matchedEntry.provenanceHash;
+	metadata.sourceSampleRate = matchedEntry.sampleRate;
+	metadata.sourceDurationFrames = matchedEntry.durationFrames;
+	metadata.bpmMilli = matchedEntry.bpmMilli;
+	metadata.key = matchedEntry.key;
+	metadata.rating = matchedEntry.rating;
+	metadata.cueCount = uint16_t(matchedEntry.cueCount);
+	metadata.gridCount = uint16_t(matchedEntry.gridCount);
+	metadata.phraseCount = uint16_t(matchedEntry.phraseCount);
+	metadata.downbeatCount = uint16_t(matchedEntry.downbeatCount);
+	metadata.confidence = matchedEntry.confidence;
+	metadata.capabilities = matchedEntry.capabilities;
+
+	// Grid anchors are no longer cached on the candidate entry itself (see
+	// DjAssistLibraryEntry's doc comment for the PSRAM-budget reason) - a
+	// RAM-only lookup into DjAssistController's small, few-slot
+	// DjAssistGridCache is the replacement. AutoDjSessionActuator::
+	// submitLoad() already requested hydration for this exact key when it
+	// submitted this command; if the background worker hasn't resolved it
+	// yet (or it was requested too late/evicted), the lookup simply misses
+	// and outAnchorCount stays 0 - the same "no usable grid" fallback
+	// buildGrid() already uses for a track with no usable grid data at
+	// all, so a miss here can never fail this load, only proceed without
+	// quantize/sync capability. Either way: zero metadataReader/SD calls.
+	assistController.gridAnchorsFor(
+		command.libraryGeneration, liveRevision, matchedEntry.identity, outAnchors, outAnchorCount
+	);
+	return true;
 }
 
 DjMetadataState DjSession::resolveMetadata(
@@ -728,11 +984,147 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 		const DjTrackIdentity identity = DjAssistBridge::buildTrackIdentity(track.fingerprint, track.sourceId);
 		outEntry = DjAssistBridge::buildLibraryEntry(
 			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
-			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
+			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount,
+			track.firstGrid, track.firstPhrase
 		);
+		// Artist/title hashes for Auto DJ's repeat/artist/title cooldown
+		// exclusion (DjAssistLibraryEntry.artistHash/titleHash) - this
+		// call already runs only from DjAssistFillWorker's background
+		// task (never DjSession::loop()'s main thread), so populating two
+		// more fields here costs zero additional locks/threads and, per
+		// the review, is what lets Auto DJ retire its own separate (and
+		// unsafe, main-thread) candidate-read path entirely in favor of
+		// this one. Best-effort like the rest of this entry:
+		// readStringHash() leaves the field at its buildLibraryEntry()
+		// default (0/"unknown") on a bad offset rather than failing the
+		// whole entry.
+		metadataReader.readStringHash(track.artist, outEntry.artistHash);
+		metadataReader.readStringHash(track.title, outEntry.titleHash);
+
+		// path + provenanceHash: same best-effort treatment as
+		// artist/title above - a failed readString() just leaves path[]
+		// empty, which DjSession::resolveIdentityLoad() already treats as
+		// "not usable for a stable-ID load" (pathLen == 0 is rejected)
+		// without invalidating the rest of this entry's (still useful for
+		// Coach scoring) fields.
+		outEntry.path[0] = '\0';
+		metadataReader.readString(track.path, outEntry.path, sizeof(outEntry.path));
+		metadataReader.readStringHash(track.provenance, outEntry.provenanceHash);
+
+		// Precompute confidence/downbeatCount exactly as
+		// DjSession::resolveMetadata() does for a manual load - once,
+		// here, off DjSession::loop()'s thread - so
+		// DjSession::resolveIdentityLoad() never needs its own
+		// readGrid()/readPhrase() burst at Auto-apply time. Bounded by
+		// JaydMetadata::Reader::MaxGridPerTrack/MaxPhrasesPerTrack (256/
+		// 128) per track, same as resolveMetadata()'s own loop; unlike
+		// that loop, a read failure here downgrades this entry to
+		// DJ_METADATA_CORRUPT (rather than aborting the whole fill pass)
+		// so one bad track's grid/phrase data never blocks the rest of
+		// the library from filling - the other already-cached scalar
+		// fields above stay intact for Coach's own (non-grid) scoring.
+		// confidence/downbeatCount only - this entry no longer caches a
+		// per-track anchor array (see DjAssistLibraryEntry's doc comment):
+		// the anchors themselves are hydrated on demand, only for the
+		// handful of identities Auto DJ is about to load, by
+		// assistTrackGridAnchors() below via DjAssistController's
+		// DjAssistGridCache, not precomputed here for the entire library.
+		bool gridPhraseOk = true;
+		for(uint32_t i = 0; i < track.gridCount && gridPhraseOk; ++i){
+			JaydMetadata::Grid grid;
+			if(!metadataReader.readGrid(track, i, grid)){
+				gridPhraseOk = false;
+				break;
+			}
+			if(grid.beatNumber == 1) ++outEntry.downbeatCount;
+			if(grid.confidence > outEntry.confidence) outEntry.confidence = grid.confidence;
+		}
+		for(uint32_t i = 0; i < track.phraseCount && gridPhraseOk; ++i){
+			JaydMetadata::Phrase phrase;
+			if(!metadataReader.readPhrase(track, i, phrase)){
+				gridPhraseOk = false;
+				break;
+			}
+			if(phrase.confidence > outEntry.confidence) outEntry.confidence = phrase.confidence;
+		}
+		if(!gridPhraseOk){
+			outEntry.state = DJ_METADATA_CORRUPT;
+			outEntry.confidence = 0;
+			outEntry.downbeatCount = 0;
+		}else if(outEntry.downbeatCount){
+			outEntry.capabilities |= DJ_METADATA_HAS_DOWNBEATS;
+		}
 	}
 	metadataMutex.unlock();
 	return ok;
+}
+
+// On-demand replacement for the old per-entry gridAnchors[] cache (see
+// DjAssistLibraryEntry's doc comment and DjAssistGridCache): computes the
+// bounded, subsampled anchor array for exactly ONE already-indexed track,
+// only when DjAssistController::stepGridHydration() asks for it (i.e. only
+// for identities Auto DJ actually requested hydration for), never for the
+// whole library. Runs strictly off DjSession::loop()'s thread - same
+// background-worker-only contract as assistTrackEntry() - and mirrors
+// buildGrid()'s exact stride/confidence/all-or-nothing capability gate, so
+// a stable-ID load can never install an anchor set less trustworthy than
+// what a manual path-based load's buildGrid() would have produced for the
+// same track.
+bool DjSession::assistTrackGridAnchors(
+	uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+){
+	outAnchorCount = 0;
+	metadataMutex.lock();
+	if(!metadataInitialized || metadataReaderStatus != JaydMetadata::Status::Ready){
+		outRevision = metadataRevision;
+		metadataMutex.unlock();
+		return false;
+	}
+	outRevision = metadataRevision;
+	JaydMetadata::Track track;
+	const bool ok = metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
+	if(!ok){
+		metadataMutex.unlock();
+		return false;
+	}
+
+	uint16_t capabilities = 0;
+	if(track.sampleRate > 0 && track.durationFrames > 0) capabilities |= DJ_METADATA_HAS_SOURCE_FRAMES;
+	if(track.bpmMilli > 0) capabilities |= DJ_METADATA_HAS_BPM;
+	if(track.gridCount > 0) capabilities |= DJ_METADATA_HAS_GRID;
+
+	const uint32_t gridStride = track.gridCount == 0 ? 1 :
+		(track.gridCount + DJ_GRID_ANCHOR_CAPACITY - 1) / DJ_GRID_ANCHOR_CAPACITY;
+	uint16_t anchorCount = 0;
+	uint16_t confidence = 0;
+	bool gridOk = true;
+	for(uint32_t i = 0; i < track.gridCount && gridOk; ++i){
+		JaydMetadata::Grid grid;
+		if(!metadataReader.readGrid(track, i, grid)){
+			gridOk = false;
+			break;
+		}
+		if(grid.confidence > confidence) confidence = grid.confidence;
+		if(grid.confidence >= DJ_GRID_MIN_CONFIDENCE && anchorCount < DJ_GRID_ANCHOR_CAPACITY &&
+		   (i % gridStride) == 0){
+			outAnchors[anchorCount].frame = grid.positionFrames;
+			outAnchors[anchorCount].quarterBeat = int64_t(i) * DJ_BEAT_QUARTER_BEATS;
+			++anchorCount;
+		}
+	}
+	metadataMutex.unlock();
+
+	// Mirror buildGrid()'s all-or-nothing gate exactly: an anchor set
+	// computed under a capability/confidence combination that wouldn't
+	// have let a manual load build a grid either must never be handed to
+	// a stable-ID load as if it were usable.
+	if(!gridOk || !(capabilities & DJ_METADATA_HAS_GRID) || !(capabilities & DJ_METADATA_HAS_SOURCE_FRAMES) ||
+	   !(capabilities & DJ_METADATA_HAS_BPM) || confidence < DJ_GRID_MIN_CONFIDENCE || anchorCount == 0){
+		outAnchorCount = 0;
+		return false;
+	}
+	outAnchorCount = anchorCount;
+	return true;
 }
 
 bool DjSession::copyAssistSnapshot(DjAssistSnapshot& snapshot) const{
@@ -788,6 +1180,256 @@ void DjSession::assistPurgePendingSystemCommands(uint8_t deck){
 	commandMutex.unlock();
 }
 
+// -- AutoDjSessionPort --
+
+// Both accessors below are RAM-only delegations to assistController's
+// background-filled candidate table (see DjAssistController::
+// candidateCount()/candidateEntry()) - this is the review's required fix:
+// Auto DJ's tick() must never call into metadataReader/metadataMutex
+// itself (that was up to AUTO_DJ_SCAN_BUDGET_PER_TICK * 3 real SD reads
+// per DjSession::loop() tick). The candidate table is the exact same one
+// Coach's own tickSuggestions() scans, filled entirely off-thread by
+// DjAssistFillWorker; Auto DJ now reuses it instead of duplicating the
+// scan with its own direct reader calls.
+uint32_t DjSession::autoDjCandidateCount(){
+	return assistController.candidateCount();
+}
+
+bool DjSession::autoDjCandidateEntry(
+	uint32_t index,
+	DjAssistLibraryEntry& outEntry,
+	uint32_t& outArtistHash,
+	uint32_t& outTitleHash,
+	uint32_t& outRevision
+){
+	const bool ok = assistController.candidateEntry(index, outEntry, outRevision);
+	outArtistHash = ok ? outEntry.artistHash : 0;
+	outTitleHash = ok ? outEntry.titleHash : 0;
+	return ok;
+}
+
+uint32_t DjSession::autoDjMetadataRevision(){
+	return assistMetadataRevision();
+}
+
+uint32_t DjSession::autoDjLibraryGeneration(){
+	return libraryGeneration;
+}
+
+DjAssistDeckContext DjSession::autoDjActiveDeckContext(){
+	DjSnapshot snapshot;
+	if(!copySnapshot(snapshot)) return DjAssistDeckContext();
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		if(!snapshot.decks[deck].playing) continue;
+		const DjDeckSnapshot& d = snapshot.decks[deck];
+		if(!d.loaded || d.metadata.state != DJ_METADATA_VALID) return DjAssistDeckContext();
+		DjAssistDeckContext ctx;
+		ctx.valid = true;
+		ctx.bpmMilli = d.metadata.bpmMilli;
+		ctx.key = d.metadata.key;
+		ctx.sampleRate = d.metadata.sourceSampleRate;
+		// Same coarse elapsed/duration-derived estimate as
+		// DjAssistController::buildDeckContext() - deliberately not
+		// frame-accurate, sufficient for a bounded scoring signal.
+		const uint64_t elapsedFrames = ctx.sampleRate ? uint64_t(d.elapsed) * ctx.sampleRate : 0;
+		const uint64_t totalFrames = d.metadata.sourceDurationFrames;
+		ctx.remainingFrames = elapsedFrames < totalFrames ? totalFrames - elapsedFrames : 0;
+		return ctx;
+	}
+	return DjAssistDeckContext();
+}
+
+uint8_t DjSession::autoDjTargetDeck(){
+	DjSnapshot snapshot;
+	if(!copySnapshot(snapshot)) return 1;
+	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; deck++){
+		if(!snapshot.decks[deck].playing) return deck;
+	}
+	return 1; // neither/both decks playing: deterministic fallback, callers
+	          // must gate on autoDjActiveDeckContext().valid first anyway.
+}
+
+DjSubmitResult DjSession::autoDjLoadDeckByIdentity(
+	uint8_t deck, const DjTrackIdentity& identity,
+	uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+){
+	return loadDeckByIdentity(deck, identity, identityLibraryGeneration, identityMetadataRevision);
+}
+
+void DjSession::autoDjTrackCommand(uint32_t commandId){
+	commandMutex.lock();
+	autoDjTracked.id = commandId;
+	autoDjTracked.tracked = true;
+	autoDjTracked.status = DJ_COMMAND_ACCEPTED;
+	commandMutex.unlock();
+}
+
+DjCommandStatus DjSession::autoDjCommandStatus(uint32_t commandId){
+	commandMutex.lock();
+	DjCommandStatus status = DJ_COMMAND_PENDING;
+	if(autoDjTracked.tracked && autoDjTracked.id == commandId){
+		status = autoDjTracked.status;
+	}
+	commandMutex.unlock();
+	return status;
+}
+
+DjSubmitResult DjSession::autoDjArmCoachTransition(
+	uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+	uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+){
+	// Built directly rather than via the public assistArmTransition()
+	// wrapper: that wrapper takes an explicit origin but never sets
+	// autoDjOwned, and Auto DJ's internal arm must always be both
+	// DJ_ORIGIN_SYSTEM (it is not a user action) and autoDjOwned (so a
+	// manual takeover purges a still-queued arm exactly like a still-
+	// queued load - see djIsAutoDjTakeoverSignal()/removeAutoDjOwned()).
+	// libraryIndex is 0: purely cosmetic UI bookkeeping the engine itself
+	// never validates (see AutoDjSessionPort.h).
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_ASSIST_ARM_TRANSITION;
+	command.deck = fromDeck;
+	command.slot = toDeck;
+	command.libraryIndex = 0;
+	command.trackIdentity = targetIdentity;
+	command.value = uint16_t(
+		crossfadeBeats |
+		(startAtBoundary ? (1 << 8) : 0) |
+		(tempoLock ? (1 << 9) : 0)
+	);
+	command.autoDjOwned = true;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjCancelCoachTransition(){
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_ASSIST_CANCEL_TRANSITION;
+	command.autoDjOwned = true;
+	return submit(command);
+}
+
+DjAssistMode DjSession::autoDjCoachTransitionMode(){
+	DjAssistSnapshot snapshot;
+	// copyAssistSnapshot() has no fallible path (always fills snapshot),
+	// but guard defensively anyway: DJ_ASSIST_MODE_OFF is the safe
+	// "nothing in flight" reading, which maps to AutoDjSessionActuator's
+	// uniform Failed-and-let-the-planner-retry/skip policy.
+	if(!copyAssistSnapshot(snapshot)) return DJ_ASSIST_MODE_OFF;
+	return snapshot.mode;
+}
+
+AutoDjManualIntentGenerations DjSession::autoDjManualIntentGenerationsSnapshot(){
+	commandMutex.lock();
+	const AutoDjManualIntentGenerations generations = autoDjManualIntentGenerations;
+	commandMutex.unlock();
+	return generations;
+}
+
+bool DjSession::autoDjConsumePhysicalConfirmation(){
+	commandMutex.lock();
+	const bool confirmed = autoDjPhysicalConfirmPending;
+	autoDjPhysicalConfirmPending = false;
+	commandMutex.unlock();
+	return confirmed;
+}
+
+bool DjSession::autoDjCoachTransitionSettled(){
+	return assistController.rollbackSettled();
+}
+
+bool DjSession::autoDjStableIdAuthorityReady(){
+	return assistController.authorityReady();
+}
+
+uint64_t DjSession::autoDjNowMicros() const{
+	// esp_timer_get_time() is ESP-IDF's true 64-bit microsecond-since-boot
+	// monotonic clock - unlike a bare Arduino micros() (32-bit, wraps every
+	// ~71.6 minutes) widened to 64 bits after the fact, which loses
+	// monotonicity across each wrap since the widen can't recover how many
+	// times the underlying 32-bit counter already rolled over. Auto DJ's
+	// wall-clock deadlines (DjAutoDjPlanner's composite-attempt budget,
+	// AutoDjSessionActuator's Teardown budget) both rely on this being
+	// genuinely monotonic for the lifetime of the session, not just within
+	// a single ~71-minute window.
+	return uint64_t(esp_timer_get_time());
+}
+
+// -- Auto DJ thin public wrappers (physical bank / browser API v2) --
+// Both origins submit the exact same DjCommand types and go through
+// apply()'s switch below, which performs the actual actuator call under
+// the same commandMutex-serialized processing every other command gets.
+
+DjSubmitResult DjSession::autoDjArmCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_ARM;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjStartCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_START;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjPauseCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_PAUSE;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjResumeCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_RESUME;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjStopCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_STOP;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjResetCommand(DjCommandOrigin origin){
+	DjCommand command = {};
+	command.origin = origin;
+	command.type = DJ_COMMAND_AUTODJ_RESET;
+	return submit(command);
+}
+
+bool DjSession::autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistHash, uint32_t titleHash){
+	if(!(identity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
+	AutoDjIdentity autoIdentity;
+	autoIdentity.flags = identity.flags & (AUTO_DJ_IDENTITY_FINGERPRINT | AUTO_DJ_IDENTITY_SOURCE);
+	autoIdentity.libraryGeneration = libraryGeneration;
+	// metadataRevision is a lock-free atomic (see its declaration) - safe
+	// to read here without metadataMutex, same as libraryGeneration is
+	// already read unlocked on this path. Captures the exact epoch this
+	// pin was made under, so a same-generation metadata replacement still
+	// invalidates a stale pin - see AutoDjIdentity::metadataRevision's doc
+	// comment.
+	autoIdentity.metadataRevision = metadataRevision;
+	memcpy(autoIdentity.fingerprint, identity.fingerprint, sizeof(autoIdentity.fingerprint));
+	memcpy(autoIdentity.sourceId, identity.sourceId, sizeof(autoIdentity.sourceId));
+	return autoDjActuator.pinTrack(autoIdentity, artistHash, titleHash);
+}
+
+void DjSession::autoDjPhysicalConfirm(){
+	commandMutex.lock();
+	autoDjPhysicalConfirmPending = true;
+	commandMutex.unlock();
+}
+
+void DjSession::copyAutoDjSnapshot(AutoDjSnapshot& snapshot) const{
+	autoDjActuator.copySnapshot(snapshot);
+}
+
 void DjSession::attachView(InfoGenerator* left, InfoGenerator* right, InfoGenerator* output){
 	if(!system || !left || !right || !output) return;
 	if(viewAttached && viewInfo[0] == left && viewInfo[1] == right && viewInfo[2] == output) return;
@@ -824,6 +1466,9 @@ void DjSession::loop(uint micros){
 		if(assistTracked.tracked && assistTracked.id == command.id){
 			assistTracked.status = status;
 		}
+		if(autoDjTracked.tracked && autoDjTracked.id == command.id){
+			autoDjTracked.status = status;
+		}
 		commandMutex.unlock();
 	}
 
@@ -843,10 +1488,21 @@ void DjSession::loop(uint micros){
 	// publish this tick.
 	publishSnapshot();
 	tickAssist();
+	// Same same-iteration-freshness reasoning as tickAssist() above:
+	// AutoDjSessionActuator::tick() takes its own copySnapshot() (called
+	// after publishSnapshot(), same as Coach) and only ever submits
+	// DjCommands (via loadDeckByIdentity()) rather than mutating session
+	// state directly, so a single tick after publishSnapshot() is
+	// sufficient for it too.
+	tickAutoDj();
 }
 
 void DjSession::tickAssist(){
 	assistController.tick();
+}
+
+void DjSession::tickAutoDj(){
+	autoDjActuator.tick();
 }
 
 bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommandStatus& status, DjCommandResult& diagnostics){
@@ -1072,9 +1728,14 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			const uint8_t crossfadeBeats = uint8_t(command.value & 0xFF);
 			const bool startAtBoundary = (command.value & (1 << 8)) != 0;
 			const bool tempoLock = (command.value & (1 << 9)) != 0;
+			// command.autoDjOwned distinguishes Auto DJ's internal arm
+			// (autoDjArmCoachTransition()) from a direct user Coach gesture
+			// (assistArmTransition()) - forwarded so the resulting plan/
+			// steps are tagged for manual-takeover purge (see
+			// DjAssistTransitionStep::autoDjOwned).
 			if(!assistController.armTransition(
 				command.deck, command.slot, command.libraryIndex, command.trackIdentity,
-				crossfadeBeats, startAtBoundary, tempoLock
+				crossfadeBeats, startAtBoundary, tempoLock, command.autoDjOwned
 			)){
 				error = DJ_COMMAND_ERROR_ASSIST_REJECTED;
 				return false;
@@ -1083,6 +1744,64 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 		}
 		case DJ_COMMAND_ASSIST_CANCEL_TRANSITION:
 			assistController.cancelTransition();
+			return true;
+		// Arm/Resume consume the one-shot physical/authenticated
+		// confirmation gate right here, synchronously within the same
+		// apply() call that performs the transition - but ONLY when the
+		// command actually originated from an on-device physical gesture
+		// (DJ_ORIGIN_PHYSICAL, set immediately before submit() by the Mix
+		// screen). An authenticated+leased browser request (DJ_ORIGIN_HTTP)
+		// can never synthesize this confirmation - authentication/leasing
+		// proves who is asking, not that a human is standing at the
+		// device, and the whole point of this gate is the latter. Reject
+		// outright with a stable, explicit error instead; the browser can
+		// still pause/stop/reset (see the other AUTODJ_* cases below,
+		// unconditional) or ask again once an on-device hold has happened.
+		case DJ_COMMAND_AUTODJ_ARM:
+			if(djAutoDjPhysicalConfirmMissing(command)){
+				error = DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED;
+				return false;
+			}
+			autoDjPhysicalConfirm();
+			if(!autoDjArm()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_START:
+			if(!autoDjStart()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_PAUSE:
+			if(!autoDjPause()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_RESUME:
+			if(djAutoDjPhysicalConfirmMissing(command)){
+				error = DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED;
+				return false;
+			}
+			autoDjPhysicalConfirm();
+			if(!autoDjResume()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_STOP:
+			if(!autoDjStop()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
+			return true;
+		case DJ_COMMAND_AUTODJ_RESET:
+			if(!autoDjReset()){
+				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
+				return false;
+			}
 			return true;
 #if defined(JAYD_ENABLE_WIRELESS)
 		case DJ_COMMAND_OPEN_PAIRING:
@@ -1106,23 +1825,75 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 			return false;
 		}
 	}
-	fs::File file = SD.open(command.path);
+
+	// Stable-ID load (empty path, see loadDeckByIdentity()/validate()):
+	// resolve the path internally against the live, in-memory metadata
+	// index before touching SD at all. Never guessed, never falls back to
+	// a stale/foreign path - any missing/ambiguous/stale-generation
+	// resolution fails the whole command with
+	// DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED.
+	const bool identityLoad = command.path[0] == '\0';
+	char resolvedPath[DJ_PATH_CAPACITY] = {};
+	const char* loadPath = command.path;
+	JaydMetadata::Track candidateTrack{};
+	DjTrackMetadataSnapshot candidateMetadata{};
+	DjGridAnchor candidateAnchors[DJ_GRID_ANCHOR_CAPACITY];
+	uint16_t candidateAnchorCount = 0;
+	if(identityLoad){
+		if(!resolveIdentityLoad(command, resolvedPath, sizeof(resolvedPath), candidateTrack, candidateMetadata,
+								 candidateAnchors, candidateAnchorCount)){
+			error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
+			return false;
+		}
+		loadPath = resolvedPath;
+	}
+
+	fs::File file = SD.open(loadPath);
 	if(!file){
 		error = DJ_COMMAND_ERROR_OPEN_FAILED;
 		return false;
 	}
 
-	JaydMetadata::Track candidateTrack{};
-	DjTrackMetadataSnapshot candidateMetadata{};
 	metadataMutex.lock();
-	resolveMetadata(
-		command.path,
-		command.libraryGeneration,
-		command.libraryKey,
-		&command.trackIdentity,
-		candidateTrack,
-		candidateMetadata
-	);
+	if(identityLoad){
+		// resolveIdentityLoad() above already resolved AND validated this
+		// exact fingerprint's full metadata entirely from RAM (see its
+		// doc comment) - calling resolveMetadata() here would reintroduce
+		// the very metadataReader.trackByPath()/readStringHash()/grid-
+		// and-phrase-scan calls this path exists to eliminate. One last
+		// cheap (lock-only, zero reader calls) re-check that nothing
+		// moved in the window between that resolution and this commit
+		// point, mirroring every other identity-load re-check in this
+		// function:
+		if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+		   command.libraryGeneration != libraryGeneration ||
+		   command.libraryKey != libraryKey ||
+		   command.metadataRevision != metadataRevision){
+			candidateMetadata.state = DJ_METADATA_STALE;
+		}
+	}else{
+		resolveMetadata(
+			loadPath,
+			command.libraryGeneration,
+			command.libraryKey,
+			&command.trackIdentity,
+			candidateTrack,
+			candidateMetadata
+		);
+	}
+	// Identity-only loads get one extra guard ordinary path-based loads
+	// deliberately don't (an unindexed/loose file is a legitimate
+	// path-based load): resolveIdentityLoad() above already matched this
+	// exact fingerprint against the live candidate table, so if this
+	// independent second check now reports anything other than
+	// DJ_METADATA_VALID - stale or otherwise - Auto DJ must never
+	// silently load the file anyway; hard-reject instead.
+	if(identityLoad && candidateMetadata.state != DJ_METADATA_VALID){
+		metadataMutex.unlock();
+		file.close();
+		error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
+		return false;
+	}
 
 	const bool hadLeft = hasDeck(0);
 	const bool hadRight = hasDeck(1);
@@ -1136,7 +1907,7 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	}
 
 	files[command.deck] = file;
-	memcpy(paths[command.deck], command.path, strlen(command.path) + 1);
+	memcpy(paths[command.deck], loadPath, strlen(loadPath) + 1);
 	metadataTracks[command.deck] = candidateTrack;
 	deckMetadata[command.deck].commitIfLoaded(
 		candidateMetadata,
@@ -1148,9 +1919,16 @@ bool DjSession::applyLoad(const DjCommand& command, DjCommandError& error){
 	// Successful hot-load: old loop bounds/anchors belonged to the previous
 	// track and are meaningless now, so always clear and rebuild from
 	// scratch. A failed load (handled above, before this point) leaves both
-	// untouched.
+	// untouched. Identity (Auto DJ) loads install the anchor cache
+	// resolveIdentityLoad() already resolved from RAM above - zero
+	// metadataReader.readGrid() calls here. Manual path-based loads still
+	// call buildGrid(), which is allowed to hit SD for an explicit load.
 	loopEngines[command.deck].disengage();
-	buildGrid(command.deck);
+	if(identityLoad){
+		installCachedGrid(command.deck, candidateAnchors, candidateAnchorCount, candidateMetadata);
+	}else{
+		buildGrid(command.deck);
+	}
 	cues.clearDeck(command.deck);
 
 	system->setVolume(command.deck, gains[command.deck]);
@@ -1223,6 +2001,21 @@ bool DjSession::buildGrid(uint8_t deck){
 	metadataMutex.unlock();
 
 	if(anchorCount == 0) return false;
+	return grids[deck].build(metadata.sourceSampleRate, metadata.bpmMilli,
+							  metadata.sourceDurationFrames, anchors, anchorCount);
+}
+
+// Stable-ID load counterpart to buildGrid(): installs a DjBeatGrid directly
+// from an anchor cache the caller already resolved entirely from RAM (see
+// resolveIdentityLoad()/DjAssistLibraryEntry::gridAnchors) - zero
+// metadataReader/SD calls here or in the caller. anchorCount == 0 (no usable
+// grid, same gate buildGrid() applies) leaves grids[deck] reset/invalid,
+// exactly like buildGrid() returning false.
+bool DjSession::installCachedGrid(uint8_t deck, const DjGridAnchor* anchors, uint16_t anchorCount,
+								   const DjTrackMetadataSnapshot& metadata){
+	if(deck >= DJ_DECK_COUNT) return false;
+	grids[deck].reset();
+	if(anchorCount == 0 || anchors == nullptr) return false;
 	return grids[deck].build(metadata.sourceSampleRate, metadata.bpmMilli,
 							  metadata.sourceDurationFrames, anchors, anchorCount);
 }

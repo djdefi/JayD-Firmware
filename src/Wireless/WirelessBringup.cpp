@@ -44,6 +44,9 @@ constexpr size_t STATE_RESULT_BUDGET = 120 + sizeof(DjCommandResult::clientComma
 constexpr size_t STATE_ASSIST_HEADER_BUDGET = 260;
 constexpr size_t STATE_SUGGESTION_BUDGET = 190;
 constexpr size_t STATE_PLAN_BUDGET = 165;
+// appendAutoDjState()'s entire block is a handful of short fixed enum
+// names plus two small integers - generously padded, not byte-exact.
+constexpr size_t STATE_AUTODJ_BUDGET = 110;
 // handleState() only ever emits this many recent_results entries - it
 // filters snapshot.recentResults[] (sized DJ_RECENT_RESULT_COUNT, which
 // is larger under JAYD_ENABLE_WIRELESS to hold in-flight command
@@ -59,7 +62,8 @@ constexpr size_t STATE_WORST_CASE =
 	STATE_RESULT_BUDGET * STATE_MAX_EMITTED_RESULTS +
 	STATE_ASSIST_HEADER_BUDGET +
 	STATE_SUGGESTION_BUDGET * DJ_ASSIST_MAX_SUGGESTIONS +
-	STATE_PLAN_BUDGET;
+	STATE_PLAN_BUDGET +
+	STATE_AUTODJ_BUDGET;
 static_assert(
 	STATE_WORST_CASE < MAX_RESPONSE,
 	"MAX_RESPONSE is smaller than the conservative worst-case /api/v2/state body - bump MAX_RESPONSE"
@@ -396,6 +400,14 @@ const char* commandErrorName(DjCommandError error){
 		case DJ_COMMAND_ERROR_CLIENT_ID_REQUIRED: return "client_id_required";
 		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "assist_rejected";
 		case DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING: return "assist_override_pending";
+		case DJ_COMMAND_ERROR_AUTODJ_REJECTED: return "autodj_rejected";
+		case DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED: return "library_identity_unresolved";
+		// Browser guidance: arm/resume needs an actual on-device physical
+		// hold gesture - authenticated/leased alone is never sufficient
+		// (see DjSession::apply()'s AUTODJ_ARM/AUTODJ_RESUME cases). Retry
+		// after a physical confirm, or use pause/stop/reset instead, which
+		// remain available remotely.
+		case DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED: return "autodj_physical_confirm_required";
 		default: return "invalid_value";
 	}
 }
@@ -464,6 +476,31 @@ const char* assistTransitionFailureName(DjAssistTransitionFailure failure){
 		case DJ_ASSIST_FAIL_TARGET_NOT_LOADED: return "target_not_loaded";
 		case DJ_ASSIST_FAIL_TARGET_CHANGED: return "target_changed";
 		case DJ_ASSIST_FAIL_CANCELLED: return "cancelled";
+		default: return "none";
+	}
+}
+
+const char* autoDjStateName(AutoDjState state){
+	switch(state){
+		case AutoDjState::Off: return "off";
+		case AutoDjState::Armed: return "armed";
+		case AutoDjState::Running: return "running";
+		case AutoDjState::Paused: return "paused";
+		case AutoDjState::Stopping: return "stopping";
+		case AutoDjState::Complete: return "complete";
+		case AutoDjState::Failed: return "failed";
+		default: return "off";
+	}
+}
+
+const char* autoDjFailReasonName(AutoDjFailReason reason){
+	switch(reason){
+		case AutoDjFailReason::None: return "none";
+		case AutoDjFailReason::CapabilityDisabled: return "capability_disabled";
+		case AutoDjFailReason::RetryBudgetExhausted: return "retry_budget_exhausted";
+		case AutoDjFailReason::RecordingFailure: return "recording_failure";
+		case AutoDjFailReason::TeardownTimeout: return "teardown_timeout";
+		case AutoDjFailReason::AuthorityUnavailable: return "authority_unavailable";
 		default: return "none";
 	}
 }
@@ -559,6 +596,12 @@ bool copyAssistSnapshot(DjAssistSnapshot& snapshot){
 	DjSession* session = DjSession::get();
 	if(!session) return false;
 	return session->copyAssistSnapshot(snapshot);
+}
+
+void copyAutoDjSnapshot(AutoDjSnapshot& snapshot){
+	DjSession* session = DjSession::get();
+	if(!session) return;
+	session->copyAutoDjSnapshot(snapshot);
 }
 
 void sendCommandResult(const DjSubmitResult& result, const char* clientCommandId){
@@ -713,7 +756,9 @@ void handleCapabilities(){
 		"{\"api\":\"v2\",\"transport\":\"http_serial\","
 		"\"actions\":[\"set_playing\",\"seek\",\"set_gain\",\"set_mix\","
 		"\"set_effect_type\",\"set_effect_intensity\",\"set_recording\","
-		"\"assist_set_mode\",\"assist_arm_transition\",\"assist_cancel_transition\"],"
+		"\"assist_set_mode\",\"assist_arm_transition\",\"assist_cancel_transition\","
+		"\"autodj_arm\",\"autodj_start\",\"autodj_pause\",\"autodj_resume\","
+		"\"autodj_stop\",\"autodj_reset\"],"
 		"\"load_by_path\":false,\"writer_lease_ms\":15000,\"pairing_window_ms\":60000,"
 		"\"request_body_max\":512,\"response_max\":%zu,\"handler_budget_ms\":50,"
 		"\"poll\":{\"active_ms\":1000,\"idle_ms\":3000,\"hidden_ms\":5000},"
@@ -806,6 +851,24 @@ void appendAssistState(JsonWriter& writer){
 	);
 }
 
+// Appends the bounded Auto DJ block to the /api/v2/state payload. Mirrors
+// appendAssistState() exactly: a single already-computed AutoDjSnapshot
+// copy (DjSession::copyAutoDjSnapshot(), no re-scan/re-plan/file I/O), and
+// only the compact state/reason wire names + two small bounded counters -
+// never a full queue/history dump (queue entries carry no path/string the
+// browser is allowed to see; stable identity only, never exposed either).
+void appendAutoDjState(JsonWriter& writer){
+	AutoDjSnapshot autoDj;
+	copyAutoDjSnapshot(autoDj);
+	writer.append(
+		"\"autodj\":{\"state\":\"%s\",\"fail_reason\":\"%s\",\"queue_depth\":%u,\"history_size\":%u}",
+		autoDjStateName(autoDj.state),
+		autoDjFailReasonName(autoDj.failReason),
+		static_cast<unsigned>(autoDj.queueDepth),
+		static_cast<unsigned>(autoDj.historySize)
+	);
+}
+
 void handleState(){
 	char clientId[WirelessApi::CLIENT_ID_CAPACITY] = {};
 	if(!authorize(false, clientId)) return;
@@ -882,6 +945,8 @@ void handleState(){
 	}
 	writer.append("],");
 	appendAssistState(writer);
+	writer.append(",");
+	appendAutoDjState(writer);
 	writer.append("}");
 	if(!writer.valid()){
 		sendError(500, "response_too_large");
@@ -1074,6 +1139,24 @@ void handleCommand(){
 				}
 			}
 		}
+	}else if(strcmp(action, "autodj_arm") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_ARM;
+	}else if(strcmp(action, "autodj_start") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_START;
+	}else if(strcmp(action, "autodj_pause") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_PAUSE;
+	}else if(strcmp(action, "autodj_resume") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_RESUME;
+	}else if(strcmp(action, "autodj_stop") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_STOP;
+	}else if(strcmp(action, "autodj_reset") == 0){
+		expectedFields = 4;
+		command.type = DJ_COMMAND_AUTODJ_RESET;
 	}else{
 		expectedFields = 6;
 		if(!parseUint8(object, "deck", command.deck)) expectedFields = 0;

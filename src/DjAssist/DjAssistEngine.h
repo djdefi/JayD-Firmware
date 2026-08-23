@@ -49,7 +49,12 @@ public:
 	// confirmation; it never fires implicitly from suggestions/coach advice.
 	// Fails (returns false, mode unchanged) when the target isn't loaded,
 	// the source deck isn't playing, recording/looping conflicts exist, or
-	// arguments are invalid.
+	// arguments are invalid. autoDjOwned is true only when Auto DJ (not a
+	// direct user Coach gesture) is the one arming this transition; it is
+	// stamped onto the plan and every one of its steps (see
+	// DjAssistTransitionPlan::autoDjOwned) so a manual takeover's
+	// removeAutoDjOwned() purge can find and drop Coach's own resulting
+	// internal commands too, not just Auto's load/arm commands.
 	bool armTransition(
 		uint8_t fromDeck,
 		uint8_t toDeck,
@@ -58,7 +63,8 @@ public:
 		uint8_t crossfadeBeats,
 		bool startAtBoundary,
 		bool tempoLock,
-		const DjAssistGuardSnapshot& guard
+		const DjAssistGuardSnapshot& guard,
+		bool autoDjOwned = false
 	);
 
 	// Advances the running transition by at most one bounded unit of work

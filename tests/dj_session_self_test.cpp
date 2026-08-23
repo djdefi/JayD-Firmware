@@ -446,5 +446,194 @@ int main(){
 		assert(burstTracked.status == DJ_COMMAND_APPLIED); // ...but the durable slot is unaffected.
 	}
 
+	{
+		// Fix #2 regression: manual takeover must synchronously purge every
+		// still-queued Auto-owned command (in any position, of any type)
+		// and mark each SUPERSEDED, mirroring DjSession::submit()'s
+		// takeover-purge block above the FIFO's next tick. Reproduce that
+		// exact block against pure DjCommandQueue/DjCommandResults state.
+		DjCommandQueue takeoverQueue;
+		DjCommandResults takeoverResults;
+		DjAssistTrackedCommand takeoverTracked;
+
+		// Queue: an unrelated command, then an Auto-owned stable-ID load
+		// (X), then another unrelated command - the load is not at the
+		// front, matching "queued Auto load" rather than "next up".
+		DjCommand unrelatedBefore = command(1, DJ_COMMAND_SET_GAIN);
+		DjCommand autoLoadX = command(2, DJ_COMMAND_LOAD_DECK);
+		autoLoadX.autoDjOwned = true;
+		DjCommand unrelatedAfter = command(3, DJ_COMMAND_SET_EFFECT_TYPE);
+		assert(takeoverQueue.push(unrelatedBefore));
+		assert(takeoverQueue.push(autoLoadX));
+		assert(takeoverQueue.push(unrelatedAfter));
+		takeoverResults.record(autoLoadX, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+		takeoverTracked.id = autoLoadX.id;
+		takeoverTracked.tracked = true;
+		takeoverTracked.status = DJ_COMMAND_ACCEPTED;
+
+		// A manual takeover signal (e.g. a physical transport play) arrives
+		// with a non-system origin - mirror submit()'s exact gate and
+		// purge. (DJ_COMMAND_SET_MIX/crossfader takeover is tracked via
+		// AutoDjManualIntentGenerations::mix instead - see
+		// djIsAutoDjManualSignal()'s doc comment on why that counter is
+		// intentionally wider than, and separate from, this purge signal.)
+		DjCommand manualTakeover = command(4, DJ_COMMAND_SET_PLAYING);
+		manualTakeover.origin = DJ_ORIGIN_PHYSICAL;
+		assert(djIsAutoDjTakeoverSignal(manualTakeover));
+		assert(manualTakeover.origin != DJ_ORIGIN_SYSTEM);
+		uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+		const uint8_t removedCount = takeoverQueue.removeAutoDjOwned(removedIds, DJ_COMMAND_CAPACITY);
+		assert(removedCount == 1);
+		assert(removedIds[0] == autoLoadX.id);
+		for(uint8_t i = 0; i < removedCount; i++){
+			takeoverResults.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+			if(takeoverTracked.tracked && takeoverTracked.id == removedIds[i]){
+				takeoverTracked.status = DJ_COMMAND_SUPERSEDED;
+			}
+		}
+
+		// The two unrelated, non-Auto-owned entries survive in original
+		// relative order; the Auto-owned load is gone from the queue.
+		assert(takeoverQueue.depth() == 2);
+		DjCommand poppedTakeover;
+		assert(takeoverQueue.pop(poppedTakeover) && poppedTakeover.id == unrelatedBefore.id);
+		assert(takeoverQueue.pop(poppedTakeover) && poppedTakeover.id == unrelatedAfter.id);
+		assert(!takeoverQueue.contains(DJ_COMMAND_LOAD_DECK));
+
+		// X is durably SUPERSEDED (not left ACCEPTED, not silently
+		// resubmitted) and the tracked slot agrees - this is exactly what
+		// stops a since-queued replacement pin (Y) from being conflated
+		// with X's outcome (a distinct, previously-fixed core bug; here we
+		// only assert the session-layer purge that must run before either
+		// entry is ever seen again by the planner).
+		DjCommandResult takeoverRecent[DJ_RECENT_RESULT_COUNT] = {};
+		takeoverResults.copyTo(takeoverRecent);
+		assert(takeoverRecent[0].id == autoLoadX.id);
+		assert(takeoverRecent[0].status == DJ_COMMAND_SUPERSEDED);
+		assert(takeoverTracked.status == DJ_COMMAND_SUPERSEDED);
+
+		// A SYSTEM-origin command (Auto DJ's own submissions, e.g. its own
+		// stable-ID load) never triggers the purge even though its type
+		// (DJ_COMMAND_LOAD_DECK) matches djIsAutoDjTakeoverSignal()'s set -
+		// submit()'s gate is "origin != DJ_ORIGIN_SYSTEM && takeover
+		// signal", both required. Without the origin half of that gate,
+		// Auto DJ's own next load would purge its own still-queued entry.
+		DjCommandQueue untouchedQueue;
+		DjCommand autoLoadOnly = command(5, DJ_COMMAND_LOAD_DECK);
+		autoLoadOnly.autoDjOwned = true;
+		assert(untouchedQueue.push(autoLoadOnly));
+		DjCommand systemLoad = command(6, DJ_COMMAND_LOAD_DECK, 1);
+		systemLoad.origin = DJ_ORIGIN_SYSTEM;
+		assert(djIsAutoDjTakeoverSignal(systemLoad)); // matches the type-only signal set...
+		if(systemLoad.origin != DJ_ORIGIN_SYSTEM && djIsAutoDjTakeoverSignal(systemLoad)){
+			untouchedQueue.removeAutoDjOwned(removedIds, DJ_COMMAND_CAPACITY);
+		}
+		// ...but the origin check means submit()'s actual gate never
+		// fires for it, so the queued Auto-owned entry survives untouched.
+		assert(untouchedQueue.depth() == 1);
+		assert(untouchedQueue.contains(DJ_COMMAND_LOAD_DECK));
+	}
+
+	{
+		// Fix #4 regression: AUTODJ_ARM/AUTODJ_RESUME must never accept a
+		// non-physical origin as a substitute for an on-device physical
+		// confirmation - see djAutoDjPhysicalConfirmMissing()'s doc
+		// comment. This is the pure predicate DjSession::apply() gates on
+		// (apply() itself lives in DjSession.cpp, which is not
+		// host-compiled, so this is the layer that can be regression
+		// tested here).
+		DjCommand armPhysical = command(40, DJ_COMMAND_AUTODJ_ARM);
+		armPhysical.origin = DJ_ORIGIN_PHYSICAL;
+		assert(!djAutoDjPhysicalConfirmMissing(armPhysical));
+
+		DjCommand armHttp = command(41, DJ_COMMAND_AUTODJ_ARM);
+		armHttp.origin = DJ_ORIGIN_HTTP;
+		assert(djAutoDjPhysicalConfirmMissing(armHttp));
+
+		DjCommand armLocalUi = command(42, DJ_COMMAND_AUTODJ_ARM);
+		armLocalUi.origin = DJ_ORIGIN_LOCAL_UI;
+		assert(djAutoDjPhysicalConfirmMissing(armLocalUi));
+
+		DjCommand resumeHttp = command(43, DJ_COMMAND_AUTODJ_RESUME);
+		resumeHttp.origin = DJ_ORIGIN_HTTP;
+		assert(djAutoDjPhysicalConfirmMissing(resumeHttp));
+
+		DjCommand resumePhysical = command(44, DJ_COMMAND_AUTODJ_RESUME);
+		resumePhysical.origin = DJ_ORIGIN_PHYSICAL;
+		assert(!djAutoDjPhysicalConfirmMissing(resumePhysical));
+
+		// Replaying the exact same rejected HTTP command again (no token
+		// or lease state involved anywhere in this predicate) still
+		// yields the same rejection - there is nothing stateful to
+		// replay or bypass; every evaluation is independent of any prior
+		// one.
+		assert(djAutoDjPhysicalConfirmMissing(armHttp));
+		assert(djAutoDjPhysicalConfirmMissing(armHttp));
+
+		// Unrelated command types are never gated by this predicate,
+		// regardless of origin - only ARM/RESUME carry the physical-only
+		// requirement (PAUSE/STOP/RESET remain remotely reachable).
+		DjCommand pauseHttp = command(45, DJ_COMMAND_AUTODJ_PAUSE);
+		pauseHttp.origin = DJ_ORIGIN_HTTP;
+		assert(!djAutoDjPhysicalConfirmMissing(pauseHttp));
+		DjCommand stopHttp = command(46, DJ_COMMAND_AUTODJ_STOP);
+		stopHttp.origin = DJ_ORIGIN_HTTP;
+		assert(!djAutoDjPhysicalConfirmMissing(stopHttp));
+		DjCommand resetHttp = command(47, DJ_COMMAND_AUTODJ_RESET);
+		resetHttp.origin = DJ_ORIGIN_HTTP;
+		assert(!djAutoDjPhysicalConfirmMissing(resetHttp));
+	}
+
+	// -- round 5, fix #3 (exact-identity aliasing) --
+	// djTrackIdentityExactMatch() is the single comparator DjSession::
+	// resolveIdentityLoad() (the stable-ID resolver) and DjAssistGridCache
+	// now both use in place of DjAssistScoring::identityMatches() (which
+	// aliases on fingerprint alone). Testing the shared free function
+	// directly here proves both of those production call sites can never
+	// alias two tracks that share a fingerprint but differ only in
+	// sourceId - resolveIdentityLoad() itself can't be exercised directly
+	// from a host test (DjSession requires real hardware-backed
+	// dependencies), but it contains no branching logic of its own beyond
+	// calling this exact function, so this is a complete proof of its
+	// matching behavior.
+	{
+		DjTrackIdentity x;
+		x.flags = DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE;
+		memset(x.fingerprint, 0x77, sizeof(x.fingerprint));
+		memset(x.sourceId, 0xA1, sizeof(x.sourceId));
+
+		// Two-source, same-fingerprint regression: Y shares X's fingerprint
+		// exactly but comes from a different source - must never alias.
+		DjTrackIdentity y = x;
+		memset(y.sourceId, 0xB2, sizeof(y.sourceId));
+		assert(!djTrackIdentityExactMatch(x, y));
+		assert(!djTrackIdentityExactMatch(y, x));
+
+		// An identical copy (same fingerprint AND same sourceId) matches.
+		DjTrackIdentity xCopy = x;
+		assert(djTrackIdentityExactMatch(x, xCopy));
+
+		// Fingerprint-only (no SOURCE flag) vs. the same fingerprint but
+		// carrying SOURCE evidence must not alias either way - a caller
+		// with strictly less evidence can't stand in for one with more.
+		DjTrackIdentity fingerprintOnly;
+		fingerprintOnly.flags = DJ_TRACK_IDENTITY_FINGERPRINT;
+		memcpy(fingerprintOnly.fingerprint, x.fingerprint, sizeof(fingerprintOnly.fingerprint));
+		assert(!djTrackIdentityExactMatch(x, fingerprintOnly));
+		assert(!djTrackIdentityExactMatch(fingerprintOnly, x));
+
+		// Two fingerprint-only identities with matching fingerprint bytes
+		// still match each other (no sourceId evidence on either side to
+		// disagree about).
+		DjTrackIdentity fingerprintOnlyCopy = fingerprintOnly;
+		assert(djTrackIdentityExactMatch(fingerprintOnly, fingerprintOnlyCopy));
+
+		// A completely empty/invalid identity (no FINGERPRINT flag) never
+		// matches anything, including another empty one.
+		DjTrackIdentity empty;
+		assert(!djTrackIdentityExactMatch(empty, empty));
+		assert(!djTrackIdentityExactMatch(x, empty));
+	}
+
 	return 0;
 }

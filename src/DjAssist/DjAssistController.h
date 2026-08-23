@@ -3,6 +3,7 @@
 
 #include "DjAssistEngine.h"
 #include "DjAssistFillWorker.h"
+#include "DjAssistGridCache.h"
 #include "DjAssistSessionBridge.h"
 #include "DjAssistSessionPort.h"
 
@@ -68,7 +69,11 @@ public:
 
 	// This call *is* the explicit user confirmation (mirrors
 	// DjAssistEngine::armTransition()); builds the guard snapshot itself
-	// from DjSession's current published state.
+	// from DjSession's current published state. autoDjOwned true means
+	// Auto DJ (not a direct user Coach gesture) is arming this transition;
+	// forwarded to DjAssistEngine::armTransition() so it is stamped onto
+	// the plan/steps for DjAssistSessionActuator to tag its resulting
+	// commands with (see DjAssistTransitionStep::autoDjOwned).
 	bool armTransition(
 		uint8_t fromDeck,
 		uint8_t toDeck,
@@ -76,11 +81,83 @@ public:
 		const DjTrackIdentity& targetIdentity,
 		uint8_t crossfadeBeats,
 		bool startAtBoundary,
-		bool tempoLock
+		bool tempoLock,
+		bool autoDjOwned = false
 	);
 	void cancelTransition();
 
 	void copySnapshot(DjAssistSnapshot& snapshot) const;
+
+	// True once any previously-FAILED transition has fully settled - i.e.
+	// either the engine was never in DJ_ASSIST_MODE_TRANSITION_FAILED at
+	// all, or tickRollback() has finished undoing that plan's mutations
+	// (rollbackPhase_ reached DJ_ASSIST_ROLLBACK_DONE). armTransition()
+	// itself refuses to arm a fresh transition while this is false (see
+	// its definition) - this accessor exposes the same check to callers
+	// (AutoDjSessionActuator's composite workflow, via AutoDjSessionPort::
+	// autoDjCoachTransitionSettled()) that must not treat a transition as
+	// terminally Failed - and thus retry/re-arm - until rollback is
+	// actually done, not merely started.
+	bool rollbackSettled() const;
+
+	// True only while the stable-ID candidate authority this controller
+	// backs is actually functional: the candidate table was successfully
+	// allocated (ps_malloc didn't fail - see allocationFailed_) AND the
+	// background fill worker that populates it is actually running (see
+	// DjAssistFillWorker::launched()/exited()). Both failure modes are
+	// silent otherwise - begin() simply leaves entries_ null or the table
+	// permanently empty rather than crashing - so without this check a
+	// caller has no way to distinguish "authority is real but empty right
+	// now" from "authority can never produce a candidate no matter how
+	// long it waits". AutoDjSessionActuator::hasStableIdEndpoint() (via
+	// AutoDjSessionPort) uses this as the live signal behind the
+	// capability it advertises, checked on every call rather than cached
+	// once at begin() time - a launched() worker that later reports
+	// exited() (stopped/crashed after launch) degrades this back to false
+	// immediately, so Auto DJ's capability check (arm()/start() admission
+	// and the ongoing tick() loop) sees the same live truth an in-flight
+	// attempt would need to safely pause/fail on, rather than continuing
+	// to believe a capability that can no longer produce anything.
+	// entries_ being ps_malloc'd successfully but the fill worker having
+	// failed to launch (or having since exited) both correctly report
+	// false: neither one can ever fill the table going forward.
+	bool authorityReady() const{
+		return !allocationFailed_ && entries_ != nullptr && fillWorker_.launched() && !fillWorker_.exited();
+	}
+
+	// Bounded, RAM-only read of the background-filled candidate table
+	// (see fillWorkerStep()) - NEVER touches the metadata reader/SD card
+	// itself, unlike assistTrackEntry()/DjSession's old direct-reader
+	// candidate path. This is the shared, already-safe candidate
+	// authority both Coach's own tickSuggestions() and Auto DJ's
+	// stepScan() read from; Auto DJ must use these two accessors (via
+	// AutoDjSessionPort) instead of ever calling into the reader itself.
+	// candidateCount() returns the currently fully-filled entry total (0
+	// while a fill for the live generation is still in progress - see
+	// entryTotal_'s own doc comment) and candidateEntry() rejects any
+	// index at or beyond that bound. outRevision reports the exact fill
+	// generation (loadedGeneration_) the returned entry was filled under,
+	// captured under the same lock as the entry read - mirrors
+	// assistTrackEntry()'s single-critical-section discipline.
+	uint32_t candidateCount();
+	bool candidateEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision);
+
+	// Bounded, few-slot on-demand grid-anchor hydration cache (see
+	// DjAssistGridCache/DjAssistGridCacheSlot's doc comments) - the PSRAM-
+	// budget-safe replacement for the old per-candidate-entry gridAnchors[]
+	// array. requestGridHydration() is called by AutoDjSessionActuator (via
+	// DjSession::loadDeckByIdentity()) at the moment a stable-ID load is
+	// submitted; the background fill worker resolves at most one pending
+	// request per stepGridHydration() call (never blocking, never gating
+	// the main candidate-table fill progress). gridAnchorsFor() is the
+	// read-only, RAM-only lookup DjSession::resolveIdentityLoad() uses at
+	// apply time - a miss (never requested, still pending, evicted, or a
+	// stale-key result) is always safe to treat as "no usable grid".
+	void requestGridHydration(uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity);
+	bool gridAnchorsFor(
+		uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity,
+		DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+	);
 
 private:
 	// Host integration harness only - grants access to the private
@@ -88,6 +165,14 @@ private:
 	// so it can drive the exact real controller logic deterministically;
 	// it adds no production API surface and changes no behavior.
 	friend class DjAssistIntegrationSelfCheck;
+	// Same grant, for the separate Auto DJ + Coach composite-workflow host
+	// harness (tests/auto_dj_coach_integration_selfcheck.cpp), which needs
+	// to drive fillWorkerStep() directly to prove its production
+	// requestGridHydration() call (from autoDjLoadDeckByIdentity(), see
+	// that file's FakePort) actually resolves end-to-end - that harness
+	// has no other access to DjAssistIntegrationSelfCheck's own TU-local
+	// helper class.
+	friend class AutoDjCoachGridHydrationHarness;
 
 	DjAssistSessionPort* session_ = nullptr;
 	DjAssistEngine engine_;
@@ -111,6 +196,13 @@ private:
 	bool generationSeen_ = false;
 	uint16_t fillCursor_ = 0;
 	bool fillComplete_ = false;
+
+	// Few-slot, few-KiB, non-ps_malloc'd on-demand grid-anchor hydration
+	// cache (see DjAssistGridCache.h) - protected by the same
+	// candidateMutex_ as entries_[]/entryTotal_ above, since
+	// stepGridHydration() needs to scan entries_[] for the requested
+	// identity's libraryIndex.
+	DjAssistGridCache gridCache_;
 
 	// Main-thread-only mirror of the fill generation, used solely to
 	// notice (once per tick, via a single locked read) when a NEW
@@ -174,6 +266,7 @@ private:
 
 	static void fillWorkerStepTrampoline(void* self);
 	void fillWorkerStep();
+	void stepGridHydration();
 	bool candidateTableReady(uint32_t& outGeneration);
 	void updateRecentTracks(const DjSnapshot& snapshot);
 	DjAssistGuardSnapshot buildGuard(const DjSnapshot& snapshot) const;

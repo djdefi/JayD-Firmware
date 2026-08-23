@@ -1,0 +1,212 @@
+#ifndef JAYD_FIRMWARE_DJ_AUTO_DJ_TYPES_H
+#define JAYD_FIRMWARE_DJ_AUTO_DJ_TYPES_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+// Dependency-free POD types shared by the Auto DJ planning layer
+// (DjAutoDjQueue / DjAutoDjHistory / DjAutoDjStateMachine / DjAutoDjPlanner).
+//
+// This intentionally does NOT #include DjSession/DjSessionState.h or
+// LibraryIndex.h: those live on the in-progress Coach branch and are still
+// changing. AutoDjIdentity mirrors the shape of DjTrackIdentity (flags +
+// fingerprint) plus a library generation so the two can be reconciled with a
+// small adapter once the Coach branch lands, instead of duplicated forever.
+
+static constexpr uint8_t AUTO_DJ_QUEUE_CAPACITY = 32;
+static constexpr uint8_t AUTO_DJ_HISTORY_CAPACITY = 24;
+static constexpr uint8_t AUTO_DJ_RETRY_BUDGET = 2; // retries allowed after the first attempt
+// One full attempt-cycle's wall-clock budget, enforced solely by
+// DjAutoDjPlanner::progressPending()/resolvePendingWhileStopping() around
+// AutoDjLoadPort::pollLoad(), measured against AutoDjLoadPort::nowMicros()
+// rather than a DjSession::loop() tick count. Originally sized (as a tick
+// count) for a bare stable-ID deck load only; since the composite-workflow
+// integration (RAM stable-ID resolve -> load submit -> load applied ->
+// internal Auto-owned Coach arm -> poll Coach through boundary/start/sync/
+// crossfade/stop/rollback -> only then Applied), pollLoad() does not report
+// Applied until that entire sequence finishes, so this single budget must
+// cover the worst case of all of it, not just the load. A tick count is the
+// wrong unit for that: real DjSession::loop() throughput varies with audio-
+// callback scheduling, so a fixed tick budget does not bound a fixed
+// wall-clock duration. 150 wall-clock seconds is comfortably above even a
+// slow-tempo (e.g. 70 BPM) worst-case phrase-boundary wait (~32 beats,
+// ~27s) plus a 32-beat crossfade (~27s) plus load I/O.
+static constexpr uint64_t AUTO_DJ_LOAD_TIMEOUT_US = 150000000ULL; // 150s
+// Bounded budget for the Teardown sub-phase specifically (waiting for
+// Coach's own rollback - mix/sync/stop-deck restore - to actually settle
+// after a failed/cancelled transition; see AutoDjSessionActuator's
+// AutoDjLoadSubPhase::Teardown and AutoDjLoadOutcome::Settling doc
+// comments). Deliberately separate from, and much shorter than,
+// AUTO_DJ_LOAD_TIMEOUT_US: that outer budget covers an entire composite
+// load->arm->transition attempt and may already be mostly consumed by the
+// time a transition fails and rollback begins, so it cannot be relied on to
+// bound this specific wait - a Teardown that outlives ITS OWN deadline must
+// resolve deterministically (AutoDjLoadOutcome::FailedTerminal) regardless
+// of how much of the outer budget happens to remain. Coach's own rollback
+// is at most 3 short commands (mix/sync/stop-deck), so a generous few
+// seconds is more than sufficient without masking a genuinely stuck
+// rollback for long.
+static constexpr uint64_t AUTO_DJ_TEARDOWN_TIMEOUT_US = 10000000ULL; // 10s
+static constexpr uint8_t AUTO_DJ_DEFAULT_RECENT_EXCLUSION = 8;
+static constexpr uint8_t AUTO_DJ_DEFAULT_ARTIST_EXCLUSION = 4;
+static constexpr uint8_t AUTO_DJ_DEFAULT_TITLE_EXCLUSION = 6;
+
+// Wraparound-safe "has the deadline passed" check, shared by every
+// wall-clock deadline in this layer (DjAutoDjPlanner's composite-attempt
+// budget, AutoDjSessionActuator's Teardown budget): computing the
+// difference as an unsigned 64-bit subtraction and comparing it against
+// half the value range tolerates a nowMicros() implementation that wraps
+// (e.g. widening a real 32-bit micros() read), so every caller gets
+// identical, single-source-of-truth wraparound handling rather than each
+// reimplementing (and potentially disagreeing on) the same check.
+static inline bool djAutoDjDeadlinePassed(uint64_t now, uint64_t deadline){
+	return (now - deadline) < (UINT64_C(1) << 63);
+}
+
+enum AutoDjIdentityFlag : uint8_t {
+	AUTO_DJ_IDENTITY_FINGERPRINT = 1 << 0,
+	AUTO_DJ_IDENTITY_SOURCE = 1 << 1
+};
+
+// A stable library identity for a single track. The planner and queue must
+// only ever address tracks through this triple (generation + fingerprint) -
+// never a raw filesystem path, so a queued entry can always be re-validated
+// or safely dropped if the library re-indexes underneath it.
+struct AutoDjIdentity {
+	uint8_t flags = 0;
+	uint32_t libraryGeneration = 0;
+	uint8_t fingerprint[16] = {};
+	// Mirrors DjTrackIdentity::sourceId exactly (same 16 bytes, same
+	// AUTO_DJ_IDENTITY_SOURCE/DJ_TRACK_IDENTITY_SOURCE flag gating). Without
+	// this field, a round trip through AutoDjIdentity silently zeroed
+	// sourceId while still carrying the SOURCE flag - a review-flagged bug:
+	// DjSession::resolveMetadata() passes trackByPath() a non-null zeroed
+	// sourceId whenever the flag is set, and trackByPath() then requires an
+	// exact match against the real (nonzero) on-disk sourceId, so every
+	// nonzero-source track failed resolution and exhausted its retry budget.
+	// Carried end-to-end: candidate table entry -> AutoDjCandidate ->
+	// queue/history entry -> submitLoad()'s DjTrackIdentity -> resolveMetadata().
+	uint8_t sourceId[16] = {};
+	// Independent epoch from libraryGeneration: bumped on any metadata
+	// content replacement even when the external library generation is
+	// unchanged (e.g. a same-generation sidecar re-tag) - mirrors
+	// DjSession::assistMetadataRevision()'s doc comment exactly. A queued/
+	// pending candidate whose revision no longer matches live must be
+	// invalidated the same way a generation change already invalidates it
+	// (see DjAutoDjQueue::invalidateRevision()); 0 is a valid initial value
+	// (matches an unstarted revision counter), never treated as "unknown".
+	uint32_t metadataRevision = 0;
+
+	bool valid() const{
+		return flags != 0;
+	}
+
+	// Exact stable-identity comparator: requires EVERY present component
+	// to match, not fingerprint alone. Two tracks that share a fingerprint
+	// but differ only in sourceId (the exact review-flagged alias: the
+	// old fingerprint-only check let a same-fingerprint-different-source
+	// candidate be silently treated as "already queued"/"recently played",
+	// so it could never itself be queued, or - via the equivalent
+	// DjTrackIdentity-level bug this mirrors, see djTrackIdentityExactMatch
+	// in DjSessionState.h - resolve to the wrong cached path/grid) must
+	// never compare equal here. Requires: identical flags (a fingerprint-
+	// only identity must never alias one that also carries source
+	// evidence, or vice versa), an exact fingerprint match, an exact
+	// sourceId match whenever the SOURCE flag is set, and matching
+	// libraryGeneration - by the time this runs, invalidateGeneration()/
+	// invalidateRevision() have already dropped any queue entry whose
+	// generation/revision no longer matches the live values (see their
+	// own doc comments), so this is defense-in-depth, not the primary
+	// enforcement. metadataRevision is deliberately NOT compared here: it
+	// is an external validity epoch (see its own doc comment above),
+	// already enforced by invalidateRevision() before any dedup/exclusion
+	// check runs - mirrors DjAssistGridCache::sameKey()'s own split
+	// between the identity match itself and its external generation/
+	// revision key parameters.
+	bool sameTrack(const AutoDjIdentity& other) const{
+		if(!valid() || !other.valid()) return false;
+		if(flags != other.flags) return false;
+		if(!(flags & AUTO_DJ_IDENTITY_FINGERPRINT)) return false;
+		if(memcmp(fingerprint, other.fingerprint, sizeof(fingerprint)) != 0) return false;
+		if(flags & AUTO_DJ_IDENTITY_SOURCE){
+			if(memcmp(sourceId, other.sourceId, sizeof(sourceId)) != 0) return false;
+		}
+		return libraryGeneration == other.libraryGeneration;
+	}
+};
+
+// Stable ordering used to break ties deterministically regardless of the
+// order candidates happen to be presented in.
+inline bool autoDjIdentityLess(const AutoDjIdentity& a, const AutoDjIdentity& b){
+	return memcmp(a.fingerprint, b.fingerprint, sizeof(a.fingerprint)) < 0;
+}
+
+enum AutoDjReason : uint16_t {
+	AUTO_DJ_REASON_NONE = 0,
+	AUTO_DJ_REASON_FRESH = 1 << 0,               // not found in recent history
+	AUTO_DJ_REASON_ARTIST_VARIETY = 1 << 1,      // artist not on cooldown
+	AUTO_DJ_REASON_TITLE_VARIETY = 1 << 2,       // title not on cooldown
+	AUTO_DJ_REASON_METADATA_MATCH = 1 << 3,      // reserved: Coach bpm/key/energy scoring
+	AUTO_DJ_REASON_CONSERVATIVE_FALLBACK = 1 << 4, // no metadata; ordering only, no fabricated match
+	AUTO_DJ_REASON_TIE_BREAK = 1 << 5             // selected via stable identity tie-break
+};
+
+// A track offered to the planner for consideration. `score` and metadata
+// fields are placeholders for the final Coach scoring model; until that
+// lands the planner only ever uses them when `hasMetadata` is true, and
+// never invents a harmonic/beat match on missing data.
+struct AutoDjCandidate {
+	AutoDjIdentity identity = {};
+	uint32_t artistHash = 0; // 0 == unknown, never used for exclusion
+	uint32_t titleHash = 0;  // 0 == unknown, never used for exclusion
+	bool hasMetadata = false;
+	bool durationTrustworthy = false;
+	uint32_t durationSeconds = 0;
+	uint32_t bpmMilli = 0;
+	uint16_t key = 0;
+	uint32_t score = 0;
+	uint16_t reasons = AUTO_DJ_REASON_NONE;
+};
+
+enum class AutoDjState : uint8_t {
+	Off,
+	Armed,
+	Running,
+	Paused,
+	Stopping,
+	Complete,
+	Failed
+};
+
+enum class AutoDjFailReason : uint8_t {
+	None,
+	CapabilityDisabled,
+	RetryBudgetExhausted,
+	RecordingFailure,
+	// Coach's rollback (mix/sync/stop-deck restore) after a failed/cancelled
+	// transition did not settle within AUTO_DJ_TEARDOWN_TIMEOUT_US. Terminal
+	// and deliberately not retried/skipped through: an unsettled rollback
+	// may still have commands in flight against the deck this attempt
+	// targeted, so submitting a fresh load could race them. Requires an
+	// explicit reset() (and, in practice, human verification of real deck
+	// state) before Auto DJ can arm again.
+	TeardownTimeout,
+	// The stable-ID load authority (DjAssistController's candidate-table
+	// allocation + running fill-worker) was available at arm()/start() time
+	// but has since become unavailable - e.g. the fill-worker exited or a
+	// later allocation failed - while Auto DJ was Running. Checked
+	// continuously every tick(), not just at arm()/start(), so a capability
+	// loss mid-session is caught before any further load is ever attempted
+	// against an authority that can no longer produce a trustworthy
+	// candidate. Terminal and never retried/skipped through, matching
+	// TeardownTimeout's rationale: retrying here would only ever resubmit
+	// against the same dead authority. If a composite load/Coach-transition/
+	// rollback was already in flight when the loss was detected, that
+	// attempt is always allowed to settle to its own outcome first (see
+	// DjAutoDjPlanner::failAfterPending's doc comment) - this reason is
+	// never used to interrupt or strand an in-flight command.
+	AuthorityUnavailable
+};
+
+#endif //JAYD_FIRMWARE_DJ_AUTO_DJ_TYPES_H

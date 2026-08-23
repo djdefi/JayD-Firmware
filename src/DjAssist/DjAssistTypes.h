@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "../DjSession/DjSessionState.h"
+#include "../DjSession/DjBeatEngine.h" // DjGridAnchor/DJ_GRID_ANCHOR_CAPACITY: also Arduino-free.
 
 // Coach/suggestions/one-shot-transition layer. Deliberately hardware/Arduino
 // free (mirrors DjSessionState.h) so it stays host-testable and decoupled
@@ -91,7 +92,115 @@ struct DjAssistLibraryEntry {
 	uint8_t rating = 255; // 0-5, 255 = unknown.
 	uint64_t durationFrames = 0;
 	uint32_t sampleRate = 0;
+	// Additive fields for Auto DJ's repeat/artist/title cooldown exclusion
+	// (see AutoDjSessionActuator). Populated by DjSession::assistTrackEntry()
+	// - the same background-fill-worker call that populates every other
+	// field above - so reading them costs zero extra locks/threads over
+	// what Coach's own fill pass already does; Coach itself simply never
+	// reads these two fields. 0 == unknown, never treated as a match (see
+	// DjAutoDjHistory).
+	uint32_t artistHash = 0;
+	uint32_t titleHash = 0;
+	// Additive fields letting Auto DJ resolve a stable-ID load AND build its
+	// full DjTrackMetadataSnapshot without a single metadataReader call on
+	// DjSession::loop()'s thread (see DjSession::resolveIdentityLoad()).
+	// All populated by the same background DjAssistFillWorker pass as every
+	// field above; Coach's own path-based loads never read these. path[]
+	// mirrors DjSessionState.h's DJ_PATH_CAPACITY-bounded, no-leading-slash
+	// on-disk path convention (see resolveIdentityPath()'s reconstruction
+	// comment). firstGrid/gridCount/firstPhrase/phraseCount are the raw
+	// JaydMetadata::Track offsets/counts readGrid()/readPhrase() need;
+	// confidence/downbeatCount/provenanceHash mirror
+	// DjSession::resolveMetadata()'s own grid/phrase scan output exactly,
+	// computed once here instead of on every load. state is downgraded to
+	// DJ_METADATA_CORRUPT (never left VALID) if that background scan
+	// itself hit a corrupt grid/phrase entry, so a stable-ID load can
+	// never trust a confidence/downbeatCount that wasn't actually fully
+	// computed.
+	char path[DJ_PATH_CAPACITY] = {};
+	uint32_t firstGrid = 0;
+	uint32_t gridCount = 0;
+	uint32_t firstPhrase = 0;
+	uint32_t phraseCount = 0;
+	uint32_t cueCount = 0;
+	uint32_t provenanceHash = 0;
+	uint16_t confidence = 0;
+	uint32_t downbeatCount = 0;
+	// NOTE: this entry deliberately does NOT cache a per-track beat-grid
+	// anchor array. An earlier revision did (DjGridAnchor
+	// gridAnchors[DJ_GRID_ANCHOR_CAPACITY] on every one of
+	// DJ_ASSIST_MAX_INDEX_ENTRIES entries) and a focused review correctly
+	// flagged that this blew the PSRAM budget: ~768B/entry * 4096 entries
+	// is ~3.1MiB on top of this struct's other fields, leaving no headroom
+	// for SongList/index/audio/recording/hot-swap in a 4MiB PSRAM part -
+	// and a resulting allocation failure would silently empty the whole
+	// candidate table while callers still believed the capability was
+	// available. See DjAssistGridCache below (and DjAssistController's
+	// gridCache_ member) for the bounded, few-KiB, few-slot replacement:
+	// grid anchors are hydrated off-thread on demand, only for the handful
+	// of identities Auto DJ is actually about to load, never precomputed
+	// for the entire library.
 };
+
+// Bounded, on-demand replacement for per-entry grid-anchor caching (see
+// DjAssistLibraryEntry's doc comment above for why the entry itself no
+// longer carries this). Holds at most DJ_ASSIST_GRID_CACHE_SLOTS
+// (currently in-flight Auto DJ loads are never more than one at a time -
+// see AutoDjLoadPort's "at most one load in flight" contract - so a small
+// handful of slots is generous headroom, not a queue). Populated strictly
+// off DjSession::loop()'s thread by DjAssistController::fillWorkerStep()
+// (see its own doc comment) once AutoDjSessionActuator::submitLoad()
+// requests hydration for the exact identity/epoch it is about to load;
+// looked up read-only, RAM-only, by DjSession::resolveIdentityLoad() at
+// apply time. A cache miss (never requested, evicted, still Pending, or a
+// stale-key Ready slot) is always safe to treat as "no usable grid" - the
+// same fallback DjBeatGrid::build() and buildGrid() already use for a
+// track with no usable grid data at all - so this cache can never cause a
+// load to fail, only to proceed without quantize/sync capability.
+static const uint8_t DJ_ASSIST_GRID_CACHE_SLOTS = 4;
+
+enum class DjAssistGridCacheState : uint8_t {
+	Empty,   // never used, or evicted by a newer request.
+	Pending, // requested; fillWorkerStep() has not yet resolved it.
+	Ready,   // resolved: anchors/anchorCount are valid for this exact key.
+	Failed   // resolved but no usable grid (identity not found, read
+	         // failed, or the all-or-nothing capability gate rejected it).
+};
+
+// Fixed-size, POD (host-testable) hydration-cache entry. Keyed by the same
+// tuple DjSession::resolveIdentityLoad()/DjCommand already carry end-to-end
+// for a stable-ID load (libraryGeneration, metadataRevision, identity), so
+// no new command/queue field is needed anywhere else - apply time simply
+// looks this cache up using fields it already has.
+struct DjAssistGridCacheSlot {
+	DjAssistGridCacheState state = DjAssistGridCacheState::Empty;
+	uint32_t libraryGeneration = 0;
+	uint32_t metadataRevision = 0;
+	DjTrackIdentity identity = {};
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t anchorCount = 0;
+};
+
+// Compile-time PSRAM budget guards (see the review this addresses: an
+// earlier revision's per-entry gridAnchors[] made the candidate table alone
+// ~3.9MiB of a 4MiB PSRAM part). DJ_ASSIST_MAX_INDEX_ENTRIES *
+// sizeof(DjAssistLibraryEntry) is the single largest allocation
+// DjAssistController::begin() makes (see its ps_malloc() call); 1MiB leaves
+// generous (>2.9MiB) headroom for SongList/index/audio/recording/hot-swap.
+// DjAssistGridCacheSlot's array is a plain (non-ps_malloc'd,
+// DJ_ASSIST_GRID_CACHE_SLOTS-sized) member and must stay a "few KiB" total,
+// never scaling with library size - capped here at 16KiB as a generous
+// upper bound for a 4-slot cache.
+static_assert(
+	sizeof(DjAssistLibraryEntry) * size_t(DJ_ASSIST_MAX_INDEX_ENTRIES) <= size_t(1) * 1024 * 1024,
+	"DjAssistLibraryEntry candidate table must stay well under the PSRAM budget - "
+	"do not add another per-entry array; see DjAssistGridCache's doc comment"
+);
+static_assert(
+	sizeof(DjAssistGridCacheSlot) * size_t(DJ_ASSIST_GRID_CACHE_SLOTS) <= size_t(16) * 1024,
+	"DjAssistGridCache must stay a small, fixed, few-KiB allocation - "
+	"do not scale DJ_ASSIST_GRID_CACHE_SLOTS with library size"
+);
 
 // Compact, bounded, POD suggestion - safe to copy into a snapshot/API/browser
 // payload as-is.
@@ -172,6 +281,20 @@ struct DjAssistTransitionStep {
 	uint32_t commandId = 0;
 	bool submitted = false;
 	bool applied = false;
+	// True when this step belongs to a transition Coach was armed for BY
+	// Auto DJ (never set directly by a user-facing Coach arm gesture) -
+	// mirrors DjAssistTransitionPlan::autoDjOwned, copied onto every
+	// FORWARD plan step in buildSteps() so DjAssistSessionActuator::submit()
+	// can tag the resulting setPlaying/setSync/setMix command's
+	// DjCommand::autoDjOwned - the only way a manual takeover's
+	// removeAutoDjOwned() purge can find and drop Coach's own in-flight
+	// internal commands, not just Auto's load/arm. Deliberately NOT copied
+	// onto the synthetic rollback step DjAssistController::tickRollback()
+	// builds fresh each phase - see that function's own comment: rollback
+	// must run to completion once started, even across an unrelated later
+	// manual command, and already has its own one-time
+	// assistPurgePendingSystemCommands() sweep.
+	bool autoDjOwned = false;
 };
 
 enum DjAssistTransitionFailure : uint8_t {
@@ -234,6 +357,11 @@ struct DjAssistTransitionPlan {
 	// play/sync could fool.
 	bool toDeckStartOwnedByPlan = false;
 	bool toDeckSyncOwnedByPlan = false;
+	// True when Auto DJ (not a direct user Coach gesture) armed this
+	// transition - see DjAssistTransitionStep::autoDjOwned above for why
+	// this must be copied onto every step, including the synthetic
+	// rollback ones tickRollback() builds fresh each phase.
+	bool autoDjOwned = false;
 };
 
 // Bounded snapshot supplied every tick so the state machine can detect

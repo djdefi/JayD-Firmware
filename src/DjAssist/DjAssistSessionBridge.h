@@ -22,11 +22,15 @@ DjTrackIdentity buildTrackIdentity(const uint8_t fingerprint[16], const uint8_t 
 
 // Builds one candidate-table entry's capability bitmask from cheap,
 // already-resolved integer fields (mirrors DjSession::resolveMetadata()'s
-// capability formula, minus the per-grid/per-phrase downbeat-count/
-// confidence enumeration - deliberately out of scope for the bulk candidate
-// table; see DjAssistController for the disclosed tradeoff). Missing fields
-// simply leave the corresponding bit unset (reduces scoring confidence
-// rather than rejecting the track).
+// capability formula). firstGrid/firstPhrase are threaded through as plain
+// scalars from the same JaydMetadata::Track the caller already read - zero
+// extra cost - so DjSession::resolveIdentityLoad() can later reconstruct a
+// Track purely from this entry. Missing fields simply leave the
+// corresponding bit unset (reduces scoring confidence rather than rejecting
+// the track). confidence/downbeatCount/path/provenanceHash are NOT set
+// here (they need their own reader calls beyond the single trackByIndex()
+// this entry's other fields came from) - the caller (DjSession::
+// assistTrackEntry()) fills those in directly afterward.
 DjAssistLibraryEntry buildLibraryEntry(
 	uint32_t libraryIndex,
 	const DjTrackIdentity& identity,
@@ -38,7 +42,9 @@ DjAssistLibraryEntry buildLibraryEntry(
 	uint8_t rating,
 	uint32_t cueCount,
 	uint32_t gridCount,
-	uint32_t phraseCount
+	uint32_t phraseCount,
+	uint32_t firstGrid,
+	uint32_t firstPhrase
 );
 
 // Deterministic crossfade mix value in [0,255] for a fromDeck->toDeck

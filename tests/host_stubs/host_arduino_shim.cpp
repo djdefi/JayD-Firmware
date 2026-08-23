@@ -6,6 +6,7 @@
 
 namespace {
 unsigned long g_hostMicros = 0;
+bool g_forcePsMallocFailure = false;
 }
 
 unsigned long micros(){
@@ -30,6 +31,7 @@ void delay(uint32_t milliseconds){
 }
 
 void* ps_malloc(size_t size){
+	if(g_forcePsMallocFailure) return nullptr;
 	return malloc(size);
 }
 
@@ -39,4 +41,8 @@ void hostStubSetMicros(unsigned long value){
 
 void hostStubAdvanceMicros(unsigned long deltaMicros){
 	g_hostMicros += deltaMicros;
+}
+
+void hostStubSetForcePsMallocFailure(bool force){
+	g_forcePsMallocFailure = force;
 }

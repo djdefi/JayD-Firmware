@@ -280,6 +280,8 @@ void MixScreen::MixScreen::draw(){
 		drawLoopSyncBank();
 	}else if(controls.bank == MIX_BANK_ASSIST){
 		drawAssistBank();
+	}else if(controls.bank == MIX_BANK_AUTODJ){
+		drawAutoDjBank();
 	}else{
 		drawBrowseBank();
 	}
@@ -590,6 +592,131 @@ void MixScreen::MixScreen::drawAssistBank(){
 	canvas->setTextDatum(TL_DATUM);
 }
 
+void MixScreen::MixScreen::drawAutoDjBank(){
+	if(!session) return;
+	AutoDjSnapshot autoDj;
+	session->copyAutoDjSnapshot(autoDj);
+
+	Sprite* canvas = screen.getSprite();
+	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
+	canvas->setTextFont(1);
+	canvas->setTextSize(1);
+	canvas->setTextColor(TFT_WHITE);
+	canvas->setTextDatum(TC_DATUM);
+
+	const char* stateText;
+	switch(autoDj.state){
+		case AutoDjState::Off: stateText = "OFF"; break;
+		case AutoDjState::Armed: stateText = "ARMED"; break;
+		case AutoDjState::Running: stateText = "RUNNING"; break;
+		case AutoDjState::Paused: stateText = "PAUSED"; break;
+		case AutoDjState::Stopping: stateText = "STOPPING"; break;
+		case AutoDjState::Complete: stateText = "COMPLETE"; break;
+		case AutoDjState::Failed: stateText = "FAILED"; break;
+		default: stateText = "?"; break;
+	}
+	char header[32];
+	snprintf(header, sizeof(header), "AUTO DJ | %s", stateText);
+	canvas->drawString(header, 80, 2);
+	canvas->setTextDatum(TL_DATUM);
+
+	if(autoDj.state == AutoDjState::Off){
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("AUTO DJ IS OFF", 80, 40);
+		canvas->drawString("HOLD L1 TO ARM", 80, 56);
+		canvas->setTextDatum(TL_DATUM);
+	}else if(autoDj.state == AutoDjState::Failed){
+		const char* reasonText;
+		switch(autoDj.failReason){
+			case AutoDjFailReason::CapabilityDisabled: reasonText = "NO STABLE-ID LOAD CAPABILITY"; break;
+			case AutoDjFailReason::RetryBudgetExhausted: reasonText = "LOAD RETRY BUDGET EXHAUSTED"; break;
+			case AutoDjFailReason::RecordingFailure: reasonText = "RECORDING FAILURE"; break;
+			case AutoDjFailReason::TeardownTimeout: reasonText = "ROLLBACK DID NOT SETTLE"; break;
+			case AutoDjFailReason::AuthorityUnavailable: reasonText = "LOAD AUTHORITY UNAVAILABLE"; break;
+			default: reasonText = "UNKNOWN"; break;
+		}
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("AUTO DJ FAILED", 80, 32);
+		canvas->drawString(reasonText, 80, 46);
+		canvas->drawString("HOLD L1 TO RESET", 80, 62);
+		canvas->setTextDatum(TL_DATUM);
+	}else if(autoDj.state == AutoDjState::Complete){
+		canvas->setTextDatum(MC_DATUM);
+		canvas->drawString("QUEUE COMPLETE", 80, 40);
+		canvas->drawString("HOLD L1 TO RESET", 80, 56);
+		canvas->setTextDatum(TL_DATUM);
+	}else{
+		char line[32];
+		snprintf(line, sizeof(line), "QUEUE: %u   HISTORY: %u", autoDj.queueDepth, autoDj.historySize);
+		canvas->drawString(line, 2, 20);
+		if(autoDj.state == AutoDjState::Armed){
+			canvas->drawString("WAITING FOR SAFE WINDOW", 2, 36);
+			canvas->drawString("(QUEUE FILLING, DECK PLAYING)", 2, 48);
+		}else if(autoDj.state == AutoDjState::Paused){
+			canvas->drawString("PAUSED - MANUAL TAKEOVER OR", 2, 36);
+			canvas->drawString("UNTRUSTWORTHY DURATION", 2, 48);
+		}else if(autoDj.state == AutoDjState::Stopping){
+			canvas->drawString("FINISHING IN-FLIGHT LOAD...", 2, 36);
+		}else{
+			canvas->drawString("AUTONOMOUSLY QUEUEING NEXT", 2, 36);
+			canvas->drawString("TRACKS FROM COACH SCORING", 2, 48);
+		}
+	}
+
+	canvas->setTextDatum(BC_DATUM);
+	if(autoDj.state == AutoDjState::Off || autoDj.state == AutoDjState::Failed || autoDj.state == AutoDjState::Complete){
+		canvas->drawString("HOLD L1: ARM/RESET", 80, 116);
+	}else if(autoDj.state == AutoDjState::Armed){
+		canvas->drawString("HOLD L1:START  HOLD R1:STOP", 80, 116);
+	}else if(autoDj.state == AutoDjState::Running){
+		canvas->drawString("HOLD L1:PAUSE  HOLD R1:STOP", 80, 116);
+	}else if(autoDj.state == AutoDjState::Paused){
+		canvas->drawString("HOLD L1:RESUME  HOLD R1:STOP", 80, 116);
+	}else{
+		canvas->drawString("STOPPING...", 80, 116);
+	}
+	canvas->drawString("PHYSICAL CONFIRM REQUIRED", 80, 126);
+	canvas->setTextDatum(TL_DATUM);
+}
+
+void MixScreen::MixScreen::autoDjPrimaryAction(){
+	if(!session) return;
+	AutoDjSnapshot autoDj;
+	session->copyAutoDjSnapshot(autoDj);
+
+	DjSubmitResult result(0, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE);
+	switch(autoDj.state){
+		case AutoDjState::Off:
+			result = session->autoDjArmCommand(DJ_ORIGIN_PHYSICAL);
+			break;
+		case AutoDjState::Armed:
+			result = session->autoDjStartCommand(DJ_ORIGIN_PHYSICAL);
+			break;
+		case AutoDjState::Running:
+			result = session->autoDjPauseCommand(DJ_ORIGIN_PHYSICAL);
+			break;
+		case AutoDjState::Paused:
+			result = session->autoDjResumeCommand(DJ_ORIGIN_PHYSICAL);
+			break;
+		case AutoDjState::Failed:
+		case AutoDjState::Complete:
+			result = session->autoDjResetCommand(DJ_ORIGIN_PHYSICAL);
+			break;
+		default:
+			drawQueued = true;
+			return; // Stopping: no user-initiated transition until it settles.
+	}
+	if(!result.accepted()) showCommandError(result.error);
+	drawQueued = true;
+}
+
+void MixScreen::MixScreen::autoDjStopAction(){
+	if(!session) return;
+	const DjSubmitResult result = session->autoDjStopCommand(DJ_ORIGIN_PHYSICAL);
+	if(!result.accepted()) showCommandError(result.error);
+	drawQueued = true;
+}
+
 void MixScreen::MixScreen::assistToggleCoach(){
 	if(!session) return;
 	DjAssistSnapshot assist;
@@ -647,7 +774,7 @@ void MixScreen::MixScreen::assistArmFromSelected(){
 
 void MixScreen::MixScreen::drawPalette(){
 	static const char* items[] = {
-			"MIX", "CUES", "BROWSE", "LOOP/SYNC", "ASSIST", "MATRIX", "RESCAN SD", "SETTINGS", "EXIT DJ"
+			"MIX", "CUES", "BROWSE", "LOOP/SYNC", "ASSIST", "AUTO DJ", "MATRIX", "RESCAN SD", "SETTINGS", "EXIT DJ"
 	};
 	Sprite* canvas = screen.getSprite();
 	canvas->fillRect(0, 0, 160, 128, TFT_BLACK);
@@ -697,6 +824,7 @@ const char* MixScreen::MixScreen::commandErrorText(DjCommandError error) const{
 		case DJ_COMMAND_ERROR_SESSION_ENDING: return "DJ SESSION ENDING";
 		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "ASSIST TRANSITION REJECTED";
 		case DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING: return "MANUAL OVERRIDE PENDING";
+		case DJ_COMMAND_ERROR_AUTODJ_REJECTED: return "AUTO DJ ACTION UNAVAILABLE";
 		default: return "COMMAND REJECTED";
 	}
 }
@@ -1048,6 +1176,23 @@ void MixScreen::MixScreen::encBtnHold(uint8_t i){
 		}
 		if(i == 3){
 			assistArmFromSelected();
+			return;
+		}
+		return;
+	}
+	if(controls.bank == MIX_BANK_AUTODJ){
+		// Two visible, labelled hold-actions, both requiring a deliberate
+		// hold gesture (never a plain press) as the physical/authenticated
+		// confirmation the state machine's arm()/resume() require: L1 is
+		// the context-sensitive "advance" action (arm/start/pause/resume/
+		// reset depending on current state - see autoDjPrimaryAction());
+		// R1 always requests a stop. Every other encoder is inert.
+		if(i == 0){
+			autoDjPrimaryAction();
+			return;
+		}
+		if(i == 3){
+			autoDjStopAction();
 			return;
 		}
 		return;

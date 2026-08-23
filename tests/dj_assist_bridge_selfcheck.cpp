@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <string.h>
 
+#include "../src/DjAssist/DjAssistGridCache.h"
 #include "../src/DjAssist/DjAssistSessionBridge.h"
 
 using namespace DjAssistBridge;
@@ -50,14 +51,17 @@ void testBuildTrackIdentityGatesZeroEvidence(){
 }
 
 // -- buildLibraryEntry: capability bits mirror DjSession::resolveMetadata()
-// -- exactly (minus the deliberately-out-of-scope downbeat enumeration).
+// -- exactly (minus confidence/downbeatCount, which need their own reader
+// -- calls beyond the single trackByIndex() this entry's other fields came
+// -- from - DjSession::assistTrackEntry() fills those in separately).
 
 void testBuildLibraryEntryFullCapabilities(){
 	const DjTrackIdentity identity = fingerprintIdentity(7);
 	const DjAssistLibraryEntry entry = buildLibraryEntry(
 		42, identity, DJ_METADATA_VALID,
 		44100, 44100ULL * 180ULL, 128000, 0x105, 4,
-		/*cueCount*/ 3, /*gridCount*/ 64, /*phraseCount*/ 8
+		/*cueCount*/ 3, /*gridCount*/ 64, /*phraseCount*/ 8,
+		/*firstGrid*/ 1000, /*firstPhrase*/ 2000
 	);
 	assert(entry.libraryIndex == 42);
 	assert(entry.state == DJ_METADATA_VALID);
@@ -67,11 +71,21 @@ void testBuildLibraryEntryFullCapabilities(){
 	assert(entry.durationFrames == 44100ULL * 180ULL);
 	assert(entry.sampleRate == 44100);
 	assert(memcmp(entry.identity.fingerprint, identity.fingerprint, 16) == 0);
+	// firstGrid/firstPhrase/gridCount/phraseCount/cueCount are threaded
+	// through verbatim - DjSession::resolveIdentityLoad() reconstructs a
+	// JaydMetadata::Track purely from these, so they must round-trip
+	// exactly, not just influence capability bits.
+	assert(entry.gridCount == 64);
+	assert(entry.phraseCount == 8);
+	assert(entry.cueCount == 3);
+	assert(entry.firstGrid == 1000);
+	assert(entry.firstPhrase == 2000);
 	const uint16_t expected = DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_KEY |
 		DJ_METADATA_HAS_RATING | DJ_METADATA_HAS_CUES | DJ_METADATA_HAS_GRID | DJ_METADATA_HAS_PHRASES;
 	assert(entry.capabilities == expected);
-	// Deliberately never set at the bulk-candidate-table level (see header
-	// comment + DjAssistController): scoring never reads this bit.
+	// Never set by buildLibraryEntry() itself (see header comment) -
+	// assistTrackEntry() sets this bit only after its own bounded
+	// grid-confidence scan finds at least one downbeat.
 	assert(!(entry.capabilities & DJ_METADATA_HAS_DOWNBEATS));
 }
 
@@ -82,7 +96,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry entry = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_STALE,
 		0, 0, 0, 0, 255,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(entry.capabilities == 0);
 	assert(entry.state == DJ_METADATA_STALE);
@@ -93,7 +107,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry rated = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_VALID,
 		44100, 1000, 120000, 5, 0,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(rated.capabilities & DJ_METADATA_HAS_RATING);
 
@@ -102,7 +116,7 @@ void testBuildLibraryEntryMissingFieldsClearBitsOnly(){
 	const DjAssistLibraryEntry halfSource = buildLibraryEntry(
 		0, DjTrackIdentity{}, DJ_METADATA_VALID,
 		44100, 0, 0, 0, 255,
-		0, 0, 0
+		0, 0, 0, 0, 0
 	);
 	assert(!(halfSource.capabilities & DJ_METADATA_HAS_SOURCE_FRAMES));
 }
@@ -318,6 +332,182 @@ void testCandidateGenerationCurrentMatchesExactly(){
 	assert(!DjAssistBridge::candidateGenerationCurrent(5, 6));
 }
 
+// -- DjAssistGridCache: bounded, few-slot on-demand grid-anchor hydration --
+// -- cache (the round-4 PSRAM-budget fix's replacement for a per-candidate-
+// -- entry gridAnchors[] array). Pure logic, no threading/locking of its
+// -- own (DjAssistController serializes every call under candidateMutex_).
+
+DjGridAnchor anchor(uint64_t frame, int64_t quarterBeat){
+	DjGridAnchor a;
+	a.frame = frame;
+	a.quarterBeat = quarterBeat;
+	return a;
+}
+
+void testGridCacheRequestFindPendingResolveLookupRoundTrip(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(1);
+	assert(cache.request(10, 20, identity));
+
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	assert(cache.at(uint8_t(pending)).state == DjAssistGridCacheState::Pending);
+
+	DjGridAnchor anchors[2] = { anchor(100, 0), anchor(200, 4) };
+	cache.resolve(pending, 10, 20, identity, true, anchors, 2);
+
+	assert(cache.findPending() < 0); // no longer pending.
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(10, 20, identity, out, outCount));
+	assert(outCount == 2);
+	assert(out[0].frame == 100 && out[0].quarterBeat == 0);
+	assert(out[1].frame == 200 && out[1].quarterBeat == 4);
+}
+
+void testGridCacheLookupMissForNeverRequestedKey(){
+	DjAssistGridCache cache;
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 7; // non-zero sentinel - lookup() must reset it on a miss.
+	assert(!cache.lookup(1, 1, fingerprintIdentity(9), out, outCount));
+	assert(outCount == 0);
+}
+
+void testGridCacheLookupMissWhileStillPending(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(2);
+	cache.request(1, 1, identity);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identity, out, outCount));
+}
+
+void testGridCacheResolveFailedLeavesLookupMiss(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(3);
+	cache.request(1, 1, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	cache.resolve(pending, 1, 1, identity, false, nullptr, 0);
+	assert(cache.at(uint8_t(pending)).state == DjAssistGridCacheState::Failed);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identity, out, outCount));
+}
+
+// A resolve() targeting a slot that a NEWER request() has since evicted (or
+// overwritten with a different key while the read was in flight) must be
+// silently ignored - never let a late/stale result clobber the newer
+// request's own state. Mirrors DjAssistController::stepGridHydration()'s
+// "still Pending for the exact key" re-validation.
+void testGridCacheResolveIgnoredAfterSlotReused(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identityA = fingerprintIdentity(4);
+	cache.request(1, 1, identityA);
+	const int pendingForA = cache.findPending();
+	assert(pendingForA >= 0);
+
+	// Evict slot `pendingForA` by cycling DJ_ASSIST_GRID_CACHE_SLOTS more
+	// distinct requests through round-robin (request() itself never
+	// blocks/fails - see its doc comment).
+	for(uint8_t i = 0; i < DJ_ASSIST_GRID_CACHE_SLOTS; ++i){
+		cache.request(1, 1, fingerprintIdentity(uint8_t(100 + i)));
+	}
+	// The original A key is no longer represented by ANY slot.
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(!cache.lookup(1, 1, identityA, out, outCount));
+
+	// A late resolve() for the now-stale (index, key) pair must be a no-op.
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pendingForA, 1, 1, identityA, true, anchors, 1);
+	assert(!cache.lookup(1, 1, identityA, out, outCount));
+}
+
+void testGridCacheRequestIdempotentWhilePendingOrReady(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(5);
+	cache.request(1, 1, identity);
+	const int firstPending = cache.findPending();
+	assert(firstPending >= 0);
+	// Re-requesting the same still-Pending key must not restart/duplicate
+	// it - findPending() keeps reporting the exact same slot.
+	cache.request(1, 1, identity);
+	assert(cache.findPending() == firstPending);
+
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(firstPending, 1, 1, identity, true, anchors, 1);
+	// Re-requesting an already-Ready key must not reset it back to Pending
+	// (that would needlessly re-trigger a background read).
+	cache.request(1, 1, identity);
+	assert(cache.findPending() < 0);
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, identity, out, outCount));
+}
+
+void testGridCacheAnchorCountCappedToCapacity(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(6);
+	cache.request(1, 1, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY + 5] = {};
+	for(uint16_t i = 0; i < DJ_GRID_ANCHOR_CAPACITY + 5; ++i) anchors[i] = anchor(i, i);
+	cache.resolve(pending, 1, 1, identity, true, anchors, uint16_t(DJ_GRID_ANCHOR_CAPACITY + 5));
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, identity, out, outCount));
+	assert(outCount == DJ_GRID_ANCHOR_CAPACITY);
+}
+
+// A different metadataRevision (a same-generation metadata replacement) or
+// libraryGeneration for the SAME identity must never be treated as the same
+// cache entry - both must be part of the key, not just the identity.
+void testGridCacheKeyIncludesGenerationAndRevision(){
+	DjAssistGridCache cache;
+	const DjTrackIdentity identity = fingerprintIdentity(7);
+	cache.request(1, 5, identity);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pending, 1, 5, identity, true, anchors, 1);
+
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 5, identity, out, outCount));
+	assert(!cache.lookup(1, 6, identity, out, outCount)); // different revision.
+	assert(!cache.lookup(2, 5, identity, out, outCount)); // different generation.
+}
+
+// -- round 5, fix #3 (exact-identity aliasing) --
+// Two tracks sharing a fingerprint but differing only in sourceId must
+// never resolve to each other's cached grid anchors: sameKey() must use
+// djTrackIdentityExactMatch(), not DjAssistScoring::identityMatches()
+// (which returns a match on fingerprint alone once both sides also carry a
+// SOURCE flag, regardless of the sourceId bytes).
+void testGridCacheDoesNotAliasSameFingerprintDifferentSource(){
+	DjAssistGridCache cache;
+
+	DjTrackIdentity x = fingerprintIdentity(9);
+	x.flags |= DJ_TRACK_IDENTITY_SOURCE;
+	memset(x.sourceId, 0xA1, sizeof(x.sourceId));
+
+	DjTrackIdentity y = x; // same fingerprint, different source.
+	memset(y.sourceId, 0xB2, sizeof(y.sourceId));
+
+	cache.request(1, 1, x);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pending, 1, 1, x, true, anchors, 1);
+
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, x, out, outCount)); // X's own request resolves.
+	assert(!cache.lookup(1, 1, y, out, outCount)); // Y must never alias X's slot.
+}
+
 } // namespace
 
 int main(){
@@ -342,5 +532,14 @@ int main(){
 	testPhraseCacheRescansOnBackwardSeek();
 	testPhraseCacheRescansOnMetadataGenerationOrStateChange();
 	testCandidateGenerationCurrentMatchesExactly();
+	testGridCacheRequestFindPendingResolveLookupRoundTrip();
+	testGridCacheLookupMissForNeverRequestedKey();
+	testGridCacheLookupMissWhileStillPending();
+	testGridCacheResolveFailedLeavesLookupMiss();
+	testGridCacheResolveIgnoredAfterSlotReused();
+	testGridCacheRequestIdempotentWhilePendingOrReady();
+	testGridCacheAnchorCountCappedToCapacity();
+	testGridCacheKeyIncludesGenerationAndRevision();
+	testGridCacheDoesNotAliasSameFingerprintDifferentSource();
 	return 0;
 }

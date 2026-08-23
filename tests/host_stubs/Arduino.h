@@ -27,4 +27,11 @@ void* ps_malloc(size_t size);
 void hostStubSetMicros(unsigned long value);
 void hostStubAdvanceMicros(unsigned long deltaMicros);
 
+// Test-control only: when set, the next (and every subsequent, until
+// cleared) ps_malloc() call returns nullptr, simulating PSRAM exhaustion so
+// DjAssistController::begin()'s allocation-failure path (allocationFailed_)
+// can be exercised deterministically on the host instead of only in theory
+// on real hardware with a genuinely full PSRAM heap.
+void hostStubSetForcePsMallocFailure(bool force);
+
 #endif

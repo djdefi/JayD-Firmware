@@ -43,13 +43,23 @@ include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/LovyanGFX/src)
 include_directories(${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/CircuitOS/src)
 
-# Override to point host-only self-checks (DjRecordingSelfCheck) at a
+# Override to point host-only self-checks (DjRecordingSelfCheck) and the
+# real firmware compile targets (CMBuild/CMBuildWireless below) at a
 # specific JayD-Library checkout's src/ directory, e.g. a pinned SHA under
 # review, instead of whatever core version happens to be installed:
 #   cmake -DJAYD_LIBRARY_SRC=/path/to/JayD-Library/src ..
 if (NOT DEFINED JAYD_LIBRARY_SRC)
     set(JAYD_LIBRARY_SRC ${Arduino15}/packages/cm/hardware/esp32/1.7.3/libraries/JayD-Library/src)
 endif ()
+
+# arduino-cli's --library flag takes the library ROOT (the directory
+# containing library.properties), not its src/ subdirectory, so derive
+# it from JAYD_LIBRARY_SRC rather than introducing a second variable to
+# keep in sync. This is what makes CMBuild/CMBuildWireless reproducible:
+# they compile against the exact checkout named by JAYD_LIBRARY_SRC via
+# an explicit --library invocation flag, instead of silently picking up
+# whatever JayD-Library happens to be installed under Arduino15/.
+get_filename_component(JAYD_LIBRARY_ROOT ${JAYD_LIBRARY_SRC} DIRECTORY)
 
 
 # Source directories
@@ -70,13 +80,37 @@ set(BUILD ${ROOT}/build)
 
 SET_SOURCE_FILES_PROPERTIES(${CMAKE_PROJECT_NAME}.ino PROPERTIES LANGUAGE CXX)
 
+# Both firmware compile targets below pin the exact JayD-Library checkout
+# via --library ${JAYD_LIBRARY_ROOT} (an explicit invocation flag), rather
+# than relying on whatever JayD-Library version happens to be installed
+# under Arduino15/packages/.../libraries/JayD-Library. This is what makes
+# a "default" and "wireless" build reproducible from a clean environment:
+# the library source is named by JAYD_LIBRARY_SRC/-ROOT, not mutated
+# global state.
+#
+# The wireless variant sets JAYD_ENABLE_WIRELESS via
+# compiler.cpp.extra_flags, which the platform recipe appends alongside
+# (not instead of) build.extra_flags (board-level -O2 from boards.txt) -
+# using build.extra_flags here instead would silently replace -O2 with
+# nothing, which is what produced the earlier oversized/unoptimized
+# wireless build.
 add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CMAKE_PROJECT_NAME}.ino.elf
-        COMMAND arduino-cli compile --fqbn ${DEVICE} --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} ${CMAKE_PROJECT_NAME}.ino
+        COMMAND arduino-cli compile --fqbn ${DEVICE} --library ${JAYD_LIBRARY_ROOT} --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY} ${CMAKE_PROJECT_NAME}.ino
         DEPENDS ${CMAKE_PROJECT_NAME}.ino ${SOURCES}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_custom_target(CMBuild
         SOURCES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${CMAKE_PROJECT_NAME}.ino.elf)
+
+add_custom_command(OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless/${CMAKE_PROJECT_NAME}.ino.elf
+        COMMAND arduino-cli compile --fqbn ${DEVICE} --library ${JAYD_LIBRARY_ROOT}
+                --build-property "compiler.cpp.extra_flags=-DJAYD_ENABLE_WIRELESS=1"
+                --output-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless ${CMAKE_PROJECT_NAME}.ino
+        DEPENDS ${CMAKE_PROJECT_NAME}.ino ${SOURCES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_custom_target(CMBuildWireless
+        SOURCES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}-wireless/${CMAKE_PROJECT_NAME}.ino.elf)
 
 add_custom_target(CMUpload ALL
         COMMAND arduino-cli upload --fqbn ${DEVICE} -p ${PORT} --input-dir ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
@@ -96,6 +130,11 @@ add_test(NAME LibraryIndexSelfCheck COMMAND LibraryIndexSelfCheck)
 add_executable(DjSessionSelfCheck tests/dj_session_self_test.cpp)
 set_target_properties(DjSessionSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjSessionSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjSessionSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjSessionSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
 add_test(NAME DjSessionSelfCheck COMMAND DjSessionSelfCheck)
 
 add_executable(DjBeatEngineSelfCheck tests/dj_beat_engine_selfcheck.cpp)
@@ -136,7 +175,8 @@ add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
 add_executable(DjAssistBridgeSelfCheck
         tests/dj_assist_bridge_selfcheck.cpp
         src/DjAssist/DjAssistScoring.cpp
-        src/DjAssist/DjAssistSessionBridge.cpp)
+        src/DjAssist/DjAssistSessionBridge.cpp
+        src/DjAssist/DjAssistGridCache.cpp)
 set_target_properties(DjAssistBridgeSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 target_compile_options(DjAssistBridgeSelfCheck PRIVATE -Wall -Wextra -Werror)
@@ -163,6 +203,7 @@ add_executable(DjAssistIntegrationSelfCheck
         tests/dj_assist_integration_selfcheck.cpp
         tests/host_stubs/host_arduino_shim.cpp
         src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistGridCache.cpp
         src/DjAssist/DjAssistFillWorker.cpp
         src/DjAssist/DjAssistScoring.cpp
         src/DjAssist/DjAssistSessionBridge.cpp
@@ -196,6 +237,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
             tests/dj_assist_integration_selfcheck.cpp
             tests/host_stubs/host_arduino_shim.cpp
             src/DjAssist/DjAssistController.cpp
+            src/DjAssist/DjAssistGridCache.cpp
             src/DjAssist/DjAssistFillWorker.cpp
             src/DjAssist/DjAssistScoring.cpp
             src/DjAssist/DjAssistSessionBridge.cpp
@@ -209,6 +251,80 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_link_options(DjAssistIntegrationSelfCheckTSan PRIVATE -fsanitize=thread)
     add_test(NAME DjAssistIntegrationSelfCheckTSan COMMAND DjAssistIntegrationSelfCheckTSan)
 endif ()
+
+# Isolated Auto DJ core (DjAutoDjQueue/DjAutoDjHistory/DjAutoDjStateMachine/
+# DjAutoDjPlanner). Hardware-free by design (see src/AutoDj/DjAutoDjTypes.h),
+# held to the same strict bar as DjAssistSelfCheck: warnings-as-errors plus
+# ASan/UBSan on compilers that support it.
+add_executable(AutoDjSelfCheck
+        tests/auto_dj_selfcheck.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp)
+set_target_properties(AutoDjSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjSelfCheck COMMAND AutoDjSelfCheck)
+
+# Real AutoDjSessionActuator (the production coordinator DjSession drives via
+# the AutoDjSessionPort seam) exercised end-to-end - scan/plan/submit/apply,
+# already-queued exclusion, manual-takeover pause, library-generation
+# invalidation (including mid-retry abandonment and the Stopping path),
+# missing-safe-window conservatism, recording-failure handling, pinned-track
+# identity translation, and bounded stop/pause/resume cycling - against a
+# fake AutoDjSessionPort double. DjSession.cpp itself is not host-compiled
+# here (AudioLib/SD/esp_system dependencies are out of scope for a host
+# build, same boundary DjAssistIntegrationSelfCheck already draws for
+# DjSession/DjAssistController), but every line of the real
+# AutoDjSessionActuator/DjAutoDjPlanner stack that DjSession calls into is
+# exercised through the exact same port interface DjSession implements in
+# production.
+add_executable(AutoDjSessionBridgeSelfCheck
+        tests/auto_dj_session_bridge_selfcheck.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp
+        src/DjAssist/DjAssistScoring.cpp)
+set_target_properties(AutoDjSessionBridgeSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjSessionBridgeSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjSessionBridgeSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjSessionBridgeSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjSessionBridgeSelfCheck COMMAND AutoDjSessionBridgeSelfCheck)
+
+# Full "real Auto DJ + Coach" integration: unlike AutoDjSessionBridgeSelfCheck
+# (real AutoDjSessionActuator vs. a FAKE AutoDjSessionPort that just returns
+# a controllable mode string), this drives BOTH the real
+# AutoDjSessionActuator AND the real DjAssistController (Coach) against one
+# shared hand-written port implementing both DjAssistSessionPort and
+# AutoDjSessionPort - exactly as DjSession itself does - so Auto DJ's
+# internal Coach-arm command genuinely calls DjAssistController::
+# armTransition() and its composite pollLoad() observes Coach's own
+# transition plan (boundary/start/sync/crossfade/stop) really running, or
+# really failing a guard, rather than a fake mode string set by the test.
+add_executable(AutoDjCoachIntegrationSelfCheck
+        tests/auto_dj_coach_integration_selfcheck.cpp
+        tests/host_stubs/host_arduino_shim.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp
+        src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistGridCache.cpp
+        src/DjAssist/DjAssistFillWorker.cpp
+        src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistSessionBridge.cpp
+        src/DjAssist/DjAssistEngine.cpp)
+target_include_directories(AutoDjCoachIntegrationSelfCheck BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/tests/host_stubs)
+set_target_properties(AutoDjCoachIntegrationSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjCoachIntegrationSelfCheck PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(AutoDjCoachIntegrationSelfCheck PRIVATE JAYD_ASSIST_HOST_TASK_SEAM)
+target_link_libraries(AutoDjCoachIntegrationSelfCheck PRIVATE Threads::Threads)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjCoachIntegrationSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjCoachIntegrationSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjCoachIntegrationSelfCheck COMMAND AutoDjCoachIntegrationSelfCheck)
 
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the

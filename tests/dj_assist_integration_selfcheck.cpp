@@ -95,30 +95,35 @@ public:
 	std::atomic<bool> readerBlocked{false};
 	std::atomic<bool> releaseReader{false};
 
-	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) override{
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_PLAYING;
 		command.deck = deck;
 		command.value = playing ? 1 : 0;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 
-	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) override{
+	DjSubmitResult setSync(
+		uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false
+	) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_SYNC;
 		command.deck = deck;
 		command.value = armed ? 1 : 0;
 		command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 
-	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) override{
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false) override{
 		DjCommand command = {};
 		command.origin = origin;
 		command.type = DJ_COMMAND_SET_MIX;
 		command.value = mix;
+		command.autoDjOwned = autoDjOwned;
 		return admit(command);
 	}
 
@@ -177,6 +182,30 @@ public:
 		}
 		if(index >= entryCount) return false;
 		outEntry = entries[index];
+		return true;
+	}
+
+	// Fake on-demand grid-anchor read (see DjAssistGridCache): mirrors the
+	// real DjSession::assistTrackGridAnchors()'s all-or-nothing capability
+	// gate using this same entry table, but returns one fixed, deterministic
+	// anchor instead of a real readGrid() burst - sufficient for proving
+	// stepGridHydration()'s wiring/bounded-ness without a real metadata
+	// reader.
+	int assistTrackGridAnchorsCallCount = 0;
+	bool assistTrackGridAnchors(
+		uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+	) override{
+		++assistTrackGridAnchorsCallCount;
+		outRevision = generation;
+		outAnchorCount = 0;
+		if(index >= entryCount) return false;
+		const DjAssistLibraryEntry& entry = entries[index];
+		const uint16_t required = DJ_METADATA_HAS_GRID | DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_BPM;
+		if((entry.capabilities & required) != required) return false;
+		if(outAnchors == nullptr) return false;
+		outAnchors[0].frame = 0;
+		outAnchors[0].quarterBeat = 0;
+		outAnchorCount = 1;
 		return true;
 	}
 
@@ -1075,6 +1104,82 @@ void testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume(){
 	controller.end();
 }
 
+// -- round 4, issue #1 (PSRAM budget): DjAssistController::begin() already
+// -- had graceful ps_malloc() allocation-failure handling (allocationFailed_/
+// -- entryCapacity_ = 0), but it was never actually exercised by a test -
+// -- this proves the candidate table stays permanently empty (capability
+// -- disabled), no crash, and no assistTrackEntry() port calls are ever
+// -- made, instead of merely reading correct-looking code.
+void testAllocationFailureLeavesCandidateTableEmptyAndDisablesController(){
+	FakeAssistSessionPort port;
+	port.entryCount = 2;
+	port.entries[0] = makeEntry(0, 50);
+	port.entries[1] = makeEntry(1, 60);
+	port.generation = 1;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+
+	hostStubSetForcePsMallocFailure(true);
+	DjAssistController controller;
+	controller.begin(&port);
+	hostStubSetForcePsMallocFailure(false); // reset immediately - must not leak into later tests.
+
+	controller.setCoachEnabled(true);
+	for(int i = 0; i < 50; ++i) controller.tick();
+	assert(controller.candidateCount() == 0);
+	assert(port.assistTrackEntryCallCount == 0); // never even attempted a read.
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount == 0);
+
+	controller.end(); // must return promptly - no worker was ever launched.
+}
+
+// -- round 4, issue #1: end-to-end proof of the bounded on-demand grid-
+// -- anchor hydration cache (DjAssistGridCache) wired through the real
+// -- DjAssistController - requestGridHydration() (as DjSession::
+// -- loadDeckByIdentity() calls it) eventually resolves via
+// -- stepGridHydration() (driven here from fillWorkerStep(), exactly as
+// -- production ticks do), and gridAnchorsFor() (as DjSession::
+// -- resolveIdentityLoad() calls it) then returns the hydrated anchors.
+void testGridHydrationRequestedThenResolvedThenLookupSucceeds(){
+	FakeAssistSessionPort port;
+	port.entryCount = 1;
+	port.entries[0] = makeEntry(0, 50);
+	port.entries[0].capabilities = DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_SOURCE_FRAMES | DJ_METADATA_HAS_GRID;
+	port.generation = 7;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+
+	DjAssistController controller;
+	controller.begin(&port);
+	DjAssistIntegrationSelfCheck::fillCandidateTableToReady(controller);
+
+	const DjTrackIdentity target = fingerprintIdentity(50);
+	controller.requestGridHydration(1, port.generation, target);
+
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t anchorCount = 0;
+	// Not resolved yet - stepGridHydration() only runs from
+	// fillWorkerStep(), which this test hasn't called since the request.
+	assert(!controller.gridAnchorsFor(1, port.generation, target, anchors, anchorCount));
+
+	// Bounded: one fillWorkerStep() call resolves at most one pending
+	// hydration request (see stepGridHydration()'s doc comment).
+	DjAssistIntegrationSelfCheck::stepFill(controller);
+	assert(port.assistTrackGridAnchorsCallCount == 1);
+
+	assert(controller.gridAnchorsFor(1, port.generation, target, anchors, anchorCount));
+	assert(anchorCount == 1);
+	assert(anchors[0].frame == 0 && anchors[0].quarterBeat == 0);
+
+	// A mismatched generation/revision/identity must still miss - the key
+	// is the full tuple, not just the identity.
+	uint16_t missCount = 7;
+	assert(!controller.gridAnchorsFor(1, port.generation + 1, target, anchors, missCount));
+	assert(missCount == 0);
+
+	controller.end();
+}
+
 } // namespace
 
 int main(){
@@ -1093,5 +1198,7 @@ int main(){
 	testFillWorkerRealThreadEntersRunsAndExitsOnEnd();
 	testEndBlocksUntilInFlightPortCallReleased();
 	testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume();
+	testAllocationFailureLeavesCandidateTableEmptyAndDisablesController();
+	testGridHydrationRequestedThenResolvedThenLookupSucceeds();
 	return 0;
 }

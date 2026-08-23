@@ -10,9 +10,11 @@
 #include "../Metadata/JaydMetadata.h"
 #include "../DjAssist/DjAssistController.h"
 #include "../DjAssist/DjAssistSessionPort.h"
+#include "../AutoDj/AutoDjSessionActuator.h"
+#include "../AutoDj/AutoDjSessionPort.h"
 #include "DjSessionState.h"
 
-class DjSession : public LoopListener, public DjAssistSessionPort {
+class DjSession : public LoopListener, public DjAssistSessionPort, public AutoDjSessionPort {
 public:
 	static DjSession* begin(uint8_t leftGain, uint8_t rightGain, uint8_t mix);
 	static DjSession* get();
@@ -25,10 +27,23 @@ public:
 		DjCommandOrigin origin,
 		const DjTrackIdentity* identity = nullptr
 	);
-	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin);
+	// Stable-ID load: never accepts a path from the caller. path stays
+	// empty in the submitted command; validate()/applyLoad() resolve it
+	// internally against the live, in-memory metadata index (fingerprint
+	// lookup + generation check), rejecting a missing/ambiguous/stale
+	// identity with DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED rather
+	// than ever guessing or falling back to a foreign path. Always
+	// DJ_ORIGIN_SYSTEM: only Auto DJ calls this (see
+	// AutoDjSessionActuator), so it never itself counts as a manual
+	// takeover (see djBumpAutoDjManualIntent()).
+	DjSubmitResult loadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+	);
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult seek(uint8_t deck, uint16_t seconds, DjCommandOrigin origin);
 	DjSubmitResult setGain(uint8_t deck, uint8_t gain, DjCommandOrigin origin);
-	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin);
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult setEffectType(uint8_t deck, uint8_t slot, uint8_t type, DjCommandOrigin origin);
 	DjSubmitResult setEffectIntensity(uint8_t deck, uint8_t slot, uint8_t intensity, DjCommandOrigin origin);
 	DjSubmitResult setRecording(bool recording, DjCommandOrigin origin);
@@ -37,7 +52,7 @@ public:
 	DjSubmitResult loopDisengage(uint8_t deck, DjCommandOrigin origin);
 	DjSubmitResult loopReloop(uint8_t deck, DjCommandOrigin origin);
 	// masterDeck: -1 requests auto-master (the other deck); otherwise an explicit deck index.
-	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin);
+	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin, bool autoDjOwned = false);
 	DjSubmitResult setCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult triggerCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
 	DjSubmitResult clearCue(uint8_t deck, uint8_t cue, DjCommandOrigin origin);
@@ -94,6 +109,16 @@ public:
 	// of whether the read itself succeeds, so callers can still detect a
 	// stale pass on a failed/corrupt record.
 	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override;
+	// On-demand grid-anchor hydration for exactly one already-indexed
+	// track (see DjAssistSessionPort.h's doc comment and
+	// DjAssistGridCache) - the PSRAM-budget-safe replacement for caching a
+	// gridAnchors[] array on every one of DJ_ASSIST_MAX_INDEX_ENTRIES
+	// candidate-table entries. Called only from
+	// DjAssistController::stepGridHydration() (background-worker thread),
+	// never from DjSession::loop().
+	bool assistTrackGridAnchors(
+		uint32_t index, DjGridAnchor* outAnchors, uint16_t& outAnchorCount, uint32_t& outRevision
+	) override;
 	// Cheap, in-memory downbeat hint from the already-built beat grid,
 	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
 	// are expected to throttle the latter (see DjAssistController).
@@ -136,6 +161,76 @@ public:
 	void assistPurgePendingSystemCommands(uint8_t deck) override;
 
 	bool copySnapshot(DjSnapshot& snapshot) override;
+
+	// AutoDjSessionPort (AutoDjSessionActuator.h/.cpp) - candidate table
+	// with artist/title hashes (DjAssistLibraryEntry alone doesn't carry
+	// these), the currently-playing deck's scoring context, stable-ID
+	// load submission/tracking, and the broader manual-takeover surface.
+	// See AutoDjSessionPort.h for the exact contract each method fulfills.
+	uint32_t autoDjCandidateCount() override;
+	bool autoDjCandidateEntry(
+		uint32_t index,
+		DjAssistLibraryEntry& outEntry,
+		uint32_t& outArtistHash,
+		uint32_t& outTitleHash,
+		uint32_t& outRevision
+	) override;
+	uint32_t autoDjMetadataRevision() override;
+	uint32_t autoDjLibraryGeneration() override;
+	DjAssistDeckContext autoDjActiveDeckContext() override;
+	uint8_t autoDjTargetDeck() override;
+	DjSubmitResult autoDjLoadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+	) override;
+	void autoDjTrackCommand(uint32_t commandId) override;
+	DjCommandStatus autoDjCommandStatus(uint32_t commandId) override;
+	// Constructs DJ_COMMAND_ASSIST_ARM_TRANSITION/ASSIST_CANCEL_TRANSITION
+	// directly (not via the public assistArmTransition()/
+	// assistCancelTransition() wrappers, which don't set autoDjOwned) with
+	// origin = DJ_ORIGIN_SYSTEM and autoDjOwned = true, so a manual
+	// takeover purges a still-queued Auto-internal arm/cancel exactly like
+	// it purges a still-queued load. libraryIndex is passed as 0 (see
+	// AutoDjSessionPort.h - the engine never validates it, purely cosmetic
+	// UI bookkeeping for the physical/browser Assist display).
+	DjSubmitResult autoDjArmCoachTransition(
+		uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+	) override;
+	DjSubmitResult autoDjCancelCoachTransition() override;
+	DjAssistMode autoDjCoachTransitionMode() override;
+	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override;
+	bool autoDjConsumePhysicalConfirmation() override;
+	bool autoDjCoachTransitionSettled() override;
+	bool autoDjStableIdAuthorityReady() override;
+	uint64_t autoDjNowMicros() const override;
+
+	// Thin public wrappers over the Auto DJ planner/actuator for the
+	// physical Auto DJ bank and browser/API v2 to drive. Each routes
+	// through submit()/apply() (like assistArmTransition()/
+	// assistCancelTransition() above) rather than calling the actuator
+	// directly, so both origins get the same boot_id/session_id
+	// staleness check, client_command_id idempotent-retry dedup, and a
+	// durable, pollable DjCommandResult - not just a bare bool. Arm/
+	// Resume additionally require autoDjPhysicalConfirm() to have been
+	// called immediately beforehand in the same handler (apply()
+	// consumes the one-shot flag synchronously for these two types).
+	DjSubmitResult autoDjArmCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjStartCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjPauseCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjResumeCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjStopCommand(DjCommandOrigin origin);
+	DjSubmitResult autoDjResetCommand(DjCommandOrigin origin);
+	bool autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistHash, uint32_t titleHash);
+	// Sets the one-shot physical/browser confirmation gate consumed by
+	// autoDjConsumePhysicalConfirmation() on the very next arm()/resume()
+	// check - set from the physical bank's hold-to-confirm gesture
+	// (mirrors Coach's L1/R1 500ms encBtnHold convention) or an
+	// authenticated browser confirm action, never from a plain
+	// press/click.
+	void autoDjPhysicalConfirm();
+	void copyAutoDjSnapshot(AutoDjSnapshot& snapshot) const;
+
 	bool hasPendingLoad();
 	bool libraryWorkAllowed();
 	DjMetadataState refreshLibraryMetadata(uint32_t generation, uint64_t libraryKey);
@@ -242,6 +337,48 @@ private:
 
 	DjAssistController assistController;
 	void tickAssist();
+
+	// Auto DJ's own durable single-slot command-outcome tracker (mirrors
+	// assistTracked's semantics/timing exactly, but for the one
+	// stable-ID load Auto DJ is ever waiting on at a time -
+	// AutoDjSessionActuator enforces the "at most one in flight" part of
+	// the contract, this just needs to survive commandResults' bounded
+	// ring eviction). Only Auto DJ ever submits a DJ_ORIGIN_SYSTEM
+	// LOAD_DECK, so scoping this to that exact command is unambiguous.
+	DjAssistTrackedCommand autoDjTracked;
+	// Broader non-system intent-generation tracker for Auto DJ's manual-
+	// takeover detection (transport/crossfader/rate/load/cue/loop) - see
+	// AutoDjManualIntentGenerations (DjSessionState.h). Bumped from
+	// submit() alongside assistIntentGenerations, via a separate call so
+	// admitAssistCommand() (shared with Coach) never needs to know Auto
+	// DJ exists.
+	AutoDjManualIntentGenerations autoDjManualIntentGenerations;
+	// One-shot physical/browser confirmation gate for autoDjArm()/
+	// autoDjResume() - set by autoDjPhysicalConfirm(), consumed (cleared)
+	// by autoDjConsumePhysicalConfirmation() the first time it is read,
+	// so a stale confirmation can never be replayed by polling again.
+	bool autoDjPhysicalConfirmPending = false;
+	AutoDjSessionActuator autoDjActuator;
+	void tickAutoDj();
+	// Raw actuator calls - only ever invoked from apply() while
+	// commandMutex-serialized command processing already has exclusive
+	// access (see autoDjArmCommand() etc. above for the public,
+	// queue-routed entry point every caller actually uses).
+	bool autoDjArm(){ return autoDjActuator.arm(); }
+	bool autoDjStart(){ return autoDjActuator.start(); }
+	bool autoDjPause(){ return autoDjActuator.pause(); }
+	bool autoDjResume(){ return autoDjActuator.resume(); }
+	bool autoDjStop(){ return autoDjActuator.stop(); }
+	bool autoDjReset(){ return autoDjActuator.reset(); }
+	bool resolveIdentityLoad(
+		const DjCommand& command,
+		char* outPath, size_t outCapacity,
+		JaydMetadata::Track& track,
+		DjTrackMetadataSnapshot& metadata,
+		DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+	);
+	bool installCachedGrid(uint8_t deck, const DjGridAnchor* anchors, uint16_t anchorCount,
+							const DjTrackMetadataSnapshot& metadata);
 
 	DjCommandError validate(const DjCommand& command) const;
 	bool hasDeck(uint8_t deck) const;

@@ -31,23 +31,31 @@ public:
 	bool submit(const DjAssistTransitionStep& step, uint32_t& outCommandId) override{
 		switch(step.action){
 			case DJ_ASSIST_ACTION_START_DECK:
-				return acceptedResult(session_->setPlaying(step.deck, true, DJ_ORIGIN_SYSTEM), outCommandId);
+				return acceptedResult(
+					session_->setPlaying(step.deck, true, DJ_ORIGIN_SYSTEM, step.autoDjOwned), outCommandId
+				);
 			case DJ_ASSIST_ACTION_LOCK_TEMPO:
 			case DJ_ASSIST_ACTION_ENABLE_SYNC: {
 				const int8_t otherDeck = step.deck == 0 ? 1 : 0;
 				return acceptedResult(
-					session_->setSync(step.deck, true, otherDeck, DJ_ORIGIN_SYSTEM), outCommandId
+					session_->setSync(step.deck, true, otherDeck, DJ_ORIGIN_SYSTEM, step.autoDjOwned), outCommandId
 				);
 			}
 			case DJ_ASSIST_ACTION_CROSSFADE:
 				return beginCrossfade(step, outCommandId);
 			case DJ_ASSIST_ACTION_STOP_DECK:
-				return acceptedResult(session_->setPlaying(step.deck, false, DJ_ORIGIN_SYSTEM), outCommandId);
+				return acceptedResult(
+					session_->setPlaying(step.deck, false, DJ_ORIGIN_SYSTEM, step.autoDjOwned), outCommandId
+				);
 			case DJ_ASSIST_ACTION_RELEASE_SYNC:
-				return acceptedResult(session_->setSync(step.deck, false, -1, DJ_ORIGIN_SYSTEM), outCommandId);
+				return acceptedResult(
+					session_->setSync(step.deck, false, -1, DJ_ORIGIN_SYSTEM, step.autoDjOwned), outCommandId
+				);
 			case DJ_ASSIST_ACTION_SET_MIX: {
 				const uint8_t mixValue = step.param > 255 ? 255 : uint8_t(step.param);
-				return acceptedResult(session_->setMix(mixValue, DJ_ORIGIN_SYSTEM), outCommandId);
+				return acceptedResult(
+					session_->setMix(mixValue, DJ_ORIGIN_SYSTEM, step.autoDjOwned), outCommandId
+				);
 			}
 			case DJ_ASSIST_ACTION_WAIT_BOUNDARY:
 				break; // engine never submits this action to the actuator.
@@ -68,6 +76,12 @@ private:
 	uint8_t crossfadeToDeck_ = 0;
 	uint8_t crossfadeBeats_ = 16;
 	uint64_t crossfadeStartMicros_ = 0;
+	// Captured from the CROSSFADE step at beginCrossfade() time: the ramp's
+	// intermediate/final setMix() calls happen in pollCrossfade(), which
+	// only ever sees the opaque commandId afterward, not the step - so the
+	// ownership tag must be remembered here to still reach every one of
+	// them (see DjAssistTransitionStep::autoDjOwned).
+	bool crossfadeAutoDjOwned_ = false;
 	// True once the ramp's exact endpoint value has been submitted as a
 	// single tracked command (crossfadeFinalCommandId_); before that,
 	// intermediate ramp ticks are fire-and-forget.
@@ -91,6 +105,7 @@ private:
 		crossfadeToDeck_ = step.deck;
 		crossfadeBeats_ = (step.param > 0 && step.param <= 255) ? uint8_t(step.param) : 16;
 		crossfadeStartMicros_ = micros();
+		crossfadeAutoDjOwned_ = step.autoDjOwned;
 		crossfadeFinalSubmitted_ = false;
 		crossfadeFinalCommandId_ = 0;
 		outCommandId = crossfadeId_;
@@ -129,7 +144,7 @@ private:
 		const uint8_t targetEndpoint = crossfadeToDeck_ == 0 ? 0 : 255;
 
 		if(mixValue == targetEndpoint){
-			const DjSubmitResult result = session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
+			const DjSubmitResult result = session_->setMix(mixValue, DJ_ORIGIN_SYSTEM, crossfadeAutoDjOwned_);
 			if(result.status != DJ_COMMAND_REJECTED){
 				crossfadeFinalSubmitted_ = true;
 				crossfadeFinalCommandId_ = result.id;
@@ -141,7 +156,7 @@ private:
 
 		// Intermediate ramp value: fire-and-forget, superseded freely - not
 		// tracked (only the final endpoint command is durably watched).
-		session_->setMix(mixValue, DJ_ORIGIN_SYSTEM);
+		session_->setMix(mixValue, DJ_ORIGIN_SYSTEM, crossfadeAutoDjOwned_);
 		return DJ_COMMAND_PENDING;
 	}
 };
@@ -219,6 +234,11 @@ void DjAssistController::fillWorkerStepTrampoline(void* self){
 void DjAssistController::fillWorkerStep(){
 	if(!session_ || allocationFailed_) return;
 
+	// Bounded, independent of the main candidate-table fill progress below
+	// (which early-returns once fillComplete_ - grid hydration must not
+	// stall just because the rest of the table already finished filling).
+	stepGridHydration();
+
 	const uint32_t currentGeneration = session_->assistMetadataRevision();
 
 	candidateMutex_.lock();
@@ -294,6 +314,73 @@ void DjAssistController::fillWorkerStep(){
 	candidateMutex_.unlock();
 }
 
+// Bounded, incremental hydration of at most ONE pending grid-cache request
+// per call (see DjAssistGridCache/DjAssistGridCacheSlot's doc comments) -
+// this is the review-flagged PSRAM-budget fix's on-demand replacement for
+// caching gridAnchors[] on every candidate-table entry: only the handful of
+// identities Auto DJ actually requested a load for ever get their grid
+// anchors computed, and only via this background-worker step, never on
+// DjSession::loop()'s thread.
+void DjAssistController::stepGridHydration(){
+	candidateMutex_.lock();
+	const int pendingIndex = gridCache_.findPending();
+	if(pendingIndex < 0){
+		candidateMutex_.unlock();
+		return;
+	}
+	const DjAssistGridCacheSlot pending = gridCache_.at(uint8_t(pendingIndex));
+	// The candidate table's own fill must be current AND complete for
+	// this exact metadataRevision before its entries_[] can be trusted to
+	// resolve pending.identity to a libraryIndex - otherwise this could
+	// either miss a real match (fill still in progress) or match a stale
+	// record left over from a previous generation.
+	if(!fillComplete_ || !DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, pending.metadataRevision)){
+		candidateMutex_.unlock();
+		return;
+	}
+	int32_t matchedIndex = -1;
+	for(uint16_t i = 0; i < entryTotal_; ++i){
+		// Exact match only (djTrackIdentityExactMatch, DjSessionState.h) -
+		// not DjAssistScoring::identityMatches(), which ignores sourceId
+		// once both sides have a fingerprint. A same-fingerprint-
+		// different-sourceId alias here would hydrate the WRONG track's
+		// grid anchors into this pending request's cache slot.
+		if(djTrackIdentityExactMatch(entries_[i].identity, pending.identity)){
+			matchedIndex = int32_t(i);
+			break;
+		}
+	}
+	candidateMutex_.unlock();
+
+	if(matchedIndex < 0){
+		candidateMutex_.lock();
+		gridCache_.resolve(
+			pendingIndex, pending.libraryGeneration, pending.metadataRevision, pending.identity, false, nullptr, 0
+		);
+		candidateMutex_.unlock();
+		return;
+	}
+
+	// The actual (possibly SD-backed) read happens OUTSIDE the lock -
+	// mirrors fillWorkerStep()'s own discipline for assistTrackEntry().
+	DjGridAnchor anchors[DJ_GRID_ANCHOR_CAPACITY];
+	uint16_t anchorCount = 0;
+	uint32_t readRevision = 0;
+	const bool ok = session_->assistTrackGridAnchors(uint32_t(matchedIndex), anchors, anchorCount, readRevision);
+
+	candidateMutex_.lock();
+	// Re-validate the revision the read was actually performed under
+	// immediately before committing - a refresh landing in the gap while
+	// this (possibly slow) read was outside the lock must not let a
+	// now-stale result be handed out as current.
+	const bool stillValid = ok && DjAssistBridge::candidateGenerationCurrent(pending.metadataRevision, readRevision);
+	gridCache_.resolve(
+		pendingIndex, pending.libraryGeneration, pending.metadataRevision, pending.identity,
+		stillValid, anchors, anchorCount
+	);
+	candidateMutex_.unlock();
+}
+
 // Bounded, lock-protected readiness check - never blocks on I/O (the fill
 // task never holds candidateMutex_ across a read). Retained for tests/
 // diagnostics (see DjAssistIntegrationSelfCheck::tableReady()), but
@@ -310,6 +397,47 @@ bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
 	outGeneration = loadedGeneration_;
 	candidateMutex_.unlock();
 	return ready;
+}
+
+// Public, RAM-only candidate accessors (see DjAssistController.h's doc
+// comment). entryTotal_ is only ever set once - to the full, capped count -
+// at the moment fillWorkerStep() finishes a complete pass for a generation
+// (see that function); it stays 0 for the entire duration a fill is still
+// in progress for a newer generation, so returning it directly here is
+// already the exact "fully filled or nothing" gate a caller needs, with no
+// separate readiness check required.
+uint32_t DjAssistController::candidateCount(){
+	candidateMutex_.lock();
+	const uint32_t count = entryTotal_;
+	candidateMutex_.unlock();
+	return count;
+}
+
+bool DjAssistController::candidateEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision){
+	candidateMutex_.lock();
+	outRevision = loadedGeneration_;
+	const bool ok = entries_ != nullptr && index < entryTotal_;
+	if(ok) outEntry = entries_[index];
+	candidateMutex_.unlock();
+	return ok;
+}
+
+void DjAssistController::requestGridHydration(
+	uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity
+){
+	candidateMutex_.lock();
+	gridCache_.request(libraryGeneration, metadataRevision, identity);
+	candidateMutex_.unlock();
+}
+
+bool DjAssistController::gridAnchorsFor(
+	uint32_t libraryGeneration, uint32_t metadataRevision, const DjTrackIdentity& identity,
+	DjGridAnchor* outAnchors, uint16_t& outAnchorCount
+){
+	candidateMutex_.lock();
+	const bool ok = gridCache_.lookup(libraryGeneration, metadataRevision, identity, outAnchors, outAnchorCount);
+	candidateMutex_.unlock();
+	return ok;
 }
 
 void DjAssistController::updateRecentTracks(const DjSnapshot& snapshot){
@@ -686,6 +814,13 @@ void DjAssistController::tickRollback(){
 		step.action = DJ_ASSIST_ACTION_STOP_DECK;
 		step.deck = p.toDeck;
 	}
+	// Deliberately left autoDjOwned=false (its default): rollback restores
+	// known-safe baseline state and must run to completion even if an
+	// unrelated manual command arrives mid-restore, unlike the forward
+	// plan steps below. assistPurgePendingSystemCommands() above already
+	// purges any stale pending SYSTEM SET_PLAYING/SET_SYNC/SET_MIX for
+	// these two decks once, at the moment rollback begins - the case this
+	// step's ownership tag would otherwise exist to cover.
 
 	if(!rollbackSubmitted_){
 		uint32_t commandId = 0;
@@ -746,6 +881,11 @@ bool DjAssistController::setCoachEnabled(bool enabled){
 	return true;
 }
 
+bool DjAssistController::rollbackSettled() const{
+	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return true;
+	return rollbackPhase_ == DjAssistBridge::DJ_ASSIST_ROLLBACK_DONE;
+}
+
 bool DjAssistController::armTransition(
 	uint8_t fromDeck,
 	uint8_t toDeck,
@@ -753,14 +893,26 @@ bool DjAssistController::armTransition(
 	const DjTrackIdentity& targetIdentity,
 	uint8_t crossfadeBeats,
 	bool startAtBoundary,
-	bool tempoLock
+	bool tempoLock,
+	bool autoDjOwned
 ){
 	if(!session_) return false;
+	// Defense in depth: engine_.armTransition() itself only refuses to
+	// re-arm while mode_ is TRANSITION_ARMED/TRANSITION_RUNNING - it has no
+	// visibility into rollbackPhase_, which is tracked entirely up here in
+	// the controller. Without this check a fresh arm could succeed the
+	// instant mode_ is TRANSITION_FAILED even though tickRollback() is
+	// still mid-flight undoing the PREVIOUS plan's mutations; armed==true
+	// below then unconditionally resets rollbackPhase_/rollbackSubmitted_,
+	// orphaning that in-flight rollback command so nothing ever polls it
+	// again while it can still land on the new transition's target deck.
+	if(!rollbackSettled()) return false;
 	DjSnapshot snapshot;
 	session_->copySnapshot(snapshot);
 	const DjAssistGuardSnapshot guard = buildGuard(snapshot);
 	const bool armed = engine_.armTransition(
-		fromDeck, toDeck, libraryIndex, targetIdentity, crossfadeBeats, startAtBoundary, tempoLock, guard
+		fromDeck, toDeck, libraryIndex, targetIdentity, crossfadeBeats, startAtBoundary, tempoLock, guard,
+		autoDjOwned
 	);
 	// A fresh plan must never reuse a WAIT_BOUNDARY target or rollback
 	// state latched by a previous transition (cancelled/failed/completed).
