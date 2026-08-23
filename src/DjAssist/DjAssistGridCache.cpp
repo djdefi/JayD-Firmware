@@ -1,14 +1,19 @@
 #include "DjAssistGridCache.h"
-#include "DjAssistScoring.h"
 
 namespace {
 
+// Uses the strict djTrackIdentityExactMatch() (DjSessionState.h), not
+// DjAssistScoring::identityMatches() - a grid-cache hit/miss is a direct
+// stand-in for "this is the exact track a stable-ID load resolved to", so
+// a same-fingerprint-different-sourceId alias here would silently install
+// the wrong track's beat grid onto the deck. See that comparator's own
+// doc comment for the full rationale.
 bool sameKey(
 	const DjAssistGridCacheSlot& slot, uint32_t libraryGeneration, uint32_t metadataRevision,
 	const DjTrackIdentity& identity
 ){
 	return slot.libraryGeneration == libraryGeneration && slot.metadataRevision == metadataRevision &&
-		DjAssistScoring::identityMatches(slot.identity, identity);
+		djTrackIdentityExactMatch(slot.identity, identity);
 }
 
 } // namespace

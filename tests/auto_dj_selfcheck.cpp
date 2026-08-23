@@ -29,6 +29,19 @@ AutoDjIdentity makeIdentity(uint8_t fingerprintByte, uint32_t generation = 1, ui
 	return identity;
 }
 
+// Same fingerprint byte as makeIdentity(fingerprintByte, ...) would produce,
+// but also carries distinct sourceId evidence - used to prove sameTrack()
+// (and everything built on it: DjAutoDjQueue::containsIdentity()/isQueued(),
+// DjAutoDjHistory::wasRecentlyPlayed()) never aliases two tracks that share
+// a fingerprint but come from different sources.
+AutoDjIdentity makeIdentityWithSource(uint8_t fingerprintByte, uint8_t sourceByte,
+									   uint32_t generation = 1, uint32_t revision = 1){
+	AutoDjIdentity identity = makeIdentity(fingerprintByte, generation, revision);
+	identity.flags |= AUTO_DJ_IDENTITY_SOURCE;
+	memset(identity.sourceId, sourceByte, sizeof(identity.sourceId));
+	return identity;
+}
+
 AutoDjCandidate makeCandidate(uint8_t fingerprintByte, uint32_t artistHash = 0,
 							   uint32_t titleHash = 0, bool hasMetadata = false, uint32_t score = 0){
 	AutoDjCandidate candidate;
@@ -181,6 +194,38 @@ void testQueueRevisionInvalidation(){
 	assert(queue.popNext(entry));
 	assert(entry.identity.fingerprint[0] == 2);
 	assert(queue.empty());
+}
+
+// -- round 5, fix #3 (exact-identity aliasing) --
+// Two tracks sharing a fingerprint but differing only in sourceId must
+// never be treated as "the same queued track": containsIdentity()/
+// isQueued() (used to prevent double-queuing the same candidate) and
+// wasRecentlyPlayed() (recent-repeat exclusion) both go through
+// AutoDjIdentity::sameTrack(), which previously matched on fingerprint
+// alone.
+void testQueueDoesNotAliasSameFingerprintDifferentSource(){
+	DjAutoDjQueue queue;
+	AutoDjIdentity x = makeIdentityWithSource(9, 0xA1);
+	AutoDjIdentity y = makeIdentityWithSource(9, 0xB2); // same fingerprint, different source.
+
+	assert(queue.pushPlanned(x, 0, 0, AUTO_DJ_REASON_NONE));
+	assert(!queue.containsIdentity(y)); // Y must not alias X's queued entry.
+	assert(queue.containsIdentity(x));
+
+	// Y is genuinely a distinct track, so it must be queueable even while
+	// X (same fingerprint, different source) is already queued.
+	assert(queue.pushPlanned(y, 0, 0, AUTO_DJ_REASON_NONE));
+	assert(queue.depth() == 2);
+}
+
+void testHistoryDoesNotAliasSameFingerprintDifferentSource(){
+	DjAutoDjHistory history;
+	AutoDjIdentity x = makeIdentityWithSource(9, 0xA1);
+	AutoDjIdentity y = makeIdentityWithSource(9, 0xB2); // same fingerprint, different source.
+	history.record(x, /*artistHash=*/0, /*titleHash=*/0);
+
+	assert(history.wasRecentlyPlayed(x, AUTO_DJ_DEFAULT_RECENT_EXCLUSION));
+	assert(!history.wasRecentlyPlayed(y, AUTO_DJ_DEFAULT_RECENT_EXCLUSION)); // must not alias X.
 }
 
 void testHistoryExclusion(){
@@ -843,6 +888,8 @@ int main(){
 	testQueueFullEmpty();
 	testQueueInvalidation();
 	testQueueRevisionInvalidation();
+	testQueueDoesNotAliasSameFingerprintDifferentSource();
+	testHistoryDoesNotAliasSameFingerprintDifferentSource();
 	testHistoryExclusion();
 	testPlannerSelectionExcludesRecentArtistTitle();
 	testPlannerTieBreakIsOrderIndependent();

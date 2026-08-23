@@ -133,7 +133,27 @@ public:
 	// Any other rejected reset (no live transition to abandon: Idle,
 	// LoadInFlight, or already Teardown/Stopping) is a true no-op - zero
 	// effect on Coach or loadSubPhase.
+	//
+	// One more guard applies before any of the above: a FailedTerminal
+	// outcome (see pollTeardownPhase()'s doc comment) deliberately leaves
+	// loadSubPhase in Teardown - not Idle - specifically because the
+	// Coach rollback this actuator gave up waiting on may still genuinely
+	// be in flight on real hardware. planner.reset() has no visibility
+	// into that and would happily accept the reset the instant state
+	// reaches Failed, clearing loadSubPhase to Idle regardless of
+	// settlement and letting the very next arm()/tick() burn or skip
+	// queue entries while the old rollback's commands are still racing
+	// the deck. So: whenever loadSubPhase == Teardown and settlement
+	// hasn't actually been confirmed yet, reset() must reject outright,
+	// with zero mutation - Failed, the queue, and Teardown are all
+	// preserved exactly - regardless of what planner.reset() would do.
+	// Only once autoDjCoachTransitionSettled() is true does this fall
+	// through to the normal handling below, which then correctly clears
+	// Teardown to Idle via the success path's unconditional assignment.
 	bool reset(){
+		if(loadSubPhase == AutoDjLoadSubPhase::Teardown && !sessionPort.autoDjCoachTransitionSettled()){
+			return false;
+		}
 		if(planner.reset()){
 			if(loadSubPhase == AutoDjLoadSubPhase::ArmInFlight || loadSubPhase == AutoDjLoadSubPhase::TransitionInFlight){
 				sessionPort.autoDjCancelCoachTransition();
@@ -173,8 +193,16 @@ public:
 	}
 
 	// -- AutoDjLoadPort --
+	// Backed by the live DjAssistController authority, not a static "the
+	// code path is compiled in" answer - see AutoDjSessionPort::
+	// autoDjStableIdAuthorityReady()'s doc comment. Checked on every call
+	// (arm()/start() admission via DjAutoDjPlanner, and every tick()) so
+	// an allocation failure, a fill-worker launch failure, or the worker
+	// having since exited all correctly disable the capability rather
+	// than letting Auto arm and then retry forever against an authority
+	// that can never produce a candidate.
 	bool hasStableIdEndpoint() const override{
-		return true; // the stable-ID load path is unconditionally compiled in.
+		return sessionPort.autoDjStableIdAuthorityReady();
 	}
 
 	bool submitLoad(const AutoDjIdentity& identity) override{

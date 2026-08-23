@@ -174,6 +174,17 @@ public:
 		return coachTransitionSettled;
 	}
 
+	// Defaults to true so every pre-existing scenario (written before this
+	// accessor existed) keeps observing the capability as available,
+	// exactly as the old unconditional `hasStableIdEndpoint() == true`
+	// did. Tests exercising fix 2 (capability false-positive on
+	// allocation/worker failure) flip this to false to prove arm()/
+	// start()/the ongoing queue-fill all correctly see it degrade.
+	bool stableIdAuthorityReady = true;
+	bool autoDjStableIdAuthorityReady() override{
+		return stableIdAuthorityReady;
+	}
+
 	uint64_t autoDjNowMicros() const override{
 		return fakeNowUs;
 	}
@@ -873,6 +884,22 @@ void testTeardownTimeoutBecomesTerminalFailureNotRetry(){
 	memset(anyIdentity.fingerprint, 0xEF, sizeof(anyIdentity.fingerprint));
 	assert(!actuator.submitLoad(anyIdentity));
 	assert(!port.lastLoadCalled);
+
+	// The core fix under test: reset() must reject outright while
+	// loadSubPhase is still Teardown and rollback genuinely has not
+	// settled - even though planner state is Failed (which, on its own,
+	// is exactly the condition reset() normally accepts). A rejected
+	// reset here must be a true no-op: Failed preserved, queue/history
+	// completely untouched, and arm() still rejected immediately after -
+	// proving no side effect snuck through via reset()'s attempt.
+	assert(!actuator.reset());
+	assert(actuator.state() == AutoDjState::Failed);
+	AutoDjSnapshot stillUnsettled;
+	actuator.copySnapshot(stillUnsettled);
+	assert(stillUnsettled.queueDepth == 1);
+	assert(stillUnsettled.historySize == 0);
+	assert(!actuator.arm());
+	assert(actuator.state() == AutoDjState::Failed);
 
 	// Once rollback genuinely settles, the hard-reject lifts (it only
 	// blocks while genuinely unsettled, never permanently) - reset() is

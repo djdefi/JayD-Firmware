@@ -102,12 +102,37 @@ struct AutoDjIdentity {
 		return flags != 0;
 	}
 
+	// Exact stable-identity comparator: requires EVERY present component
+	// to match, not fingerprint alone. Two tracks that share a fingerprint
+	// but differ only in sourceId (the exact review-flagged alias: the
+	// old fingerprint-only check let a same-fingerprint-different-source
+	// candidate be silently treated as "already queued"/"recently played",
+	// so it could never itself be queued, or - via the equivalent
+	// DjTrackIdentity-level bug this mirrors, see djTrackIdentityExactMatch
+	// in DjSessionState.h - resolve to the wrong cached path/grid) must
+	// never compare equal here. Requires: identical flags (a fingerprint-
+	// only identity must never alias one that also carries source
+	// evidence, or vice versa), an exact fingerprint match, an exact
+	// sourceId match whenever the SOURCE flag is set, and matching
+	// libraryGeneration - by the time this runs, invalidateGeneration()/
+	// invalidateRevision() have already dropped any queue entry whose
+	// generation/revision no longer matches the live values (see their
+	// own doc comments), so this is defense-in-depth, not the primary
+	// enforcement. metadataRevision is deliberately NOT compared here: it
+	// is an external validity epoch (see its own doc comment above),
+	// already enforced by invalidateRevision() before any dedup/exclusion
+	// check runs - mirrors DjAssistGridCache::sameKey()'s own split
+	// between the identity match itself and its external generation/
+	// revision key parameters.
 	bool sameTrack(const AutoDjIdentity& other) const{
 		if(!valid() || !other.valid()) return false;
-		if(!(flags & AUTO_DJ_IDENTITY_FINGERPRINT) || !(other.flags & AUTO_DJ_IDENTITY_FINGERPRINT)){
-			return false;
+		if(flags != other.flags) return false;
+		if(!(flags & AUTO_DJ_IDENTITY_FINGERPRINT)) return false;
+		if(memcmp(fingerprint, other.fingerprint, sizeof(fingerprint)) != 0) return false;
+		if(flags & AUTO_DJ_IDENTITY_SOURCE){
+			if(memcmp(sourceId, other.sourceId, sizeof(sourceId)) != 0) return false;
 		}
-		return memcmp(fingerprint, other.fingerprint, sizeof(fingerprint)) == 0;
+		return libraryGeneration == other.libraryGeneration;
 	}
 };
 

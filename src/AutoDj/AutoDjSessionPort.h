@@ -124,6 +124,20 @@ public:
 	// can go on to mutate the NEW transition's target deck.
 	virtual bool autoDjCoachTransitionSettled() = 0;
 
+	// True only while the live stable-ID candidate/load authority behind
+	// Auto DJ is actually functional right now - see DjAssistController::
+	// authorityReady()'s doc comment for exactly what this covers
+	// (candidate-table allocation + fill-worker launch/liveness). This is
+	// the dynamic signal AutoDjLoadPort::hasStableIdEndpoint() is backed
+	// by: unlike a static "the code path is compiled in" answer, this
+	// degrades to false the moment the authority that would actually
+	// resolve/serve a stable-ID load stops being real (allocation
+	// failure, fill-worker launch failure, or the worker having since
+	// exited), so capability-gated admission (arm()/start()) and the
+	// ongoing tick() loop both see the same live truth rather than
+	// advertising a capability that can never produce anything.
+	virtual bool autoDjStableIdAuthorityReady() = 0;
+
 	// Monotonic wall-clock read (microseconds) - see AutoDjLoadPort::
 	// nowMicros()'s own doc comment for why this replaced a loop-tick
 	// count. DjSession implements this with a real micros() read;

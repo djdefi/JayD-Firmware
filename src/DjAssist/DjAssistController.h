@@ -100,6 +100,31 @@ public:
 	// actually done, not merely started.
 	bool rollbackSettled() const;
 
+	// True only while the stable-ID candidate authority this controller
+	// backs is actually functional: the candidate table was successfully
+	// allocated (ps_malloc didn't fail - see allocationFailed_) AND the
+	// background fill worker that populates it is actually running (see
+	// DjAssistFillWorker::launched()/exited()). Both failure modes are
+	// silent otherwise - begin() simply leaves entries_ null or the table
+	// permanently empty rather than crashing - so without this check a
+	// caller has no way to distinguish "authority is real but empty right
+	// now" from "authority can never produce a candidate no matter how
+	// long it waits". AutoDjSessionActuator::hasStableIdEndpoint() (via
+	// AutoDjSessionPort) uses this as the live signal behind the
+	// capability it advertises, checked on every call rather than cached
+	// once at begin() time - a launched() worker that later reports
+	// exited() (stopped/crashed after launch) degrades this back to false
+	// immediately, so Auto DJ's capability check (arm()/start() admission
+	// and the ongoing tick() loop) sees the same live truth an in-flight
+	// attempt would need to safely pause/fail on, rather than continuing
+	// to believe a capability that can no longer produce anything.
+	// entries_ being ps_malloc'd successfully but the fill worker having
+	// failed to launch (or having since exited) both correctly report
+	// false: neither one can ever fill the table going forward.
+	bool authorityReady() const{
+		return !allocationFailed_ && entries_ != nullptr && fillWorker_.launched() && !fillWorker_.exited();
+	}
+
 	// Bounded, RAM-only read of the background-filled candidate table
 	// (see fillWorkerStep()) - NEVER touches the metadata reader/SD card
 	// itself, unlike assistTrackEntry()/DjSession's old direct-reader

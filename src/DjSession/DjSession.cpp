@@ -685,8 +685,12 @@ bool DjSession::resolveIdentityLoad(
 		// up after a same-generation metadata replacement - never trust
 		// one of those, even if its fingerprint happens to still match.
 		if(entryRevision != liveRevision) continue;
-		if(!(entry.identity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) continue;
-		if(memcmp(entry.identity.fingerprint, command.trackIdentity.fingerprint, 16) != 0) continue;
+		// Exact stable-identity match only (see djTrackIdentityExactMatch's
+		// doc comment, DjSessionState.h) - a bare fingerprint memcmp here
+		// previously ignored sourceId entirely, so two entries sharing a
+		// fingerprint but carrying different sourceId bytes could resolve
+		// to each other's cached path/grid/metadata.
+		if(!djTrackIdentityExactMatch(entry.identity, command.trackIdentity)) continue;
 		if(matched){
 			ambiguous = true;
 			break;
@@ -1333,6 +1337,10 @@ bool DjSession::autoDjConsumePhysicalConfirmation(){
 
 bool DjSession::autoDjCoachTransitionSettled(){
 	return assistController.rollbackSettled();
+}
+
+bool DjSession::autoDjStableIdAuthorityReady(){
+	return assistController.authorityReady();
 }
 
 uint64_t DjSession::autoDjNowMicros() const{

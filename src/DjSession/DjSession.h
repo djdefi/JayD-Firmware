@@ -202,6 +202,7 @@ public:
 	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override;
 	bool autoDjConsumePhysicalConfirmation() override;
 	bool autoDjCoachTransitionSettled() override;
+	bool autoDjStableIdAuthorityReady() override;
 	uint64_t autoDjNowMicros() const override;
 
 	// Thin public wrappers over the Auto DJ planner/actuator for the

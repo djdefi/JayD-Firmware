@@ -340,7 +340,12 @@ void DjAssistController::stepGridHydration(){
 	}
 	int32_t matchedIndex = -1;
 	for(uint16_t i = 0; i < entryTotal_; ++i){
-		if(DjAssistScoring::identityMatches(entries_[i].identity, pending.identity)){
+		// Exact match only (djTrackIdentityExactMatch, DjSessionState.h) -
+		// not DjAssistScoring::identityMatches(), which ignores sourceId
+		// once both sides have a fingerprint. A same-fingerprint-
+		// different-sourceId alias here would hydrate the WRONG track's
+		// grid anchors into this pending request's cache slot.
+		if(djTrackIdentityExactMatch(entries_[i].identity, pending.identity)){
 			matchedIndex = int32_t(i);
 			break;
 		}

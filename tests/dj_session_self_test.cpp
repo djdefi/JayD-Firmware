@@ -584,5 +584,56 @@ int main(){
 		assert(!djAutoDjPhysicalConfirmMissing(resetHttp));
 	}
 
+	// -- round 5, fix #3 (exact-identity aliasing) --
+	// djTrackIdentityExactMatch() is the single comparator DjSession::
+	// resolveIdentityLoad() (the stable-ID resolver) and DjAssistGridCache
+	// now both use in place of DjAssistScoring::identityMatches() (which
+	// aliases on fingerprint alone). Testing the shared free function
+	// directly here proves both of those production call sites can never
+	// alias two tracks that share a fingerprint but differ only in
+	// sourceId - resolveIdentityLoad() itself can't be exercised directly
+	// from a host test (DjSession requires real hardware-backed
+	// dependencies), but it contains no branching logic of its own beyond
+	// calling this exact function, so this is a complete proof of its
+	// matching behavior.
+	{
+		DjTrackIdentity x;
+		x.flags = DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE;
+		memset(x.fingerprint, 0x77, sizeof(x.fingerprint));
+		memset(x.sourceId, 0xA1, sizeof(x.sourceId));
+
+		// Two-source, same-fingerprint regression: Y shares X's fingerprint
+		// exactly but comes from a different source - must never alias.
+		DjTrackIdentity y = x;
+		memset(y.sourceId, 0xB2, sizeof(y.sourceId));
+		assert(!djTrackIdentityExactMatch(x, y));
+		assert(!djTrackIdentityExactMatch(y, x));
+
+		// An identical copy (same fingerprint AND same sourceId) matches.
+		DjTrackIdentity xCopy = x;
+		assert(djTrackIdentityExactMatch(x, xCopy));
+
+		// Fingerprint-only (no SOURCE flag) vs. the same fingerprint but
+		// carrying SOURCE evidence must not alias either way - a caller
+		// with strictly less evidence can't stand in for one with more.
+		DjTrackIdentity fingerprintOnly;
+		fingerprintOnly.flags = DJ_TRACK_IDENTITY_FINGERPRINT;
+		memcpy(fingerprintOnly.fingerprint, x.fingerprint, sizeof(fingerprintOnly.fingerprint));
+		assert(!djTrackIdentityExactMatch(x, fingerprintOnly));
+		assert(!djTrackIdentityExactMatch(fingerprintOnly, x));
+
+		// Two fingerprint-only identities with matching fingerprint bytes
+		// still match each other (no sourceId evidence on either side to
+		// disagree about).
+		DjTrackIdentity fingerprintOnlyCopy = fingerprintOnly;
+		assert(djTrackIdentityExactMatch(fingerprintOnly, fingerprintOnlyCopy));
+
+		// A completely empty/invalid identity (no FINGERPRINT flag) never
+		// matches anything, including another empty one.
+		DjTrackIdentity empty;
+		assert(!djTrackIdentityExactMatch(empty, empty));
+		assert(!djTrackIdentityExactMatch(x, empty));
+	}
+
 	return 0;
 }

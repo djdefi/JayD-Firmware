@@ -47,6 +47,44 @@ struct DjTrackIdentity {
 	uint8_t sourceId[16] = {};
 };
 
+// Strict, exact stable-identity comparator. Deliberately NOT the same as
+// DjAssistScoring::identityMatches() (Coach's own "is this approximately
+// the same track" heuristic used for suggestion/deck-guard matching): that
+// function matches on fingerprint alone the instant BOTH sides carry the
+// FINGERPRINT flag, even if both also carry a SOURCE flag with different
+// sourceId bytes - a harmless simplification for a scoring/suggestion
+// label, but unsafe for anything that resolves a stable identity to an
+// actual internal path/grid/metadata association, where a false-positive
+// match would silently install the WRONG track's data. This comparator
+// instead requires:
+//   - identical flags (a fingerprint-only identity must never match one
+//     that also carries source evidence, or vice versa - a caller with
+//     more evidence than the candidate can't have that evidence silently
+//     ignored, and a candidate with less evidence can't be trusted to
+//     stand in for one with more);
+//   - the FINGERPRINT flag present (fingerprint is always the primary
+//     key - an identity without it is never treated as resolvable here);
+//   - an exact fingerprint byte match;
+//   - an exact sourceId byte match too, but ONLY when the SOURCE flag is
+//     actually set (this is the exact aliasing bug fixed: two entries
+//     that share a fingerprint but differ only in sourceId must never
+//     resolve to each other's cached path/grid/metadata).
+// This is the ONLY comparator Auto DJ's own stable-ID resolver
+// (DjSession::resolveIdentityLoad()), grid cache (DjAssistGridCache), and
+// queued-command validation may use - never DjAssistScoring::
+// identityMatches(), which remains exactly as-is for Coach's own scoring/
+// suggestion/deck-guard use (out of scope to change - shared, approved,
+// upstream-owned code).
+inline bool djTrackIdentityExactMatch(const DjTrackIdentity& a, const DjTrackIdentity& b){
+	if(a.flags != b.flags) return false;
+	if(!(a.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) return false;
+	if(memcmp(a.fingerprint, b.fingerprint, sizeof(a.fingerprint)) != 0) return false;
+	if(a.flags & DJ_TRACK_IDENTITY_SOURCE){
+		if(memcmp(a.sourceId, b.sourceId, sizeof(a.sourceId)) != 0) return false;
+	}
+	return true;
+}
+
 struct DjTrackMetadataSnapshot {
 	DjMetadataState state = DJ_METADATA_ABSENT;
 	uint16_t capabilities = 0;

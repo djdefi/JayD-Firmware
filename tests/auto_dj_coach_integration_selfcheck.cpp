@@ -334,6 +334,16 @@ public:
 		return controller->rollbackSettled();
 	}
 
+	// Real controller wiring (not a test-controllable flag) - this
+	// harness exercises the actual DjAssistController::authorityReady()
+	// signal end-to-end so allocation/worker-launch-failure tests prove
+	// arm()/start()/tick() genuinely see it degrade, not merely that a
+	// mock flag can be flipped.
+	bool autoDjStableIdAuthorityReady() override{
+		if(!controller) return false;
+		return controller->authorityReady();
+	}
+
 	uint64_t autoDjNowMicros() const override{
 		return uint64_t(micros());
 	}
@@ -953,7 +963,78 @@ public:
 	static void stepFill(DjAssistController& controller){
 		controller.fillWorkerStep();
 	}
+
+	// Round 5, fix #2 (capability false-positive) test-only seam: forces
+	// the NEXT fillWorker_.begin() call (i.e. the one DjAssistController::
+	// begin() itself makes) to report launch failure, exactly mirroring a
+	// real xTaskCreate()/thread-creation failure on hardware. One-shot -
+	// consumed by that single begin() call, same as
+	// DjAssistFillWorker::forceLaunchFailureForTest's own contract.
+	static void forceFillWorkerLaunchFailure(DjAssistController& controller){
+		controller.fillWorker_.forceLaunchFailureForTest = true;
+	}
 };
+
+namespace {
+
+// -- round 5, fix #2 (capability false-positive) --
+// hasStableIdEndpoint() must reflect DjAssistController::authorityReady(),
+// not unconditionally report true. When the fill worker fails to launch
+// (a real task/thread-creation failure), the candidate table can never be
+// filled, so Auto DJ must refuse to arm with CapabilityDisabled rather than
+// arming and then having every load retry exhaust its budget against an
+// empty table.
+void testCapabilityDisabledWhenFillWorkerLaunchFails(){
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x71);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	DjAssistController controller;
+	AutoDjCoachGridHydrationHarness::forceFillWorkerLaunchFailure(controller);
+	controller.begin(&port);
+	port.controller = &controller;
+
+	assert(!controller.authorityReady());
+
+	AutoDjSessionActuator actuator(port);
+	assert(!actuator.arm());
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(actuator.failReason() == AutoDjFailReason::CapabilityDisabled);
+
+	controller.end();
+}
+
+// Sibling of the above, keyed on candidate-table allocation failure
+// (ps_malloc() returning nullptr - simulated PSRAM exhaustion) instead of
+// fill-worker launch failure - the other half of authorityReady()'s guard.
+void testCapabilityDisabledWhenCandidateAllocationFails(){
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x72);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	hostStubSetForcePsMallocFailure(true);
+	DjAssistController controller;
+	controller.begin(&port);
+	hostStubSetForcePsMallocFailure(false); // one-shot fault, clear immediately.
+	port.controller = &controller;
+
+	assert(!controller.authorityReady());
+
+	AutoDjSessionActuator actuator(port);
+	assert(!actuator.arm());
+	assert(actuator.state() == AutoDjState::Failed);
+	assert(actuator.failReason() == AutoDjFailReason::CapabilityDisabled);
+
+	controller.end();
+}
+
+} // namespace
 
 namespace {
 
@@ -1037,5 +1118,7 @@ int main(){
 	testRealCoachGuardRejectionAtArmRetriesThenSucceeds();
 	testCoachFailureRollbackSettlesBeforeAutoDjRetries();
 	testAutoDjLoadTriggersGridHydrationEndToEnd();
+	testCapabilityDisabledWhenFillWorkerLaunchFails();
+	testCapabilityDisabledWhenCandidateAllocationFails();
 	return 0;
 }

@@ -480,6 +480,34 @@ void testGridCacheKeyIncludesGenerationAndRevision(){
 	assert(!cache.lookup(2, 5, identity, out, outCount)); // different generation.
 }
 
+// -- round 5, fix #3 (exact-identity aliasing) --
+// Two tracks sharing a fingerprint but differing only in sourceId must
+// never resolve to each other's cached grid anchors: sameKey() must use
+// djTrackIdentityExactMatch(), not DjAssistScoring::identityMatches()
+// (which returns a match on fingerprint alone once both sides also carry a
+// SOURCE flag, regardless of the sourceId bytes).
+void testGridCacheDoesNotAliasSameFingerprintDifferentSource(){
+	DjAssistGridCache cache;
+
+	DjTrackIdentity x = fingerprintIdentity(9);
+	x.flags |= DJ_TRACK_IDENTITY_SOURCE;
+	memset(x.sourceId, 0xA1, sizeof(x.sourceId));
+
+	DjTrackIdentity y = x; // same fingerprint, different source.
+	memset(y.sourceId, 0xB2, sizeof(y.sourceId));
+
+	cache.request(1, 1, x);
+	const int pending = cache.findPending();
+	assert(pending >= 0);
+	DjGridAnchor anchors[1] = { anchor(1, 1) };
+	cache.resolve(pending, 1, 1, x, true, anchors, 1);
+
+	DjGridAnchor out[DJ_GRID_ANCHOR_CAPACITY] = {};
+	uint16_t outCount = 0;
+	assert(cache.lookup(1, 1, x, out, outCount)); // X's own request resolves.
+	assert(!cache.lookup(1, 1, y, out, outCount)); // Y must never alias X's slot.
+}
+
 } // namespace
 
 int main(){
@@ -512,5 +540,6 @@ int main(){
 	testGridCacheRequestIdempotentWhilePendingOrReady();
 	testGridCacheAnchorCountCappedToCapacity();
 	testGridCacheKeyIncludesGenerationAndRevision();
+	testGridCacheDoesNotAliasSameFingerprintDifferentSource();
 	return 0;
 }
