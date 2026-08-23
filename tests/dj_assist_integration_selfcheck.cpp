@@ -1,6 +1,10 @@
 #include <assert.h>
 #include <string.h>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "../src/DjAssist/DjAssistController.h"
 #include "../src/DjAssist/DjAssistSessionPort.h"
 #include "Arduino.h"
@@ -25,11 +29,18 @@
 // sequence. So this test exercises the real shared admission coordinator
 // used by DjSession, not a parallel reimplementation of it.
 //
-// The background candidate-fill Task is never actually spawned (see
-// tests/host_stubs/Util/Task.h) - this test drives DjAssistController::
-// fillWorkerStep()/candidateTableReady() directly via the friend grant,
-// exactly as many bounded, deterministic calls as it chooses, exercising the
-// identical real stepping logic without needing real threading.
+// The background candidate-fill worker (DjAssistFillWorker - see that
+// header) defaults to a manual-stepping mode on host builds, matching the
+// previous host Task.h stub's behavior exactly: it is never actually
+// spawned as a real thread for most scenarios below, which instead drive
+// DjAssistController::fillWorkerStep()/candidateTableReady() directly via
+// the friend grant, exactly as many bounded, deterministic calls as they
+// choose, exercising the identical real stepping logic without needing
+// real threading. A handful of round-7 scenarios (see
+// testEndBlocksUntilInFlightPortCallReleased and neighbors) deliberately
+// opt a specific controller into DjAssistFillWorker's real std::thread
+// path instead, to prove the actual begin()/end()-vs-in-flight-step
+// concurrency handshake - see DjAssistFillWorker.h's doc comment.
 
 namespace {
 
@@ -73,6 +84,16 @@ public:
 	uint64_t phraseFrame[DJ_DECK_COUNT] = {};
 
 	int purgeCallCount = 0;
+
+	// Round-7 shutdown-race test support (see
+	// testEndBlocksUntilInFlightPortCallReleased): when blockNextEntryRead
+	// is set, the NEXT assistTrackEntry() call parks the CALLING thread
+	// (the real background fill worker thread in that test) until the
+	// test sets releaseReader - proving DjAssistController::end() cannot
+	// return while a real in-flight port call is still executing.
+	std::atomic<bool> blockNextEntryRead{false};
+	std::atomic<bool> readerBlocked{false};
+	std::atomic<bool> releaseReader{false};
 
 	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) override{
 		DjCommand command = {};
@@ -142,6 +163,13 @@ public:
 
 	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override{
 		++assistTrackEntryCallCount;
+		if(blockNextEntryRead.exchange(false)){
+			readerBlocked.store(true);
+			while(!releaseReader.load()){
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			readerBlocked.store(false);
+		}
 		outRevision = generation;
 		if(int(index) == bumpGenerationOnReadIndex){
 			bumpGenerationOnReadIndex = -1; // fires exactly once.
@@ -315,6 +343,35 @@ public:
 			if(controller.candidateTableReady(generation)) return;
 		}
 		assert(false && "candidate table never became ready");
+	}
+
+	// -- round 7 additions: DjAssistFillWorker lifecycle + the
+	// tickSuggestions() TOCTOU test hook. See DjAssistFillWorker.h's doc
+	// comment for why useManualSteppingForTest defaults to true (keeping
+	// every pre-existing scenario above completely unaffected).
+	static void useRealBackgroundThreadForTest(DjAssistController& controller){
+		controller.fillWorker_.useManualSteppingForTest = false;
+	}
+
+	static void forceNextLaunchFailure(DjAssistController& controller){
+		controller.fillWorker_.forceLaunchFailureForTest = true;
+	}
+
+	static bool fillWorkerLaunched(DjAssistController& controller){
+		return controller.fillWorker_.launched();
+	}
+
+	static bool fillWorkerEntered(DjAssistController& controller){
+		return controller.fillWorker_.entered();
+	}
+
+	static bool fillWorkerExited(DjAssistController& controller){
+		return controller.fillWorker_.exited();
+	}
+
+	static void setScanConsumeHook(DjAssistController& controller, void (*hook)(void*), void* arg){
+		controller.testHookBeforeScanConsume_ = hook;
+		controller.testHookBeforeScanConsumeArg_ = arg;
 	}
 };
 
@@ -791,15 +848,11 @@ void testSuggestionsNeverStaleAcrossMetadataRevisionRefresh(){
 // -- DjSession::shutdown() to call assistController.end() before touching
 // -- metadataReader: even a straggling in-flight fillWorkerStep() iteration
 // -- could not go on to call any more port methods (in the real firmware,
-// -- read the metadata reader) once end() has run. The host stub Task
-// -- never actually spawns a real thread (see tests/host_stubs/Util/
-// -- Task.h, by deliberate design so every OTHER scenario in this file
-// -- stays single-threaded/deterministic), so a literal wall-clock
-// -- join-timing race cannot be reproduced here; this proves the
-// -- achievable - and actually load-bearing - half of that invariant, and
-// -- is documented as a known scope limitation rather than claimed as full
-// -- coverage of the join itself (validated instead by full firmware
-// -- build + code review, per this round's report).
+// -- read the metadata reader) once end() has run. This scenario keeps
+// -- DjAssistFillWorker's default manual-stepping mode (see that class's
+// -- doc comment), so it stays single-threaded/deterministic exactly as
+// -- before; the round-7 tests below instead prove the same invariant
+// -- with a genuine background thread and a real in-flight port call.
 void testControllerEndMakesFurtherWorkerCallsSafeNoOps(){
 	FakeAssistSessionPort port;
 	port.entryCount = 3;
@@ -835,6 +888,193 @@ void testControllerEndMakesFurtherWorkerCallsSafeNoOps(){
 	controller.end();
 }
 
+// -- round 7, issue #1 (part A): a failed background-worker launch must ---
+// -- leave the controller in a permanently-disabled-but-harmless state
+// -- (no candidate table ever converges), and end() must return promptly
+// -- rather than hang - this is the actual production bug: CircuitOS's own
+// -- Task::start()/stop(true) deadlocks forever in exactly this scenario
+// -- because Task::start() never restores `stopped` on a failed
+// -- xTaskCreate(). DjAssistFillWorker checks the creation result itself
+// -- and reports it via forceLaunchFailureForTest, so this is exercised
+// -- deterministically without needing to actually exhaust OS resources.
+// -- If DjAssistFillWorker::end() ever regressed to waiting unconditionally
+// -- (like CircuitOS's Task::stop(true)), this test would simply never
+// -- return - the whole test binary would hang, which is the strongest
+// -- signal a single-threaded, no-timeout test can give for "must not
+// -- hang".
+void testFillWorkerLaunchFailureLeavesControllerDisabledAndEndReturnsImmediately(){
+	FakeAssistSessionPort port;
+	port.entryCount = 2;
+	port.entries[0] = makeEntry(0, 50);
+	port.entries[1] = makeEntry(1, 60);
+	port.generation = 1;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+
+	DjAssistController controller;
+	DjAssistIntegrationSelfCheck::forceNextLaunchFailure(controller);
+	controller.begin(&port);
+	assert(!DjAssistIntegrationSelfCheck::fillWorkerLaunched(controller));
+
+	controller.setCoachEnabled(true);
+	// Bounded ticks: the candidate table can never converge since the
+	// fill worker never launched - suggestions must simply stay empty
+	// forever, never crash, never hang.
+	for(int i = 0; i < 50; ++i) controller.tick();
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount == 0);
+
+	// The property under test: this call actually returning (with no
+	// timeout wrapper) is the proof end() did not hang.
+	controller.end();
+}
+
+// -- round 7, issue #1 (part B): with a genuine background std::thread ----
+// -- (opted into via useRealBackgroundThreadForTest(), unlike every other
+// -- scenario in this file), the worker actually sets entered() once
+// -- running, actually converges the real candidate fill entirely on its
+// -- own (no direct fillWorkerStep() calls from this test thread - that
+// -- would itself race with the real worker thread), and end() leaves it
+// -- exited()/not-launched() afterward. This is the "running worker sets
+// -- entered/exited state" half of the review's required properties.
+void testFillWorkerRealThreadEntersRunsAndExitsOnEnd(){
+	FakeAssistSessionPort port;
+	port.entryCount = 2;
+	port.entries[0] = makeEntry(0, 50);
+	port.entries[1] = makeEntry(1, 60);
+	port.generation = 1;
+
+	DjAssistController controller;
+	DjAssistIntegrationSelfCheck::useRealBackgroundThreadForTest(controller);
+	controller.begin(&port);
+	assert(DjAssistIntegrationSelfCheck::fillWorkerLaunched(controller));
+
+	for(int i = 0; i < 2000 && !DjAssistIntegrationSelfCheck::fillWorkerEntered(controller); ++i){
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	assert(DjAssistIntegrationSelfCheck::fillWorkerEntered(controller));
+	assert(!DjAssistIntegrationSelfCheck::fillWorkerExited(controller));
+
+	uint32_t generation = 0;
+	bool ready = false;
+	for(int i = 0; i < 2000 && !ready; ++i){
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		ready = DjAssistIntegrationSelfCheck::tableReady(controller, generation);
+	}
+	assert(ready);
+
+	controller.end();
+	assert(DjAssistIntegrationSelfCheck::fillWorkerExited(controller));
+	assert(!DjAssistIntegrationSelfCheck::fillWorkerLaunched(controller));
+}
+
+// -- round 7, issue #1 (part C, the actual concurrency race): blocks the ---
+// -- real background worker thread INSIDE a real in-flight
+// -- assistTrackEntry() port call (mirroring, in the real firmware, being
+// -- blocked mid-SD-read), then calls end() from a second thread and
+// -- asserts end() cannot return while the port call is still blocked -
+// -- proving the exact handshake DjSession::shutdown() depends on
+// -- (assistController.end() before metadataReader.close()): no in-flight
+// -- reader call can still be executing once end() has returned. Releasing
+// -- the block then lets end() complete, joins cleanly, and no further
+// -- port call happens afterward.
+void testEndBlocksUntilInFlightPortCallReleased(){
+	FakeAssistSessionPort port;
+	port.entryCount = 2;
+	port.entries[0] = makeEntry(0, 50);
+	port.entries[1] = makeEntry(1, 60);
+	port.generation = 1;
+
+	DjAssistController controller;
+	DjAssistIntegrationSelfCheck::useRealBackgroundThreadForTest(controller);
+	controller.begin(&port);
+	assert(DjAssistIntegrationSelfCheck::fillWorkerLaunched(controller));
+
+	for(int i = 0; i < 2000 && !DjAssistIntegrationSelfCheck::fillWorkerEntered(controller); ++i){
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	assert(DjAssistIntegrationSelfCheck::fillWorkerEntered(controller));
+
+	port.blockNextEntryRead.store(true);
+	// The worker loop calls assistTrackEntry() on its own, continuously -
+	// wait (bounded) for it to actually reach and enter the block.
+	for(int i = 0; i < 2000 && !port.readerBlocked.load(); ++i){
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	assert(port.readerBlocked.load());
+
+	std::atomic<bool> endReturned{false};
+	std::thread endCaller([&](){
+		controller.end();
+		endReturned.store(true);
+	});
+
+	// end() must NOT be able to complete while the reader is still
+	// blocked inside the in-flight port call.
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	assert(!endReturned.load());
+	assert(port.readerBlocked.load());
+
+	port.releaseReader.store(true);
+	endCaller.join();
+	assert(endReturned.load());
+	assert(DjAssistIntegrationSelfCheck::fillWorkerExited(controller));
+
+	const int entryCallsAtEnd = port.assistTrackEntryCallCount;
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	assert(port.assistTrackEntryCallCount == entryCallsAtEnd); // no further port call after end() returned.
+}
+
+// -- round 7, issue #2: the previous version of this test changed
+// -- port.generation BEFORE calling controller.tick(), so even the OLD
+// -- separately-locked candidateTableReady()-then-scan pattern would
+// -- already have seen the new revision on its own precheck and skipped
+// -- the scan - proving nothing about the actual fix (collapsing
+// -- readiness + reset + scan into ONE candidateMutex_ critical section).
+// -- This test instead injects the revision bump from a hook invoked by
+// -- tickSuggestions() itself, from INSIDE that single critical section,
+// -- at the exact point between the readiness decision and the real
+// -- scan/consume - the one place a pre-tick generation change cannot
+// -- reach. It must fail if tickSuggestions() ever reverts to trusting an
+// -- earlier revision read without a final in-lock recheck immediately
+// -- before consuming the table.
+void testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume(){
+	FakeAssistSessionPort port;
+	port.entryCount = 1;
+	port.entries[0] = makeEntry(0, 50);
+	port.generation = 1;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+
+	DjAssistController controller;
+	controller.begin(&port);
+	controller.setCoachEnabled(true);
+
+	DjAssistIntegrationSelfCheck::fillCandidateTableToReady(controller);
+	controller.tick();
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount > 0); // established ready at revision 1.
+
+	auto bumpGenerationHook = [](void* arg){
+		static_cast<FakeAssistSessionPort*>(arg)->generation++;
+	};
+	DjAssistIntegrationSelfCheck::setScanConsumeHook(controller, bumpGenerationHook, &port);
+
+	controller.tick();
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount == 0); // discarded, not a stale revision-1 result.
+
+	DjAssistIntegrationSelfCheck::setScanConsumeHook(controller, nullptr, nullptr);
+
+	// Recovers once the fill converges again for the new (bumped) revision.
+	DjAssistIntegrationSelfCheck::fillCandidateTableToReady(controller);
+	controller.tick();
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount > 0);
+
+	controller.end();
+}
+
 } // namespace
 
 int main(){
@@ -849,5 +1089,9 @@ int main(){
 	testCandidateFillDiscardsRecordAcrossGenerationRace();
 	testSuggestionsNeverStaleAcrossMetadataRevisionRefresh();
 	testControllerEndMakesFurtherWorkerCallsSafeNoOps();
+	testFillWorkerLaunchFailureLeavesControllerDisabledAndEndReturnsImmediately();
+	testFillWorkerRealThreadEntersRunsAndExitsOnEnd();
+	testEndBlocksUntilInFlightPortCallReleased();
+	testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume();
 	return 0;
 }

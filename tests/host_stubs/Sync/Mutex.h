@@ -1,19 +1,30 @@
 #ifndef JAYD_HOST_STUB_SYNC_MUTEX_H
 #define JAYD_HOST_STUB_SYNC_MUTEX_H
 
-// Host-test stand-in for CircuitOS's Sync/Mutex.h. DjAssistIntegrationSelfCheck
-// drives DjAssistController single-threaded and deterministically (the real
-// background fill Task is never started under the Task.h stub - see that
-// header), so a real semaphore is unnecessary here; this exists purely so
-// the real, unmodified DjAssistController.cpp/DjSession.h compile for the
-// host build. lock()/unlock() are trivial no-ops.
+// Host-test stand-in for CircuitOS's Sync/Mutex.h. Most DjAssistIntegrationSelfCheck
+// scenarios still drive DjAssistController single-threaded and
+// deterministically (DjAssistFillWorker::useManualSteppingForTest defaults
+// to true - see that header - so the background fill worker never actually
+// runs a thread there), but some scenarios now deliberately opt into a
+// genuine background std::thread for the fill worker (see
+// testEndBlocksUntilInFlightPortCallReleased and related tests) to exercise
+// the real begin()/end()-vs-in-flight-step handshake. A trivial no-op here
+// would be a genuine, sanitizer-visible data race between that thread and
+// the main test thread's own candidateMutex_-protected calls
+// (tickSuggestions()/candidateTableReady()), not merely an inert stub -
+// this must provide REAL mutual exclusion, so it wraps std::mutex.
+#include <mutex>
+
 class Mutex {
 public:
 	Mutex(){}
 	~Mutex(){}
 
-	bool lock(){ return true; }
-	void unlock(){}
+	bool lock(){ mutex_.lock(); return true; }
+	void unlock(){ mutex_.unlock(); }
+
+private:
+	std::mutex mutex_;
 };
 
 #endif

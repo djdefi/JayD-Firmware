@@ -163,6 +163,7 @@ add_executable(DjAssistIntegrationSelfCheck
         tests/dj_assist_integration_selfcheck.cpp
         tests/host_stubs/host_arduino_shim.cpp
         src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistFillWorker.cpp
         src/DjAssist/DjAssistScoring.cpp
         src/DjAssist/DjAssistSessionBridge.cpp
         src/DjAssist/DjAssistEngine.cpp)
@@ -170,11 +171,44 @@ target_include_directories(DjAssistIntegrationSelfCheck BEFORE PRIVATE ${CMAKE_S
 set_target_properties(DjAssistIntegrationSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 target_compile_options(DjAssistIntegrationSelfCheck PRIVATE -Wall -Wextra -Werror)
+# Selects DjAssistFillWorker's host std::thread-backed implementation
+# (instead of raw FreeRTOS calls, which don't exist on the host) for this
+# target only - see DjAssistFillWorker.h's doc comment. NOT the pre-
+# existing -DARDUINO (that is defined for every target in this file,
+# including this one, via add_definitions() above, so it cannot be used to
+# distinguish "real firmware" from "host test" builds).
+target_compile_definitions(DjAssistIntegrationSelfCheck PRIVATE JAYD_ASSIST_HOST_TASK_SEAM)
+find_package(Threads REQUIRED)
+target_link_libraries(DjAssistIntegrationSelfCheck PRIVATE Threads::Threads)
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(DjAssistIntegrationSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(DjAssistIntegrationSelfCheck PRIVATE -fsanitize=address,undefined)
 endif ()
 add_test(NAME DjAssistIntegrationSelfCheck COMMAND DjAssistIntegrationSelfCheck)
+
+# Same real controller/worker sources, rebuilt under ThreadSanitizer instead
+# of ASan/UBSan (the two families cannot be combined in one binary) - only
+# meaningful because DjAssistFillWorker's host path now spawns a genuine
+# std::thread (see testEndBlocksUntilInFlightPortCallReleased). Uses only
+# the compiler's already-bundled -fsanitize=thread; no new tooling added.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_executable(DjAssistIntegrationSelfCheckTSan
+            tests/dj_assist_integration_selfcheck.cpp
+            tests/host_stubs/host_arduino_shim.cpp
+            src/DjAssist/DjAssistController.cpp
+            src/DjAssist/DjAssistFillWorker.cpp
+            src/DjAssist/DjAssistScoring.cpp
+            src/DjAssist/DjAssistSessionBridge.cpp
+            src/DjAssist/DjAssistEngine.cpp)
+    target_include_directories(DjAssistIntegrationSelfCheckTSan BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/tests/host_stubs)
+    set_target_properties(DjAssistIntegrationSelfCheckTSan PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+    target_compile_definitions(DjAssistIntegrationSelfCheckTSan PRIVATE JAYD_ASSIST_HOST_TASK_SEAM)
+    target_link_libraries(DjAssistIntegrationSelfCheckTSan PRIVATE Threads::Threads)
+    target_compile_options(DjAssistIntegrationSelfCheckTSan PRIVATE -Wall -Wextra -Werror -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(DjAssistIntegrationSelfCheckTSan PRIVATE -fsanitize=thread)
+    add_test(NAME DjAssistIntegrationSelfCheckTSan COMMAND DjAssistIntegrationSelfCheckTSan)
+endif ()
 
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the

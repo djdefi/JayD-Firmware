@@ -2,11 +2,11 @@
 #define JAYD_FIRMWARE_DJASSISTCONTROLLER_H
 
 #include "DjAssistEngine.h"
+#include "DjAssistFillWorker.h"
 #include "DjAssistSessionBridge.h"
 #include "DjAssistSessionPort.h"
 
 #include <Sync/Mutex.h>
-#include <Util/Task.h>
 
 // Bounded, POD, browser/API/physical-bank-ready snapshot of Coach/transition
 // state. Copied out of the live engine + suggestion table on request; safe
@@ -35,11 +35,12 @@ struct DjAssistSnapshot {
 // The controller only ever depends on DjSession through DjAssistSessionPort
 // (see that header) - never included/forward-declared here - so this exact,
 // unmodified class can be driven by DjAssistIntegrationSelfCheck (a host
-// test) against a fake port and stub Sync/Mutex.h + Util/Task.h + the
-// handful of Arduino.h free functions it calls (micros()/delay()/
-// ps_malloc()), in addition to the real firmware build. The pure arithmetic
-// it calls into (DjAssistSessionBridge, DjAssistScoring, DjAssistEngine) is
-// separately host-tested with ASan/UBSan.
+// test) against a fake port and stub Sync/Mutex.h + the handful of
+// Arduino.h free functions it calls (micros()/delay()/ps_malloc()), in
+// addition to the real firmware build - see DjAssistFillWorker.h for how
+// the background candidate-fill worker itself is made host-testable. The
+// pure arithmetic it calls into (DjAssistSessionBridge, DjAssistScoring,
+// DjAssistEngine) is separately host-tested with ASan/UBSan.
 class DjAssistController {
 public:
 	DjAssistController();
@@ -104,7 +105,7 @@ private:
 	// by the main thread too (tickSuggestions()'s scanTick() call), always
 	// under the same lock.
 	Mutex candidateMutex_;
-	Task* fillTask_ = nullptr;
+	DjAssistFillWorker fillWorker_;
 	uint16_t entryTotal_ = 0;
 	uint32_t loadedGeneration_ = 0;
 	bool generationSeen_ = false;
@@ -159,7 +160,19 @@ private:
 
 	DjAssistCoachAdvice lastAdvice_ = {};
 
-	static void fillTaskTrampoline(Task* task);
+	// Test-only hook (always compiled in, a no-op unless a test wires it
+	// in): invoked, if set, from inside tickSuggestions()'s single
+	// candidateMutex_ critical section, immediately before the final
+	// live-revision recheck that gates the actual candidate scan. Lets a
+	// host test inject a metadata-revision change at the EXACT point the
+	// review's readiness/consumption TOCTOU concern is about - between
+	// the readiness decision and the actual consume/scan - which a test
+	// that merely changes the revision before calling tick() cannot
+	// exercise (see testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume).
+	void (*testHookBeforeScanConsume_)(void*) = nullptr;
+	void* testHookBeforeScanConsumeArg_ = nullptr;
+
+	static void fillWorkerStepTrampoline(void* self);
 	void fillWorkerStep();
 	bool candidateTableReady(uint32_t& outGeneration);
 	void updateRecentTracks(const DjSnapshot& snapshot);

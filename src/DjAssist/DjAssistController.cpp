@@ -166,21 +166,22 @@ void DjAssistController::begin(DjAssistSessionPort* session){
 	actuator_ = new DjAssistSessionActuator(session_);
 
 	if(!allocationFailed_){
-		// Lowest priority, unpinned (core=-1): this task only ever reads
-		// already-indexed metadata a record at a time and is never on the
-		// audio-critical path, so it must never contend for CPU against
-		// mixing/loop/sync work.
-		fillTask_ = new Task("DjAssistFill", &DjAssistController::fillTaskTrampoline, 4096, this);
-		fillTask_->start(0, -1);
+		// See DjAssistFillWorker's doc comment for why this is not
+		// CircuitOS's own Util/Task.h: that class's start()/stop(true)
+		// pair deadlocks forever if the underlying task creation ever
+		// fails to launch. A failed launch here instead simply leaves
+		// the candidate table permanently empty (suggestions/advice stay
+		// off) without affecting the rest of the session, and end()
+		// below is guaranteed to return immediately in that case.
+		fillWorker_.begin(&DjAssistController::fillWorkerStepTrampoline, this, "DjAssistFill", 4096);
 	}
 }
 
 void DjAssistController::end(){
-	if(fillTask_){
-		fillTask_->stop(true); // blocking: must not touch entries_ after free() below.
-		delete fillTask_;
-		fillTask_ = nullptr;
-	}
+	// No-op (returns immediately) unless a worker was actually launched -
+	// see DjAssistFillWorker::end(). Otherwise blocks until it has
+	// actually exited before entries_ is freed below.
+	fillWorker_.end();
 	delete actuator_;
 	actuator_ = nullptr;
 	free(entries_);
@@ -188,12 +189,8 @@ void DjAssistController::end(){
 	session_ = nullptr;
 }
 
-void DjAssistController::fillTaskTrampoline(Task* task){
-	DjAssistController* self = static_cast<DjAssistController*>(task->arg);
-	while(task->running){
-		self->fillWorkerStep();
-		delay(20); // gentle background cadence; never audio-critical.
-	}
+void DjAssistController::fillWorkerStepTrampoline(void* self){
+	static_cast<DjAssistController*>(self)->fillWorkerStep();
 }
 
 // Background-thread-only: performs the bounded, possibly SD-backed
@@ -495,11 +492,34 @@ void DjAssistController::tickSuggestions(const DjSnapshot& snapshot){
 			scanCursor_ = 0;
 			suggestionCount_ = 0;
 		}
-		DjAssistScoring::scanTick(
-			entries_, entryTotal_, scanCursor_, DJ_ASSIST_DEFAULT_SCAN_BUDGET,
-			deckCtx, loaded, loadedCount, recentTracks_, recentCount_,
-			suggestions_, suggestionCount_, DJ_ASSIST_MAX_SUGGESTIONS
-		);
+
+		// Test-only seam (no-op in production - see the member's doc
+		// comment in DjAssistController.h).
+		if(testHookBeforeScanConsume_) testHookBeforeScanConsume_(testHookBeforeScanConsumeArg_);
+
+		// Re-confirm the live revision immediately before actually
+		// consuming/scanning the table, rather than trusting the
+		// `liveGeneration` read captured a few statements above: this is
+		// the exact "under-lock live-revision check" the review asked
+		// for at the real consumption point, closing even a same-tick
+		// gap between the readiness decision above and this instant (see
+		// testSuggestionsDiscardWhenRevisionChangesBetweenReadinessAndConsume).
+		// On real firmware this can only actually differ if this whole
+		// critical section were ever entered without truly holding
+		// candidateMutex_ across both reads - which it does - so this is
+		// defense in depth, not a reachable production path.
+		const uint32_t confirmGeneration = session_ ? session_->assistMetadataRevision() : liveGeneration;
+		if(confirmGeneration != liveGeneration){
+			scanGenerationSeen_ = false;
+			scanCursor_ = 0;
+			suggestionCount_ = 0;
+		}else{
+			DjAssistScoring::scanTick(
+				entries_, entryTotal_, scanCursor_, DJ_ASSIST_DEFAULT_SCAN_BUDGET,
+				deckCtx, loaded, loadedCount, recentTracks_, recentCount_,
+				suggestions_, suggestionCount_, DJ_ASSIST_MAX_SUGGESTIONS
+			);
+		}
 	}
 	candidateMutex_.unlock();
 
