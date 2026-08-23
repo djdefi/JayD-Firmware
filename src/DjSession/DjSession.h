@@ -67,24 +67,32 @@ public:
 	// Bounded candidate-table data source for DjAssistController, backed by
 	// the same already-indexed metadata reader used by resolveMetadata() -
 	// never a fresh file read outside these bounded, mutex-guarded calls.
-	// assistLibraryGeneration() is a lock-free atomic load (see
-	// libraryGeneration below): refreshLibraryMetadata() bumps it BEFORE
+	// assistMetadataRevision() is a lock-free atomic load (see
+	// metadataRevision below): every reader-mutating call (refresh that
+	// actually swaps the reader, invalidate, shutdown) bumps it BEFORE
 	// mutating the reader, so a caller can safely re-read it a second time
 	// immediately adjacent to its own unrelated lock/commit (e.g.
 	// DjAssistController::fillWorkerStep()'s candidateMutex_ critical
 	// section) with zero risk of lock-ordering/deadlock against
 	// metadataMutex, closing the review's "check-then-lock gap" for good.
-	uint32_t assistLibraryGeneration() override;
+	// Deliberately a SEPARATE counter from libraryGeneration (the
+	// externally-meaningful semantic library identity, e.g. from
+	// LibraryIndex): a same-generation sidecar file replacement, or a
+	// metadata loss+reopen cycle that happens to land back on the same
+	// external generation, must still invalidate the candidate table, and
+	// libraryGeneration alone cannot distinguish those cases from "nothing
+	// changed".
+	uint32_t assistMetadataRevision() override;
 	uint32_t assistTrackCount() override;
-	// outRevision reports the exact metadata generation this read was
+	// outRevision reports the exact metadataRevision this read was
 	// performed under, captured atomically (single metadataMutex
 	// acquisition) with the entry read itself - not a separate before/
-	// after generation probe - so a concurrent refreshLibraryMetadata()
-	// swapping the reader mid-scan can never leave outRevision and
-	// outEntry describing two different underlying reader states (the
-	// review's "check-then-lock gap"). Set regardless of whether the read
-	// itself succeeds, so callers can still detect a stale pass on a
-	// failed/corrupt record.
+	// after probe - so a concurrent refreshLibraryMetadata()/
+	// invalidateLibraryMetadata() swapping the reader mid-scan can never
+	// leave outRevision and outEntry describing two different underlying
+	// reader states (the review's "check-then-lock gap"). Set regardless
+	// of whether the read itself succeeds, so callers can still detect a
+	// stale pass on a failed/corrupt record.
 	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override;
 	// Cheap, in-memory downbeat hint from the already-built beat grid,
 	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
@@ -176,15 +184,25 @@ private:
 	uint32_t sessionId = 0;
 	JaydMetadata::Reader metadataReader;
 	JaydMetadata::Status metadataReaderStatus = JaydMetadata::Status::Missing;
-	// Lock-free: refreshLibraryMetadata() stores a fresh value BEFORE
-	// mutating metadataReader (still inside one metadataMutex critical
-	// section, as a sequencing guarantee - not a required inter-lock
-	// barrier, since this load takes no lock of its own). This lets
-	// assistLibraryGeneration() be called safely a second time from
-	// inside an unrelated lock (e.g. DjAssistController's candidateMutex_)
-	// with zero lock-ordering/deadlock risk between the two independently
-	// locked classes - see assistLibraryGeneration()'s doc comment.
+	// Externally-meaningful semantic library identity (e.g. from
+	// LibraryIndex), used for deck-metadata association/snapshot/command
+	// tagging elsewhere in this class. Still atomic/lock-free-readable for
+	// those existing lock-free comparisons, but no longer exposed to
+	// DjAssistController for candidate-table freshness - see
+	// metadataRevision below and assistMetadataRevision()'s doc comment
+	// for why the two must not be conflated.
 	std::atomic<uint32_t> libraryGeneration { 0 };
+	// Dedicated, purely-internal monotonic revision counter for candidate-
+	// table freshness (see assistMetadataRevision()/assistTrackEntry()) -
+	// deliberately separate from libraryGeneration above (external
+	// semantic library identity). Bumped before EVERY reader-mutating
+	// attempt: refreshLibraryMetadata()'s reload path, invalidateLibraryMetadata(),
+	// and shutdown() - including when the external generation/key passed
+	// to refreshLibraryMetadata() is unchanged but the underlying file
+	// content isn't (metadataFileKey differs), and including a metadata
+	// loss+reopen cycle that happens to land back on the same external
+	// generation. Never assigned from the external generation/key values.
+	std::atomic<uint32_t> metadataRevision { 0 };
 	uint64_t libraryKey = 0;
 	uint64_t metadataFileKey = 0;
 	bool metadataInitialized = false;

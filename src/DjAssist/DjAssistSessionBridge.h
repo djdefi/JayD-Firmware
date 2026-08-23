@@ -66,6 +66,40 @@ enum DjAssistRollbackPhase : uint8_t {
 	DJ_ASSIST_ROLLBACK_DONE
 };
 
+// Result of reconcileOwnership() below: which of the plan's two toDeck
+// applied-mutation ownership flags (START_DECK, LOCK_TEMPO/ENABLE_SYNC) this
+// plan is STILL the sole author of, after comparing live vs. armed intent
+// generations for BOTH properties independently.
+struct DjAssistOwnershipReconciliation {
+	bool toDeckStartOwnedByPlan;
+	bool toDeckSyncOwnedByPlan;
+};
+
+// Independently re-derives toDeck play/sync rollback ownership from live-
+// vs-armed intent generations, for BOTH properties in one pass - never as a
+// chain of early-return checks that could relinquish only the FIRST
+// divergent property and leave a second, simultaneously-diverged property's
+// ownership flag stale (e.g. a user command that touches both play and sync
+// on the target deck in one action). A property already relinquished (or
+// never owned) stays relinquished; ownership is only ever taken away here,
+// never granted (granting happens solely at the instant DjAssistEngine::
+// tick() observes the corresponding step's command reach
+// DJ_COMMAND_APPLIED). Called from BOTH DjAssistEngine::guardOk() (every
+// tick while ARMED/RUNNING) and DjAssistController::tickRollback() (every
+// tick while FAILED, via DjAssistEngine::reconcileOwnershipOnDivergence() -
+// guardOk() no longer runs once the transition has already failed/been
+// cancelled, so without this second call site a user re-asserting play/
+// sync AFTER that point, but before rollback finishes, would never be
+// caught and rollback could stop/release the user's own newer intent).
+DjAssistOwnershipReconciliation reconcileOwnership(
+	bool priorStartOwnedByPlan,
+	bool priorSyncOwnedByPlan,
+	uint32_t livePlayGeneration,
+	uint32_t armedPlayGeneration,
+	uint32_t liveSyncGeneration,
+	uint32_t armedSyncGeneration
+);
+
 // Given the current rollback phase, whether a manual (non-system) mix
 // change has occurred since arm, and whether the sync/start-deck steps were
 // both submitted AND actually plan-owned (i.e. the engine observed the

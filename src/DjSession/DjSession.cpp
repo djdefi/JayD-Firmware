@@ -455,15 +455,27 @@ DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t 
 		deckMetadata[0].attached(),
 		deckMetadata[1].attached()
 	};
-	// Bump the (atomic, lock-free-readable) generation BEFORE swapping the
-	// reader below - any concurrent assistLibraryGeneration() caller sees
-	// the new value the instant it's visible, ahead of the reader mutation
-	// it describes, closing the review's check-then-lock gap for callers
-	// that re-check generation immediately adjacent to their own lock
-	// (see DjAssistController::fillWorkerStep()/candidateTableReady()).
+	// Bump the (atomic, lock-free-readable) metadataRevision BEFORE
+	// swapping the reader below - any concurrent assistMetadataRevision()
+	// caller sees the new value the instant it's visible, ahead of the
+	// reader mutation it describes, closing the review's check-then-lock
+	// gap for callers that re-check the revision immediately adjacent to
+	// their own lock (see DjAssistController::fillWorkerStep()/
+	// candidateTableReady()). libraryGeneration is bumped here too, but
+	// purely for its own external-identity purpose - it is not what
+	// candidate-table freshness keys off anymore.
 	libraryGeneration = generation;
 	libraryKey = key;
 	metadataFileKey = fileKey;
+	// metadataRevision is bumped here too, alongside libraryGeneration -
+	// this is the ONLY place assistMetadataRevision() advances on a real
+	// content change, and it must do so even when generation/key (the
+	// externally-supplied semantic values) are unchanged but fileKey
+	// isn't (a same-generation sidecar file replacement): the candidate
+	// table must still be invalidated in that case, which libraryGeneration
+	// alone cannot signal since it's about to be reassigned the SAME
+	// external value.
+	metadataRevision++;
 	metadataInitialized = true;
 	metadataReader.close();
 	metadataReaderStatus = metadataReader.open(file);
@@ -486,9 +498,15 @@ DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t 
 void DjSession::invalidateLibraryMetadata(){
 	metadataMutex.lock();
 	// Same bump-before-mutation ordering as refreshLibraryMetadata() above.
+	// metadataRevision is bumped unconditionally here too - a subsequent
+	// fast reopen landing back on the SAME external generation/key must
+	// still be distinguishable from "nothing ever changed" by anything
+	// that samples assistMetadataRevision() across the invalidate+reopen
+	// window.
 	libraryGeneration = 0;
 	libraryKey = 0;
 	metadataFileKey = 0;
+	metadataRevision++;
 	metadataInitialized = false;
 	metadataReader.close();
 	metadataReaderStatus = JaydMetadata::Status::Missing;
@@ -668,16 +686,19 @@ bool DjSession::nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& o
 	return found;
 }
 
-// Lock-free: libraryGeneration is std::atomic, and refreshLibraryMetadata()/
-// invalidateLibraryMetadata() bump it BEFORE mutating metadataReader (see
-// DjSession.h's doc comment on the member). No metadataMutex acquisition
-// needed for this specific accessor, which is what lets a caller safely
-// call it a SECOND time from inside an unrelated lock (e.g.
-// DjAssistController's candidateMutex_ critical section, right before a
-// commit/readiness decision) with zero lock-ordering/deadlock risk between
-// the two independently locked classes.
-uint32_t DjSession::assistLibraryGeneration(){
-	return libraryGeneration;
+// Lock-free: metadataRevision is std::atomic, and refreshLibraryMetadata()/
+// invalidateLibraryMetadata()/shutdown() bump it BEFORE mutating
+// metadataReader (see DjSession.h's doc comment on the member). No
+// metadataMutex acquisition needed for this specific accessor, which is
+// what lets a caller safely call it a SECOND time from inside an unrelated
+// lock (e.g. DjAssistController's candidateMutex_ critical section, right
+// before a commit/readiness decision) with zero lock-ordering/deadlock risk
+// between the two independently locked classes. Deliberately independent
+// of libraryGeneration (the externally-supplied semantic library identity):
+// see metadataRevision's doc comment in DjSession.h for why the two must
+// not be conflated.
+uint32_t DjSession::assistMetadataRevision(){
+	return metadataRevision;
 }
 
 uint32_t DjSession::assistTrackCount(){
@@ -694,12 +715,12 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 	// trackByIndex() read below - not a separate before/after probe - so
 	// it is guaranteed to describe the exact reader state this read used.
 	// refreshLibraryMetadata()/invalidateLibraryMetadata() also take
-	// metadataMutex around every libraryGeneration bump and reader swap,
+	// metadataMutex around every metadataRevision bump and reader swap,
 	// so there is no window in which a refresh can change the reader out
-	// from under this read while still reporting the old generation (the
+	// from under this read while still reporting the old revision (the
 	// previously-possible check-then-lock gap between a generation probe
 	// and this call).
-	outRevision = libraryGeneration;
+	outRevision = metadataRevision;
 	JaydMetadata::Track track;
 	const bool ok = metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready &&
 		metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
@@ -1463,7 +1484,32 @@ void DjSession::shutdown(){
 
 	publishSnapshot();
 	if(system) system->stop();
+
+	// Stop (blocking join) the background candidate-fill task BEFORE
+	// touching metadataReader below. DjAssistController::end() is already
+	// idempotent and already joins its task before freeing anything -
+	// see DjAssistController.cpp - but it was never being called here at
+	// all: the fill task was previously only ever stopped as an
+	// incidental side effect of assistController's OWN member destructor
+	// running, which happens well AFTER shutdown() returns and the reader
+	// is already closed below. A straggling in-flight fillWorkerStep()
+	// iteration could then run assistTrackEntry()/assistMetadataRevision()
+	// against an already-closed reader. Calling end() here first
+	// guarantees no such iteration is still in flight by the time
+	// metadataReader.close() runs. The destructor's later implicit
+	// end() call (via ~DjAssistController()) remains a safe no-op.
+	assistController.end();
+
 	metadataMutex.lock();
+	// Bump-before-mutate, same ordering as refreshLibraryMetadata()/
+	// invalidateLibraryMetadata(): any assistMetadataRevision() reader
+	// (there are none left in-flight after assistController.end() above,
+	// but this keeps the invariant unconditional, not something a caller
+	// must rely on ordering-with-end() to get right) observes the bump
+	// strictly before the reader is actually closed.
+	metadataRevision++;
+	metadataInitialized = false;
+	metadataReaderStatus = JaydMetadata::Status::Missing;
 	metadataReader.close();
 	metadataMutex.unlock();
 }

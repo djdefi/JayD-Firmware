@@ -70,6 +70,21 @@ public:
 	// DJ_ASSIST_FAIL_CANCELLED so the caller can drive a rollback.
 	void cancelTransition();
 
+	// Re-applies the same per-property toDeck play/sync ownership
+	// reconciliation guardOk() performs every tick while ARMED/RUNNING -
+	// see DjAssistBridge::reconcileOwnership() - but callable at ANY time,
+	// in particular while FAILED/CANCELLED, when tick() no longer runs
+	// guardOk() at all. DjAssistController::tickRollback() calls this once
+	// at the start of every tick it runs (using a freshly-read live
+	// play/sync intent generation for the plan's toDeck), so a user
+	// re-asserting play/sync on the target deck AFTER the transition has
+	// already failed/been cancelled - but before rollback has finished
+	// undoing it - still immediately relinquishes that property's rollback
+	// ownership, not just at the single tick the divergence was first
+	// detected. Only ever relinquishes ownership, never grants it; a no-op
+	// once both flags are already false.
+	void reconcileOwnershipOnDivergence(uint32_t livePlayGeneration, uint32_t liveSyncGeneration);
+
 	const DjAssistTransitionPlan& plan() const;
 
 private:

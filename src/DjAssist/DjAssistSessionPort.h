@@ -25,8 +25,18 @@ public:
 	virtual bool copySnapshot(DjSnapshot& snapshot) = 0;
 
 	// Bounded candidate-table data source (DjAssistController::fillWorkerStep()/
-	// candidateTableReady()).
-	virtual uint32_t assistLibraryGeneration() = 0;
+	// candidateTableReady()/tickSuggestions()). assistMetadataRevision() is
+	// a DEDICATED, purely-internal monotonic counter - distinct from
+	// DjSession's externally-meaningful library generation (semantic
+	// library identity, e.g. from LibraryIndex) - bumped on every reader
+	// mutation attempt (refresh that actually swaps the reader,
+	// invalidate, shutdown), even when the external generation/key value
+	// passed in happens to be unchanged (e.g. a same-generation sidecar
+	// file replacement, or a loss+reopen cycle landing back on the same
+	// external generation). Candidate-table freshness must key off THIS
+	// counter, never the external generation, so those cases are never
+	// mistaken for "nothing changed".
+	virtual uint32_t assistMetadataRevision() = 0;
 	virtual uint32_t assistTrackCount() = 0;
 	virtual bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) = 0;
 

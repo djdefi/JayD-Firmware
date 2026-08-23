@@ -119,15 +119,29 @@ public:
 		return true;
 	}
 
-	uint32_t assistLibraryGeneration() override{
+	uint32_t assistMetadataRevision() override{
 		return generation;
 	}
 
+	// Bounded call counters used only by
+	// testControllerEndMakesFurtherWorkerCallsSafeNoOps() (issue #4): prove
+	// that once DjAssistController::end() has run, ANY further call to
+	// these methods (which a straggling in-flight background-task
+	// iteration could otherwise make) simply cannot happen anymore,
+	// because fillWorkerStep()/candidateTableReady() early-return the
+	// instant session_ is null - the exact invariant that makes it safe
+	// for DjSession::shutdown() to call assistController.end() before
+	// closing metadataReader.
+	int assistTrackCountCallCount = 0;
+	int assistTrackEntryCallCount = 0;
+
 	uint32_t assistTrackCount() override{
+		++assistTrackCountCallCount;
 		return entryCount;
 	}
 
 	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override{
+		++assistTrackEntryCallCount;
 		outRevision = generation;
 		if(int(index) == bumpGenerationOnReadIndex){
 			bumpGenerationOnReadIndex = -1; // fires exactly once.
@@ -482,6 +496,114 @@ void testUserPlayDivergenceRelinquishesRollbackOwnership(){
 	controller.end();
 }
 
+// -- round 6, issue #1a: a user command that changes BOTH play and sync ---
+// -- on the target deck in ONE action must relinquish BOTH ownership -----
+// -- flags, not just the first one a chain of early-return checks would --
+// -- have reached. --------------------------------------------------------
+void testSimultaneousPlaySyncDivergenceRelinquishesBothOwnership(){
+	FakeAssistSessionPort port;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+	setupLoadedStoppedDeck(port.snapshot, 1, 2, 128000);
+
+	DjAssistController controller;
+	controller.begin(&port);
+	const DjTrackIdentity target = fingerprintIdentity(2);
+	assert(controller.armTransition(0, 1, 3, target, 4, /*startAtBoundary=*/false, /*tempoLock=*/true));
+
+	advanceOneStep(controller, port); // START_DECK applied.
+	advanceOneStep(controller, port); // LOCK_TEMPO applied (sync enabled).
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.plan.toDeckStartOwnedByPlan);
+	assert(snap.plan.toDeckSyncOwnedByPlan);
+	assert(port.snapshot.decks[1].playing);
+	assert(port.snapshot.decks[1].sync.state == DJ_SYNC_LOCKED);
+
+	// The user re-asserts BOTH play and sync on the target deck
+	// themselves, admitted in the SAME interval. Before this fix, a
+	// chain of individual early-return divergence checks in guardOk()
+	// would have cleared only the FIRST property it happened to check
+	// and returned before ever examining the second.
+	port.setPlaying(1, true, DJ_ORIGIN_LOCAL_UI);
+	port.setSync(1, true, 0, DJ_ORIGIN_LOCAL_UI);
+	driveAllQueuedCommands(port);
+
+	controller.tick(); // guardOk() sees BOTH properties diverged.
+	controller.copySnapshot(snap);
+	assert(snap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(snap.plan.failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+	assert(!snap.plan.toDeckStartOwnedByPlan); // both relinquished together.
+	assert(!snap.plan.toDeckSyncOwnedByPlan);
+
+	for(int i = 0; i < 20; ++i){
+		controller.tick();
+		driveAllQueuedCommands(port);
+	}
+	// Rollback must never have touched either property - the user's own
+	// later intent is authoritative for BOTH now, not just whichever one
+	// a broken early-return chain would have noticed first.
+	assert(port.snapshot.decks[1].playing);
+	assert(port.snapshot.decks[1].sync.state == DJ_SYNC_LOCKED);
+
+	controller.end();
+}
+
+// -- round 6, issue #1b: a user re-asserting play/sync AFTER the ----------
+// -- transition has already been cancelled (mode already FAILED, so -------
+// -- DjAssistEngine::tick()/guardOk() never run again) must still be ------
+// -- caught - by tickRollback()'s own fresh reconciliation against LIVE ---
+// -- intent generations, every tick it runs - not just at whatever tick ---
+// -- guardOk() originally happened to observe a divergence. ---------------
+void testUserIntentAfterCancelRelinquishesOwnershipDuringRollback(){
+	FakeAssistSessionPort port;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+	setupLoadedStoppedDeck(port.snapshot, 1, 2, 128000);
+
+	DjAssistController controller;
+	controller.begin(&port);
+	const DjTrackIdentity target = fingerprintIdentity(2);
+	assert(controller.armTransition(0, 1, 3, target, 4, /*startAtBoundary=*/false, /*tempoLock=*/true));
+
+	advanceOneStep(controller, port); // START_DECK applied.
+	advanceOneStep(controller, port); // LOCK_TEMPO applied (sync enabled).
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.plan.toDeckStartOwnedByPlan);
+	assert(snap.plan.toDeckSyncOwnedByPlan);
+
+	controller.cancelTransition();
+	controller.copySnapshot(snap);
+	assert(snap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(snap.plan.failure == DJ_ASSIST_FAIL_CANCELLED);
+	// A plain cancel does not itself touch ownership - only a LIVE
+	// divergence does, and none has happened yet.
+	assert(snap.plan.toDeckStartOwnedByPlan);
+	assert(snap.plan.toDeckSyncOwnedByPlan);
+
+	// The user re-asserts BOTH play and sync on the target deck AFTER
+	// the transition is already terminal, and before rollback has run
+	// even once - mode is already FAILED, so guardOk() will never run
+	// again for this plan; only tickRollback()'s own reconciliation call
+	// can still catch this.
+	port.setPlaying(1, true, DJ_ORIGIN_LOCAL_UI);
+	port.setSync(1, true, 0, DJ_ORIGIN_LOCAL_UI);
+	driveAllQueuedCommands(port);
+
+	for(int i = 0; i < 20; ++i){
+		controller.tick();
+		driveAllQueuedCommands(port);
+	}
+	controller.copySnapshot(snap);
+	assert(!snap.plan.toDeckStartOwnedByPlan);
+	assert(!snap.plan.toDeckSyncOwnedByPlan);
+	// Rollback must never have stopped/released the user's own newer
+	// intent, established after the transition was already terminal.
+	assert(port.snapshot.decks[1].playing);
+	assert(port.snapshot.decks[1].sync.state == DJ_SYNC_LOCKED);
+
+	controller.end();
+}
+
 // -- issue #2: a non-system sync command on the SOURCE deck (never plan- --
 // -- owned) is still a genuine manual override and must abort the ---------
 // -- transition rather than silently continue past it. ---------------------
@@ -617,15 +739,115 @@ void testCandidateFillDiscardsRecordAcrossGenerationRace(){
 	controller.end();
 }
 
+// -- round 6, issue #3: a live metadata-revision bump (assistMetadataRevision(),
+// -- what DjSession::refreshLibraryMetadata()/invalidateLibraryMetadata()/
+// -- shutdown() all advance) landing AFTER the candidate table already
+// -- became ready for the OLD revision, but BEFORE the background fill has
+// -- been re-run for the new one, must never let a suggestion scan publish
+// -- stale-revision suggestions. Previously tick() decided whether/how to
+// -- reset suggestionCount_/scanCursor_ from a candidateTableReady() call
+// -- that had already unlocked candidateMutex_ by the time tickSuggestions()
+// -- separately re-locked to actually scan - this test injects the refresh
+// -- exactly in that now-closed gap.
+void testSuggestionsNeverStaleAcrossMetadataRevisionRefresh(){
+	FakeAssistSessionPort port;
+	port.entryCount = 1;
+	port.entries[0] = makeEntry(0, 50);
+	port.generation = 1;
+	setupPlayingDeck(port.snapshot, 0, 1, 120000);
+
+	DjAssistController controller;
+	controller.begin(&port);
+	controller.setCoachEnabled(true);
+
+	DjAssistIntegrationSelfCheck::fillCandidateTableToReady(controller);
+	controller.tick();
+	DjAssistSnapshot snap;
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount > 0); // converged and produced a real suggestion for revision 1.
+
+	// A metadata refresh bumps the live revision to 2 - simulating
+	// DjSession bumping metadataRevision before it swaps/closes the
+	// reader - without the background fill having been re-run for it yet.
+	port.generation = 2;
+
+	controller.tick(); // must observe the live revision no longer matches loadedGeneration_.
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount == 0); // no stale revision-1 suggestion survives.
+
+	// The fill converges again for the new revision, and suggestions
+	// correctly reappear.
+	DjAssistIntegrationSelfCheck::fillCandidateTableToReady(controller);
+	controller.tick();
+	controller.copySnapshot(snap);
+	assert(snap.suggestionCount > 0);
+
+	controller.end();
+}
+
+// -- round 6, issue #4: DjAssistController::end() must make ANY further ----
+// -- call to the background fill worker's own methods a guaranteed,
+// -- complete no-op - the exact safety invariant that makes it correct for
+// -- DjSession::shutdown() to call assistController.end() before touching
+// -- metadataReader: even a straggling in-flight fillWorkerStep() iteration
+// -- could not go on to call any more port methods (in the real firmware,
+// -- read the metadata reader) once end() has run. The host stub Task
+// -- never actually spawns a real thread (see tests/host_stubs/Util/
+// -- Task.h, by deliberate design so every OTHER scenario in this file
+// -- stays single-threaded/deterministic), so a literal wall-clock
+// -- join-timing race cannot be reproduced here; this proves the
+// -- achievable - and actually load-bearing - half of that invariant, and
+// -- is documented as a known scope limitation rather than claimed as full
+// -- coverage of the join itself (validated instead by full firmware
+// -- build + code review, per this round's report).
+void testControllerEndMakesFurtherWorkerCallsSafeNoOps(){
+	FakeAssistSessionPort port;
+	port.entryCount = 3;
+	for(uint32_t i = 0; i < port.entryCount; ++i){
+		port.entries[i] = makeEntry(i, uint8_t(i + 20));
+	}
+	port.generation = 1;
+
+	DjAssistController controller;
+	controller.begin(&port);
+
+	DjAssistIntegrationSelfCheck::stepFill(controller); // one record committed; mid-fill.
+	const int trackCountCallsBeforeEnd = port.assistTrackCountCallCount;
+	const int trackEntryCallsBeforeEnd = port.assistTrackEntryCallCount;
+	assert(trackCountCallsBeforeEnd > 0);
+	assert(trackEntryCallsBeforeEnd > 0);
+
+	controller.end();
+
+	// Simulate a straggling fill-worker iteration that still runs (or was
+	// already in flight) after end() - session_ is now null, so this must
+	// be a guaranteed, complete no-op: no further port call at all, and no
+	// touching of the already-freed entries_ array.
+	DjAssistIntegrationSelfCheck::stepFill(controller);
+	uint32_t generation = 0;
+	assert(!DjAssistIntegrationSelfCheck::tableReady(controller, generation));
+	assert(port.assistTrackCountCallCount == trackCountCallsBeforeEnd);
+	assert(port.assistTrackEntryCallCount == trackEntryCallsBeforeEnd);
+
+	// end() is itself idempotent - a second call (e.g. the implicit one
+	// from ~DjAssistController() after DjSession::shutdown() already
+	// called it explicitly) must also be a safe no-op.
+	controller.end();
+}
+
 } // namespace
 
 int main(){
 	testFullDefaultTransitionHappyPath();
 	testCancelRollbackRestoresOnlyPlanOwnedState();
 	testUserPlayDivergenceRelinquishesRollbackOwnership();
+	testSimultaneousPlaySyncDivergenceRelinquishesBothOwnership();
+	testUserIntentAfterCancelRelinquishesOwnershipDuringRollback();
 	testFromDeckSyncDivergenceAbortsTransition();
 	testManualMixDuringCrossfadeAbortsTransition();
 	testQueueSupersedeAndRemovalThroughRealAdmission();
 	testCandidateFillDiscardsRecordAcrossGenerationRace();
+	testSuggestionsNeverStaleAcrossMetadataRevisionRefresh();
+	testControllerEndMakesFurtherWorkerCallsSafeNoOps();
 	return 0;
 }

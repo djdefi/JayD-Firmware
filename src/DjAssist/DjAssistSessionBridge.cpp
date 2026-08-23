@@ -85,6 +85,20 @@ uint8_t computeCrossfadeMix(
 	return toDeck == 0 ? uint8_t(255 - curve) : curve;
 }
 
+DjAssistOwnershipReconciliation reconcileOwnership(
+	bool priorStartOwnedByPlan,
+	bool priorSyncOwnedByPlan,
+	uint32_t livePlayGeneration,
+	uint32_t armedPlayGeneration,
+	uint32_t liveSyncGeneration,
+	uint32_t armedSyncGeneration
+){
+	DjAssistOwnershipReconciliation result;
+	result.toDeckStartOwnedByPlan = priorStartOwnedByPlan && (livePlayGeneration == armedPlayGeneration);
+	result.toDeckSyncOwnedByPlan = priorSyncOwnedByPlan && (liveSyncGeneration == armedSyncGeneration);
+	return result;
+}
+
 DjAssistRollbackPhase nextRollbackPhase(
 	DjAssistRollbackPhase phase,
 	bool crossfadeSubmitted,

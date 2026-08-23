@@ -204,18 +204,25 @@ void DjAssistController::fillTaskTrampoline(Task* task){
 // only for the brief array write + bookkeeping update - so the main thread
 // is never blocked waiting on a card read, only on a few field writes.
 //
-// assistLibraryGeneration() is a lock-free atomic read (see DjSession.h),
-// so every commit point below re-loads the LIVE generation a second time
+// assistMetadataRevision() is a lock-free atomic read (see DjSession.h),
+// so every commit point below re-loads the LIVE revision a second time
 // immediately adjacent to (inside) the candidateMutex_ critical section it
 // commits under, rather than trusting a value captured before the lock was
 // acquired - there is no way for a refresh landing in that gap to go
 // unnoticed, because the very last thing checked before every mutation is
 // a fresh, in-lock read of the same lock-free accessor a concurrent
-// refreshLibraryMetadata() bumps before it swaps the reader.
+// refreshLibraryMetadata()/invalidateLibraryMetadata()/shutdown() bumps
+// before it swaps/closes the reader. Deliberately keyed on
+// assistMetadataRevision(), NOT assistLibraryGeneration() - the latter is
+// an externally-meaningful semantic library identity that can stay
+// unchanged across a real underlying content change (same-generation
+// sidecar replacement) or a loss+reopen cycle landing back on the same
+// value; assistMetadataRevision() is a dedicated counter guaranteed to
+// advance on every such case.
 void DjAssistController::fillWorkerStep(){
 	if(!session_ || allocationFailed_) return;
 
-	const uint32_t currentGeneration = session_->assistLibraryGeneration();
+	const uint32_t currentGeneration = session_->assistMetadataRevision();
 
 	candidateMutex_.lock();
 	bool freshGeneration = !generationSeen_ || currentGeneration != loadedGeneration_;
@@ -236,12 +243,12 @@ void DjAssistController::fillWorkerStep(){
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
 	if(cursor >= cappedTotal){
 		candidateMutex_.lock();
-		// Live generation re-loaded HERE, inside the lock, immediately
+		// Live revision re-loaded HERE, inside the lock, immediately
 		// before the commit - not the currentGeneration captured at the
 		// top of this call, and not a pre-lock probe either - so a
 		// refresh landing in the gap between counting cappedTotal and
 		// this exact instant is still caught.
-		const uint32_t liveGeneration = session_->assistLibraryGeneration();
+		const uint32_t liveGeneration = session_->assistMetadataRevision();
 		if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, liveGeneration)){
 			entryTotal_ = cappedTotal;
 			fillComplete_ = true;
@@ -276,7 +283,7 @@ void DjAssistController::fillWorkerStep(){
 	// acquired). Either mismatch discards the record rather than commits
 	// it; fillCursor_ stays put so the same slot is retried on the next
 	// (now-current-generation) pass.
-	const uint32_t liveGeneration = session_->assistLibraryGeneration();
+	const uint32_t liveGeneration = session_->assistMetadataRevision();
 	if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, entryRevision) &&
 	   DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, liveGeneration) &&
 	   fillCursor_ == cursor){
@@ -290,19 +297,18 @@ void DjAssistController::fillWorkerStep(){
 	candidateMutex_.unlock();
 }
 
-// Bounded, lock-protected readiness check for the main thread - never
-// blocks on I/O (the fill task never holds candidateMutex_ across a read).
-// The live generation is re-loaded INSIDE candidateMutex_, immediately
-// before the readiness decision - not a pre-lock probe - so a refresh that
-// completes between fillWorkerStep() finishing and this call still
-// atomically invalidates readiness, rather than reporting a table that is
-// stale by the time the caller acts on it. Safe only because
-// assistLibraryGeneration() is lock-free (see DjSession.h): calling a
-// metadataMutex-guarded accessor from inside candidateMutex_ would require
-// reasoning about lock ordering across two independently-locked classes.
+// Bounded, lock-protected readiness check - never blocks on I/O (the fill
+// task never holds candidateMutex_ across a read). Retained for tests/
+// diagnostics (see DjAssistIntegrationSelfCheck::tableReady()), but
+// tickSuggestions() no longer gates its scan off this function's separately-
+// acquired result - see tickSuggestions()'s doc comment for why that used
+// to be a TOCTOU gap. Safe only because assistMetadataRevision() is
+// lock-free (see DjSession.h): calling a metadataMutex-guarded accessor
+// from inside candidateMutex_ would require reasoning about lock ordering
+// across two independently-locked classes.
 bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
 	candidateMutex_.lock();
-	const uint32_t liveGeneration = session_ ? session_->assistLibraryGeneration() : 0;
+	const uint32_t liveGeneration = session_ ? session_->assistMetadataRevision() : 0;
 	const bool ready = fillComplete_ && loadedGeneration_ == liveGeneration;
 	outGeneration = loadedGeneration_;
 	candidateMutex_.unlock();
@@ -452,15 +458,49 @@ void DjAssistController::tickSuggestions(const DjSnapshot& snapshot){
 		}
 	}
 
+	// Readiness (fillComplete_ + live metadata-revision match), the
+	// revision-keyed scanCursor_/suggestionCount_ reset, AND the actual
+	// scan now all happen inside ONE candidateMutex_ acquisition - this
+	// closes the review's readiness/consumption TOCTOU. Previously
+	// tick() called candidateTableReady() (its own separate, already-
+	// unlocked-by-the-time-it-returns lock acquisition) to decide
+	// whether/how to reset, THEN called this function, which re-locked
+	// separately just to run the scan - a background fillWorkerStep()
+	// refresh landing in the gap between those two independent lock
+	// acquisitions could leave the reset decision stale relative to what
+	// the table actually looked like by the time it was scanned, or
+	// expose a scan over a table that had just been partially
+	// invalidated/is mid-refill for a newer revision. There is no such
+	// gap now: the live revision is read exactly once, under this same
+	// lock, and used immediately to decide both the reset and the scan
+	// (or to skip the scan and clear suggestions if not ready).
 	// entries_[]/entryTotal_ are written by the background fill task (see
-	// fillWorkerStep()); this is the one place the main thread reads them,
-	// so the whole (bounded, I/O-free) scan is done under the same lock.
+	// fillWorkerStep()); this is the one place the main thread reads them.
 	candidateMutex_.lock();
-	DjAssistScoring::scanTick(
-		entries_, entryTotal_, scanCursor_, DJ_ASSIST_DEFAULT_SCAN_BUDGET,
-		deckCtx, loaded, loadedCount, recentTracks_, recentCount_,
-		suggestions_, suggestionCount_, DJ_ASSIST_MAX_SUGGESTIONS
-	);
+	const uint32_t liveGeneration = session_ ? session_->assistMetadataRevision() : 0;
+	const bool ready = fillComplete_ && loadedGeneration_ == liveGeneration;
+	if(!ready){
+		// Not ready this tick - either still filling, or a refresh has
+		// moved the live revision past what has actually been filled so
+		// far. Report no suggestions rather than scan/publish against a
+		// table that is incomplete or no longer matches the live
+		// revision: never expose a stale or partially-overwritten table.
+		scanGenerationSeen_ = false;
+		scanCursor_ = 0;
+		suggestionCount_ = 0;
+	}else{
+		if(!scanGenerationSeen_ || liveGeneration != scanGeneration_){
+			scanGenerationSeen_ = true;
+			scanGeneration_ = liveGeneration;
+			scanCursor_ = 0;
+			suggestionCount_ = 0;
+		}
+		DjAssistScoring::scanTick(
+			entries_, entryTotal_, scanCursor_, DJ_ASSIST_DEFAULT_SCAN_BUDGET,
+			deckCtx, loaded, loadedCount, recentTracks_, recentCount_,
+			suggestions_, suggestionCount_, DJ_ASSIST_MAX_SUGGESTIONS
+		);
+	}
 	candidateMutex_.unlock();
 
 	if(mode == DJ_ASSIST_MODE_COACH){
@@ -567,6 +607,26 @@ void DjAssistController::tickRollback(){
 	if(!actuator_) return;
 	if(engine_.mode() != DJ_ASSIST_MODE_TRANSITION_FAILED) return;
 
+	// Re-reconcile toDeck play/sync ownership against LIVE intent
+	// generations at the START of every tick this runs - not just once, at
+	// the single tick guardOk() first observed a divergence.
+	// DjAssistEngine::tick() (and thus guardOk()) no longer runs once the
+	// transition has already reached FAILED (via a guard failure OR an
+	// explicit cancelTransition(), which never calls guardOk() at all), so
+	// without this, a user re-asserting play/sync on the target deck AFTER
+	// that point - but before rollback has finished acting - would never
+	// be caught, and rollback would go on to stop/release state the user
+	// re-established after the transition was already terminal. See
+	// DjAssistEngine::reconcileOwnershipOnDivergence()/
+	// DjAssistBridge::reconcileOwnership().
+	if(session_){
+		const DjAssistIntentGenerations live = session_->assistIntentGenerationsSnapshot();
+		const uint8_t toDeck = engine_.plan().toDeck;
+		if(toDeck < DJ_DECK_COUNT){
+			engine_.reconcileOwnershipOnDivergence(live.playing[toDeck], live.sync[toDeck]);
+		}
+	}
+
 	const DjAssistTransitionPlan& p = engine_.plan();
 
 	// Purge exactly once per failure/cancel episode, before computing/
@@ -650,16 +710,13 @@ void DjAssistController::tick(){
 
 	updateRecentTracks(snapshot);
 
-	uint32_t generation = 0;
-	if(candidateTableReady(generation)){
-		if(!scanGenerationSeen_ || generation != scanGeneration_){
-			scanGenerationSeen_ = true;
-			scanGeneration_ = generation;
-			scanCursor_ = 0;
-			suggestionCount_ = 0;
-		}
-		tickSuggestions(snapshot);
-	}
+	// Readiness/generation-reset now happens INSIDE tickSuggestions()'s own
+	// candidateMutex_ acquisition (see its doc comment) - no separate
+	// candidateTableReady() pre-check/gate here anymore, closing the
+	// previous readiness/consumption TOCTOU between this call site and the
+	// scan.
+	tickSuggestions(snapshot);
+
 	tickTransition(snapshot);
 	tickRollback();
 }

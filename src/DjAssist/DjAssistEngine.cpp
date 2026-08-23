@@ -204,21 +204,30 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 	// the plan's own idempotent steps can never trigger a false positive
 	// either, which is what previously made LOCK_TEMPO's redundant sync
 	// step read as a manual override.
-	// A diverged property immediately relinquishes this plan's rollback
-	// ownership of that exact property (DjAssistTransitionPlan::
-	// toDeckStartOwnedByPlan/toDeckSyncOwnedByPlan) before failing. Without
-	// this, a user re-asserting play/sync on the target deck AFTER this
-	// plan's own step already applied would fail the transition (correctly)
-	// but leave ownership true, so tickRollback() would then stop/release
-	// the user's own newer intent instead of leaving it alone - rollback
-	// must only ever undo a mutation this plan is still the sole author of.
+	//
+	// reconcileOwnershipOnDivergence() re-derives BOTH toDeck ownership
+	// flags (start, sync) in one pass, independently, BEFORE either of
+	// the two failure checks below runs - not as a chain of individual
+	// early-return checks that each relinquish only their own property.
+	// The previous shape returned on the FIRST divergence found, so a
+	// user command that changed BOTH play and sync on the target deck in
+	// one action would only ever have its play ownership cleared (the
+	// play check ran first and returned before the sync check was even
+	// reached), leaving toDeckSyncOwnedByPlan stale/true and rollback
+	// would then release sync the user had just re-armed themselves.
+	// Without this, a user re-asserting play/sync on the target deck
+	// AFTER this plan's own step already applied would fail the
+	// transition (correctly) but leave ownership true, so
+	// tickRollback() would then stop/release the user's own newer
+	// intent instead of leaving it alone - rollback must only ever undo
+	// a mutation this plan is still the sole author of.
+	reconcileOwnershipOnDivergence(
+		guard.playIntentGeneration[plan_.toDeck], guard.syncIntentGeneration[plan_.toDeck]);
 	if(guard.playIntentGeneration[plan_.toDeck] != plan_.armedPlayGeneration[plan_.toDeck]){
-		plan_.toDeckStartOwnedByPlan = false;
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
 	if(guard.syncIntentGeneration[plan_.toDeck] != plan_.armedSyncGeneration[plan_.toDeck]){
-		plan_.toDeckSyncOwnedByPlan = false;
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
@@ -248,6 +257,16 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 	}
 
 	return true;
+}
+
+void DjAssistEngine::reconcileOwnershipOnDivergence(uint32_t livePlayGeneration, uint32_t liveSyncGeneration){
+	const DjAssistBridge::DjAssistOwnershipReconciliation reconciled = DjAssistBridge::reconcileOwnership(
+		plan_.toDeckStartOwnedByPlan, plan_.toDeckSyncOwnedByPlan,
+		livePlayGeneration, plan_.armedPlayGeneration[plan_.toDeck],
+		liveSyncGeneration, plan_.armedSyncGeneration[plan_.toDeck]
+	);
+	plan_.toDeckStartOwnedByPlan = reconciled.toDeckStartOwnedByPlan;
+	plan_.toDeckSyncOwnedByPlan = reconciled.toDeckSyncOwnedByPlan;
 }
 
 void DjAssistEngine::fail(DjAssistTransitionFailure reason){
