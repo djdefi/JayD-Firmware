@@ -96,6 +96,11 @@ add_test(NAME LibraryIndexSelfCheck COMMAND LibraryIndexSelfCheck)
 add_executable(DjSessionSelfCheck tests/dj_session_self_test.cpp)
 set_target_properties(DjSessionSelfCheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjSessionSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjSessionSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjSessionSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
 add_test(NAME DjSessionSelfCheck COMMAND DjSessionSelfCheck)
 
 add_executable(DjBeatEngineSelfCheck tests/dj_beat_engine_selfcheck.cpp)
@@ -251,6 +256,37 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_link_options(AutoDjSessionBridgeSelfCheck PRIVATE -fsanitize=address,undefined)
 endif ()
 add_test(NAME AutoDjSessionBridgeSelfCheck COMMAND AutoDjSessionBridgeSelfCheck)
+
+# Full "real Auto DJ + Coach" integration: unlike AutoDjSessionBridgeSelfCheck
+# (real AutoDjSessionActuator vs. a FAKE AutoDjSessionPort that just returns
+# a controllable mode string), this drives BOTH the real
+# AutoDjSessionActuator AND the real DjAssistController (Coach) against one
+# shared hand-written port implementing both DjAssistSessionPort and
+# AutoDjSessionPort - exactly as DjSession itself does - so Auto DJ's
+# internal Coach-arm command genuinely calls DjAssistController::
+# armTransition() and its composite pollLoad() observes Coach's own
+# transition plan (boundary/start/sync/crossfade/stop) really running, or
+# really failing a guard, rather than a fake mode string set by the test.
+add_executable(AutoDjCoachIntegrationSelfCheck
+        tests/auto_dj_coach_integration_selfcheck.cpp
+        tests/host_stubs/host_arduino_shim.cpp
+        src/AutoDj/DjAutoDjPlanner.cpp
+        src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistFillWorker.cpp
+        src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistSessionBridge.cpp
+        src/DjAssist/DjAssistEngine.cpp)
+target_include_directories(AutoDjCoachIntegrationSelfCheck BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/tests/host_stubs)
+set_target_properties(AutoDjCoachIntegrationSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(AutoDjCoachIntegrationSelfCheck PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(AutoDjCoachIntegrationSelfCheck PRIVATE JAYD_ASSIST_HOST_TASK_SEAM)
+target_link_libraries(AutoDjCoachIntegrationSelfCheck PRIVATE Threads::Threads)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(AutoDjCoachIntegrationSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(AutoDjCoachIntegrationSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME AutoDjCoachIntegrationSelfCheck COMMAND AutoDjCoachIntegrationSelfCheck)
 
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the

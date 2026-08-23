@@ -177,7 +177,16 @@ enum DjCommandError : uint8_t {
 	// resolved to zero or more than one track (trackByFingerprint()
 	// reports Stale on any duplicate-fingerprint match) - never guessed,
 	// never falls back to a stale/foreign path.
-	,DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED
+	,DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED,
+	// AUTODJ_ARM/AUTODJ_RESUME submitted with an origin other than
+	// DJ_ORIGIN_PHYSICAL (i.e. DJ_ORIGIN_HTTP or DJ_ORIGIN_LOCAL_UI):
+	// physical/authenticated confirmation can never be synthesized for a
+	// remote request, no matter how it authenticated/leased - see apply()'s
+	// AUTODJ_ARM/AUTODJ_RESUME cases. A wireless client may still pause/
+	// stop/reset (no confirmation semantics there) or request arm/resume,
+	// but the request is rejected with this stable error until an actual
+	// on-device physical hold gesture has happened.
+	DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED
 };
 
 enum DjTimingQuality : uint8_t {
@@ -237,12 +246,35 @@ struct DjCommand {
 	uint16_t value = 0;
 	uint32_t libraryGeneration = 0;
 	uint64_t libraryKey = 0;
+	// DJ_COMMAND_LOAD_DECK stable-ID loads only (see
+	// DjSession::loadDeckByIdentity()): the metadataRevision the candidate
+	// was captured/selected under, captured explicitly by the caller at
+	// selection time - NOT re-read live at submit/apply time, mirroring
+	// libraryGeneration's existing contract. resolveIdentityPath() rejects
+	// unless this still matches the live metadataRevision, exactly like
+	// libraryGeneration/libraryKey, so a same-generation metadata
+	// replacement (see AutoDjIdentity::metadataRevision's doc comment)
+	// invalidates a stale-but-not-yet-applied load instead of silently
+	// applying it against superseded metadata.
+	uint32_t metadataRevision = 0;
 	DjTrackIdentity trackIdentity = {};
 	char path[DJ_PATH_CAPACITY] = {};
 	// DJ_COMMAND_ASSIST_ARM_TRANSITION only: candidate-table index of the
 	// confirmed target track (paired with trackIdentity, which the engine
 	// re-checks against the loaded deck every tick to catch a swap).
 	uint32_t libraryIndex = 0;
+	// True only for a command Auto DJ itself submitted (its own stable-ID
+	// deck load, or - once armed - its own internal Coach-transition
+	// arm/cancel): NOT the same thing as origin==DJ_ORIGIN_SYSTEM, which
+	// Coach's own human-triggered system commands also use. This is the
+	// explicit "Auto plan ID" tag the takeover-purge below keys off of, so
+	// a manual signal can distinguish "Auto's own queued work" from any
+	// other still-queued system command and remove only the former. Set
+	// exactly once, at submission, by the handful of DjSession methods
+	// Auto DJ itself calls (loadDeckByIdentity() and, once wired, the
+	// internal Coach-arm/cancel helpers) - never by any UI/HTTP-facing
+	// command builder.
+	bool autoDjOwned = false;
 #if defined(JAYD_ENABLE_WIRELESS)
 	uint64_t requestBootId = 0;
 	uint32_t requestSessionId = 0;
@@ -391,6 +423,38 @@ inline void djBumpAutoDjManualIntent(AutoDjManualIntentGenerations& generations,
 	if(djIsAutoDjManualSignal(command) && command.deck < DJ_DECK_COUNT){
 		generations.deck[command.deck]++;
 	}
+}
+
+// Broader than djIsAutoDjManualSignal(): also true for a recording toggle
+// (start or stop), which djIsAutoDjManualSignal() deliberately excludes
+// from the per-deck manual-intent generation bump (recording alone doesn't
+// contest deck/transport ownership), but which must still make Auto DJ
+// yield - Auto never starts/stops a recording itself, and a queued Auto
+// load/arm racing a user-initiated recording change is exactly the kind of
+// non-system intent Auto must synchronously get out of the way of. Used
+// only to gate the takeover-purge below, never the generation bump.
+inline bool djIsAutoDjTakeoverSignal(const DjCommand& command){
+	return djIsAutoDjManualSignal(command) || command.type == DJ_COMMAND_SET_RECORDING;
+}
+
+// True if `command` is an AUTODJ_ARM/AUTODJ_RESUME request that is missing
+// the required physical/authenticated confirmation gate for its origin.
+// Extracted as a small, pure, host-testable predicate (see
+// DjSessionSelfCheck) so the "never synthesize physical confirmation for
+// wireless" rule can be regression-tested directly, even though
+// DjSession::apply() itself (the only caller) is not host-compiled.
+// DJ_ORIGIN_PHYSICAL is the sole origin the Mix screen's on-device hold
+// gesture ever submits AUTODJ_ARM/AUTODJ_RESUME with (see MixScreen.cpp) -
+// an authenticated+leased DJ_ORIGIN_HTTP request, or any other origin,
+// proves who is asking, never that a human is physically at the device,
+// so it must always be rejected here rather than treated as equivalent.
+// This is a stateless, non-bypassable check (no token/lease to forge or
+// replay): every command is re-evaluated independently on its own origin.
+inline bool djAutoDjPhysicalConfirmMissing(const DjCommand& command){
+	if(command.type != DJ_COMMAND_AUTODJ_ARM && command.type != DJ_COMMAND_AUTODJ_RESUME){
+		return false;
+	}
+	return command.origin != DJ_ORIGIN_PHYSICAL;
 }
 
 struct DjEffectSnapshot {
@@ -738,6 +802,34 @@ public:
 
 	uint8_t depth() const{
 		return count;
+	}
+
+	// Removes every currently-queued command tagged autoDjOwned (see
+	// DjCommand's doc comment), unscoped by target/deck - unlike
+	// removeSystemTargeting() above, which only clears the SAME channel a
+	// specific incoming command targets. A manual takeover means "Auto DJ
+	// yields entirely", not "Auto DJ yields on this one deck", so every
+	// Auto-owned entry anywhere in the ring is purged regardless of which
+	// deck/type it targets. Same bounded in-place two-pointer compaction
+	// as removeSystemTargeting() (<= DJ_COMMAND_CAPACITY iterations, no
+	// heap); removed ids are reported (bounded by maxRemoved) so the
+	// caller can record each as SUPERSEDED.
+	uint8_t removeAutoDjOwned(uint32_t* removedIds, uint8_t maxRemoved){
+		uint8_t removed = 0;
+		uint8_t writeOffset = 0;
+		for(uint8_t readOffset = 0; readOffset < count; readOffset++){
+			const DjCommand entry = commands[(head + readOffset) % DJ_COMMAND_CAPACITY];
+			if(entry.autoDjOwned){
+				if(removedIds && removed < maxRemoved) removedIds[removed] = entry.id;
+				removed++;
+				continue;
+			}
+			commands[(head + writeOffset) % DJ_COMMAND_CAPACITY] = entry;
+			writeOffset++;
+		}
+		count = writeOffset;
+		tail = (head + writeOffset) % DJ_COMMAND_CAPACITY;
+		return removed;
 	}
 
 	bool contains(DjCommandType type) const{

@@ -98,6 +98,32 @@ DjSubmitResult DjSession::submit(DjCommand command){
 		return { command.id, DJ_COMMAND_REJECTED, error };
 	}
 
+	// Manual takeover: synchronously purge every still-queued Auto-owned
+	// command (its own stable-ID load, or an internal Coach-arm) and mark
+	// each SUPERSEDED BEFORE this command is admitted - see
+	// djIsAutoDjTakeoverSignal()'s and DjCommand::autoDjOwned's doc
+	// comments. Without this, DjSession::loop()'s FIFO can pop and apply a
+	// stale Auto-owned command on the very next tick, ahead of
+	// tickAutoDj() (called last in that same loop()) ever observing the
+	// generation bump djBumpAutoDjManualIntent() records below - the exact
+	// race the independent review flagged. No direct autoDjActuator.pause()
+	// call is needed here: marking the entry SUPERSEDED is enough for the
+	// planner's own next poll (AutoDjSessionActuator::pollLoad()) to see a
+	// Failed outcome and resolve it through the existing, already-approved
+	// retry/terminal-skip path, and the generation bump below still drives
+	// tick()'s own manualTakeoverActive()-gated pause()+cancelPending() on
+	// its next call exactly as before - calling pause() directly here,
+	// ahead of that, would skip cancelPending() and could leave a stale
+	// pendingEntry to be resurrected after a resume().
+	if(command.origin != DJ_ORIGIN_SYSTEM && djIsAutoDjTakeoverSignal(command)){
+		uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+		const uint8_t removedCount = commandQueue.removeAutoDjOwned(removedIds, DJ_COMMAND_CAPACITY);
+		for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
+			commandResults.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+			if(autoDjTracked.tracked && autoDjTracked.id == removedIds[i]) autoDjTracked.status = DJ_COMMAND_SUPERSEDED;
+		}
+	}
+
 	const DjSubmitResult result = admitAssistCommand(
 		command, commandQueue, commandResults, assistTracked, assistIntentGenerations);
 	if(result.status == DJ_COMMAND_ACCEPTED) djBumpAutoDjManualIntent(autoDjManualIntentGenerations, command);
@@ -128,16 +154,32 @@ DjSubmitResult DjSession::loadDeck(
 	return submit(command);
 }
 
-DjSubmitResult DjSession::loadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity){
+DjSubmitResult DjSession::loadDeckByIdentity(
+	uint8_t deck, const DjTrackIdentity& identity,
+	uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+){
 	DjCommand command = {};
 	command.origin = DJ_ORIGIN_SYSTEM;
 	command.type = DJ_COMMAND_LOAD_DECK;
 	command.deck = deck;
+	// libraryGeneration/metadataRevision are the exact epoch the caller
+	// (Auto DJ) captured this identity under at selection time - never a
+	// live re-read here, otherwise the whole "reject a load whose
+	// candidate has since been superseded" contract is tautological (the
+	// live values always match themselves). libraryKey has no Auto DJ-side
+	// captured equivalent (AutoDjIdentity doesn't carry it) so it is still
+	// read live, same as every other caller of loadDeck().
+	command.libraryGeneration = identityLibraryGeneration;
+	command.metadataRevision = identityMetadataRevision;
 	metadataMutex.lock();
-	command.libraryGeneration = libraryGeneration;
 	command.libraryKey = libraryKey;
 	metadataMutex.unlock();
 	command.trackIdentity = identity;
+	// Sole caller is autoDjLoadDeckByIdentity() (the AutoDjSessionPort
+	// implementation below) - always Auto DJ's own command, so the
+	// takeover-purge tag is set unconditionally here rather than at each
+	// call site.
+	command.autoDjOwned = true;
 	// command.path is left empty (DjCommand{} zero-initializes char[]) -
 	// the sole signal to validate()/applyLoad() that this is a stable-ID
 	// load to be resolved internally, never a caller-supplied path.
@@ -553,20 +595,66 @@ bool DjSession::resolveIdentityPath(const DjCommand& command, char* outPath, siz
 	metadataMutex.lock();
 	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
 	   command.libraryGeneration != libraryGeneration ||
-	   command.libraryKey != libraryKey){
+	   command.libraryKey != libraryKey ||
+	   command.metadataRevision != metadataRevision){
 		// Reject stale/missing generation outright rather than resolve
 		// against a library snapshot the caller no longer agrees with.
+		// metadataRevision catches a same-generation metadata replacement
+		// that libraryGeneration/libraryKey alone would miss - see
+		// AutoDjIdentity::metadataRevision's doc comment.
 		metadataMutex.unlock();
 		return false;
 	}
+	metadataMutex.unlock();
 
+	// Fingerprint -> libraryIndex is now a bounded RAM-only scan over the
+	// same background-filled candidate table Auto DJ's own scan reads
+	// (DjAssistController::candidateEntry(), capped at
+	// DJ_ASSIST_MAX_INDEX_ENTRIES POD comparisons) - never
+	// metadataReader.trackByFingerprint()'s old O(n) full-library scan,
+	// which issued one real SD read per track and ran on this same
+	// (main/DjSession::loop()) thread. Ambiguous (more than one match) or
+	// missing is rejected identically to the old behavior: never guess.
+	const uint32_t candidateTotal = assistController.candidateCount();
+	bool matched = false;
+	bool ambiguous = false;
+	uint32_t matchedIndex = 0;
+	for(uint32_t i = 0; i < candidateTotal; ++i){
+		DjAssistLibraryEntry entry;
+		uint32_t entryRevision = 0;
+		if(!assistController.candidateEntry(i, entry, entryRevision)) continue;
+		if(!(entry.identity.flags & DJ_TRACK_IDENTITY_FINGERPRINT)) continue;
+		if(memcmp(entry.identity.fingerprint, command.trackIdentity.fingerprint, 16) != 0) continue;
+		if(matched){
+			ambiguous = true;
+			break;
+		}
+		matched = true;
+		matchedIndex = entry.libraryIndex;
+	}
+	if(!matched || ambiguous) return false;
+
+	// Single bounded indexed read (not a scan) to fetch the one field the
+	// candidate table doesn't carry: the on-disk path. Still real SD I/O,
+	// but exactly one read, only on an already-resolved, already-approved
+	// library load - never a linear search.
+	metadataMutex.lock();
+	if(metadataReaderStatus != JaydMetadata::Status::Ready ||
+	   command.libraryGeneration != libraryGeneration ||
+	   command.libraryKey != libraryKey ||
+	   command.metadataRevision != metadataRevision){
+		metadataMutex.unlock();
+		return false;
+	}
 	JaydMetadata::Track track{};
-	const JaydMetadata::Status status =
-		metadataReader.trackByFingerprint(command.trackIdentity.fingerprint, track);
-	if(status != JaydMetadata::Status::Ready){
-		// Missing (no match) and Stale (ambiguous - more than one track
-		// shares this fingerprint) are both rejected identically: never
-		// guess which candidate the caller meant.
+	const JaydMetadata::Status status = metadataReader.trackByIndex(matchedIndex, track);
+	if(status != JaydMetadata::Status::Ready ||
+	   memcmp(track.fingerprint, command.trackIdentity.fingerprint, 16) != 0){
+		// Defensive re-check: the underlying index could in principle
+		// have shifted between the RAM scan above and this read (both
+		// still guarded by the same libraryGeneration/libraryKey check,
+		// but belt-and-suspenders against any future gap). Reject rather
+		// than resolve to the wrong track.
 		metadataMutex.unlock();
 		return false;
 	}
@@ -798,6 +886,19 @@ bool DjSession::assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry,
 			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
 			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
 		);
+		// Artist/title hashes for Auto DJ's repeat/artist/title cooldown
+		// exclusion (DjAssistLibraryEntry.artistHash/titleHash) - this
+		// call already runs only from DjAssistFillWorker's background
+		// task (never DjSession::loop()'s main thread), so populating two
+		// more fields here costs zero additional locks/threads and, per
+		// the review, is what lets Auto DJ retire its own separate (and
+		// unsafe, main-thread) candidate-read path entirely in favor of
+		// this one. Best-effort like the rest of this entry:
+		// readStringHash() leaves the field at its buildLibraryEntry()
+		// default (0/"unknown") on a bad offset rather than failing the
+		// whole entry.
+		metadataReader.readStringHash(track.artist, outEntry.artistHash);
+		metadataReader.readStringHash(track.title, outEntry.titleHash);
 	}
 	metadataMutex.unlock();
 	return ok;
@@ -858,8 +959,17 @@ void DjSession::assistPurgePendingSystemCommands(uint8_t deck){
 
 // -- AutoDjSessionPort --
 
+// Both accessors below are RAM-only delegations to assistController's
+// background-filled candidate table (see DjAssistController::
+// candidateCount()/candidateEntry()) - this is the review's required fix:
+// Auto DJ's tick() must never call into metadataReader/metadataMutex
+// itself (that was up to AUTO_DJ_SCAN_BUDGET_PER_TICK * 3 real SD reads
+// per DjSession::loop() tick). The candidate table is the exact same one
+// Coach's own tickSuggestions() scans, filled entirely off-thread by
+// DjAssistFillWorker; Auto DJ now reuses it instead of duplicating the
+// scan with its own direct reader calls.
 uint32_t DjSession::autoDjCandidateCount(){
-	return assistTrackCount();
+	return assistController.candidateCount();
 }
 
 bool DjSession::autoDjCandidateEntry(
@@ -869,31 +979,9 @@ bool DjSession::autoDjCandidateEntry(
 	uint32_t& outTitleHash,
 	uint32_t& outRevision
 ){
-	metadataMutex.lock();
-	// Same single-critical-section discipline as assistTrackEntry(): the
-	// revision, base entry, and artist/title hashes are all read under one
-	// lock acquisition so a concurrent reader swap can never be observed
-	// as a mix of two different reader states.
-	outRevision = metadataRevision;
-	outArtistHash = 0;
-	outTitleHash = 0;
-	JaydMetadata::Track track;
-	const bool ok = metadataInitialized && metadataReaderStatus == JaydMetadata::Status::Ready &&
-		metadataReader.trackByIndex(index, track) == JaydMetadata::Status::Ready;
-	if(ok){
-		const DjTrackIdentity identity = DjAssistBridge::buildTrackIdentity(track.fingerprint, track.sourceId);
-		outEntry = DjAssistBridge::buildLibraryEntry(
-			index, identity, DJ_METADATA_VALID, track.sampleRate, track.durationFrames,
-			track.bpmMilli, track.key, track.rating, track.cueCount, track.gridCount, track.phraseCount
-		);
-		// Best-effort: readStringHash() leaves the hash untouched (still
-		// the pre-zeroed value above) on failure, so a bad artist/title
-		// offset just reads back as "unknown" rather than failing the
-		// whole entry - the rest of the entry is still valid for scoring.
-		metadataReader.readStringHash(track.artist, outArtistHash);
-		metadataReader.readStringHash(track.title, outTitleHash);
-	}
-	metadataMutex.unlock();
+	const bool ok = assistController.candidateEntry(index, outEntry, outRevision);
+	outArtistHash = ok ? outEntry.artistHash : 0;
+	outTitleHash = ok ? outEntry.titleHash : 0;
 	return ok;
 }
 
@@ -938,11 +1026,14 @@ uint8_t DjSession::autoDjTargetDeck(){
 	          // must gate on autoDjActiveDeckContext().valid first anyway.
 }
 
-DjSubmitResult DjSession::autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity){
-	return loadDeckByIdentity(deck, identity);
+DjSubmitResult DjSession::autoDjLoadDeckByIdentity(
+	uint8_t deck, const DjTrackIdentity& identity,
+	uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+){
+	return loadDeckByIdentity(deck, identity, identityLibraryGeneration, identityMetadataRevision);
 }
 
-void DjSession::autoDjTrackLoadCommand(uint32_t commandId){
+void DjSession::autoDjTrackCommand(uint32_t commandId){
 	commandMutex.lock();
 	autoDjTracked.id = commandId;
 	autoDjTracked.tracked = true;
@@ -950,7 +1041,7 @@ void DjSession::autoDjTrackLoadCommand(uint32_t commandId){
 	commandMutex.unlock();
 }
 
-DjCommandStatus DjSession::autoDjLoadCommandStatus(uint32_t commandId){
+DjCommandStatus DjSession::autoDjCommandStatus(uint32_t commandId){
 	commandMutex.lock();
 	DjCommandStatus status = DJ_COMMAND_PENDING;
 	if(autoDjTracked.tracked && autoDjTracked.id == commandId){
@@ -958,6 +1049,52 @@ DjCommandStatus DjSession::autoDjLoadCommandStatus(uint32_t commandId){
 	}
 	commandMutex.unlock();
 	return status;
+}
+
+DjSubmitResult DjSession::autoDjArmCoachTransition(
+	uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+	uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+){
+	// Built directly rather than via the public assistArmTransition()
+	// wrapper: that wrapper takes an explicit origin but never sets
+	// autoDjOwned, and Auto DJ's internal arm must always be both
+	// DJ_ORIGIN_SYSTEM (it is not a user action) and autoDjOwned (so a
+	// manual takeover purges a still-queued arm exactly like a still-
+	// queued load - see djIsAutoDjTakeoverSignal()/removeAutoDjOwned()).
+	// libraryIndex is 0: purely cosmetic UI bookkeeping the engine itself
+	// never validates (see AutoDjSessionPort.h).
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_ASSIST_ARM_TRANSITION;
+	command.deck = fromDeck;
+	command.slot = toDeck;
+	command.libraryIndex = 0;
+	command.trackIdentity = targetIdentity;
+	command.value = uint16_t(
+		crossfadeBeats |
+		(startAtBoundary ? (1 << 8) : 0) |
+		(tempoLock ? (1 << 9) : 0)
+	);
+	command.autoDjOwned = true;
+	return submit(command);
+}
+
+DjSubmitResult DjSession::autoDjCancelCoachTransition(){
+	DjCommand command = {};
+	command.origin = DJ_ORIGIN_SYSTEM;
+	command.type = DJ_COMMAND_ASSIST_CANCEL_TRANSITION;
+	command.autoDjOwned = true;
+	return submit(command);
+}
+
+DjAssistMode DjSession::autoDjCoachTransitionMode(){
+	DjAssistSnapshot snapshot;
+	// copyAssistSnapshot() has no fallible path (always fills snapshot),
+	// but guard defensively anyway: DJ_ASSIST_MODE_OFF is the safe
+	// "nothing in flight" reading, which maps to AutoDjSessionActuator's
+	// uniform Failed-and-let-the-planner-retry/skip policy.
+	if(!copyAssistSnapshot(snapshot)) return DJ_ASSIST_MODE_OFF;
+	return snapshot.mode;
 }
 
 AutoDjManualIntentGenerations DjSession::autoDjManualIntentGenerationsSnapshot(){
@@ -1027,6 +1164,13 @@ bool DjSession::autoDjPinTrack(const DjTrackIdentity& identity, uint32_t artistH
 	AutoDjIdentity autoIdentity;
 	autoIdentity.flags = identity.flags & (AUTO_DJ_IDENTITY_FINGERPRINT | AUTO_DJ_IDENTITY_SOURCE);
 	autoIdentity.libraryGeneration = libraryGeneration;
+	// metadataRevision is a lock-free atomic (see its declaration) - safe
+	// to read here without metadataMutex, same as libraryGeneration is
+	// already read unlocked on this path. Captures the exact epoch this
+	// pin was made under, so a same-generation metadata replacement still
+	// invalidates a stale pin - see AutoDjIdentity::metadataRevision's doc
+	// comment.
+	autoIdentity.metadataRevision = metadataRevision;
 	memcpy(autoIdentity.fingerprint, identity.fingerprint, sizeof(autoIdentity.fingerprint));
 	return autoDjActuator.pinTrack(autoIdentity, artistHash, titleHash);
 }
@@ -1353,15 +1497,21 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			return true;
 		// Arm/Resume consume the one-shot physical/authenticated
 		// confirmation gate right here, synchronously within the same
-		// apply() call that performs the transition - a command can only
-		// ever reach this point after either a physical hold gesture
+		// apply() call that performs the transition - but ONLY when the
+		// command actually originated from an on-device physical gesture
 		// (DJ_ORIGIN_PHYSICAL, set immediately before submit() by the Mix
-		// screen) or an authenticated+leased browser request
-		// (DJ_ORIGIN_HTTP, gated by handleCommand()'s authorize()+
-		// hasWriterLease() before submit()), so setting the flag here is
-		// exactly the required "physical OR authenticated" confirmation,
-		// never a bare unconfirmed arm.
+		// screen). An authenticated+leased browser request (DJ_ORIGIN_HTTP)
+		// can never synthesize this confirmation - authentication/leasing
+		// proves who is asking, not that a human is standing at the
+		// device, and the whole point of this gate is the latter. Reject
+		// outright with a stable, explicit error instead; the browser can
+		// still pause/stop/reset (see the other AUTODJ_* cases below,
+		// unconditional) or ask again once an on-device hold has happened.
 		case DJ_COMMAND_AUTODJ_ARM:
+			if(djAutoDjPhysicalConfirmMissing(command)){
+				error = DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED;
+				return false;
+			}
 			autoDjPhysicalConfirm();
 			if(!autoDjArm()){
 				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;
@@ -1381,6 +1531,10 @@ bool DjSession::apply(const DjCommand& command, DjCommandError& error, DjCommand
 			}
 			return true;
 		case DJ_COMMAND_AUTODJ_RESUME:
+			if(djAutoDjPhysicalConfirmMissing(command)){
+				error = DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED;
+				return false;
+			}
 			autoDjPhysicalConfirm();
 			if(!autoDjResume()){
 				error = DJ_COMMAND_ERROR_AUTODJ_REJECTED;

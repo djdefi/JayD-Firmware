@@ -36,7 +36,10 @@ public:
 	// DJ_ORIGIN_SYSTEM: only Auto DJ calls this (see
 	// AutoDjSessionActuator), so it never itself counts as a manual
 	// takeover (see djBumpAutoDjManualIntent()).
-	DjSubmitResult loadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity);
+	DjSubmitResult loadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+	);
 	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin);
 	DjSubmitResult seek(uint8_t deck, uint16_t seconds, DjCommandOrigin origin);
 	DjSubmitResult setGain(uint8_t deck, uint8_t gain, DjCommandOrigin origin);
@@ -166,9 +169,26 @@ public:
 	uint32_t autoDjLibraryGeneration() override;
 	DjAssistDeckContext autoDjActiveDeckContext() override;
 	uint8_t autoDjTargetDeck() override;
-	DjSubmitResult autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity) override;
-	void autoDjTrackLoadCommand(uint32_t commandId) override;
-	DjCommandStatus autoDjLoadCommandStatus(uint32_t commandId) override;
+	DjSubmitResult autoDjLoadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+	) override;
+	void autoDjTrackCommand(uint32_t commandId) override;
+	DjCommandStatus autoDjCommandStatus(uint32_t commandId) override;
+	// Constructs DJ_COMMAND_ASSIST_ARM_TRANSITION/ASSIST_CANCEL_TRANSITION
+	// directly (not via the public assistArmTransition()/
+	// assistCancelTransition() wrappers, which don't set autoDjOwned) with
+	// origin = DJ_ORIGIN_SYSTEM and autoDjOwned = true, so a manual
+	// takeover purges a still-queued Auto-internal arm/cancel exactly like
+	// it purges a still-queued load. libraryIndex is passed as 0 (see
+	// AutoDjSessionPort.h - the engine never validates it, purely cosmetic
+	// UI bookkeeping for the physical/browser Assist display).
+	DjSubmitResult autoDjArmCoachTransition(
+		uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+	) override;
+	DjSubmitResult autoDjCancelCoachTransition() override;
+	DjAssistMode autoDjCoachTransitionMode() override;
 	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override;
 	bool autoDjConsumePhysicalConfirmation() override;
 

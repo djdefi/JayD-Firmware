@@ -69,6 +69,16 @@ public:
 		queue.invalidateGeneration(currentGeneration);
 	}
 
+	// Sibling of invalidateLibraryGeneration(): see
+	// DjAutoDjQueue::invalidateRevision()'s and AutoDjIdentity::
+	// metadataRevision's doc comments. A pending in-flight entry dropped by
+	// this call is picked up the same way an invalidateLibraryGeneration()
+	// drop already is - beginNextLoad()'s containsSequence() re-check
+	// before any retry abandons it cleanly instead of resubmitting.
+	void invalidateMetadataRevision(uint32_t currentRevision){
+		queue.invalidateRevision(currentRevision);
+	}
+
 	bool arm(){
 		return machine.arm(port.hasStableIdEndpoint(), port.physicalConfirmationPresent());
 	}

@@ -24,13 +24,14 @@ class AutoDjSessionPort {
 public:
 	virtual ~AutoDjSessionPort() {}
 
-	// Bounded candidate-table data source, backed by the exact same
-	// already-indexed metadata reader assistTrackEntry()/resolveMetadata()
-	// use - never a fresh file read. outRevision reports the exact
-	// metadataRevision this read was performed under, captured under the
-	// same lock acquisition as the entry read itself (mirrors
-	// assistTrackEntry()'s doc comment), so a caller can detect a reader
-	// swap mid-scan rather than mixing two different reader states.
+	// Bounded candidate-table data source. RAM-only: delegates to
+	// DjAssistController's background-filled candidate table (the exact
+	// same table Coach's own suggestion scan reads), never the metadata
+	// reader/SD card directly - see DjSession::autoDjCandidateEntry().
+	// outRevision reports the exact fill generation this read was
+	// performed under, captured under the same lock acquisition as the
+	// entry read itself, so a caller can detect a reader swap mid-scan
+	// rather than mixing two different reader states.
 	virtual uint32_t autoDjCandidateCount() = 0;
 	virtual bool autoDjCandidateEntry(
 		uint32_t index,
@@ -60,10 +61,44 @@ public:
 	// Non-blocking stable-ID deck load (see DjSession::loadDeckByIdentity()).
 	// Always submitted with DJ_ORIGIN_SYSTEM so it can never itself count
 	// as a manual takeover. Mirrors DjAssistController's
-	// submit()-then-track two-step convention exactly.
-	virtual DjSubmitResult autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity) = 0;
-	virtual void autoDjTrackLoadCommand(uint32_t commandId) = 0;
-	virtual DjCommandStatus autoDjLoadCommandStatus(uint32_t commandId) = 0;
+	// submit()-then-track two-step convention exactly. libraryGeneration/
+	// metadataRevision are the exact epoch values the candidate was scored/
+	// selected under (see AutoDjIdentity), captured explicitly by the
+	// caller - never re-read live inside this call - so
+	// resolveIdentityPath() can reject a load whose captured epoch has
+	// since been superseded instead of silently resolving against a
+	// different revision's metadata.
+	virtual DjSubmitResult autoDjLoadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t libraryGeneration, uint32_t metadataRevision
+	) = 0;
+	virtual void autoDjTrackCommand(uint32_t commandId) = 0;
+	virtual DjCommandStatus autoDjCommandStatus(uint32_t commandId) = 0;
+
+	// Composite-workflow step 2: arm the already-approved Coach transition
+	// engine as the sole mechanism that actually advances play/mix/stop -
+	// Auto DJ never runs its own crossfade logic. Submitted with
+	// DJ_ORIGIN_SYSTEM and tagged autoDjOwned so a manual takeover purges a
+	// still-queued arm exactly like it purges a still-queued load; once
+	// applied, Coach's own guard (identity/deck-state re-validated at arm
+	// time) is the confirmation that the loaded target is correct, and
+	// Coach's own manual-override/media/recording-conflict handling is
+	// inherited unmodified - see AutoDjSessionActuator's composite
+	// pollLoad(). targetIdentity/toDeck must be the exact identity/deck
+	// Auto just loaded; fromDeck is the other, currently-playing deck.
+	virtual DjSubmitResult autoDjArmCoachTransition(
+		uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+	) = 0;
+	// Best-effort teardown of an Auto-owned Coach arm/transition (e.g. a
+	// hard reset()); never required for correctness since Coach's own guard
+	// independently detects and fails/rolls back on genuine manual
+	// takeover, but avoids leaving a transition Auto no longer wants
+	// running unsupervised after an explicit abandon.
+	virtual DjSubmitResult autoDjCancelCoachTransition() = 0;
+	// Coach's current mode, polled once per tick while a transition Auto
+	// armed is in flight. Always succeeds (no fallible snapshot path).
+	virtual DjAssistMode autoDjCoachTransitionMode() = 0;
 
 	virtual bool copySnapshot(DjSnapshot& snapshot) = 0;
 

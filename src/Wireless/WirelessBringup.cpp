@@ -401,6 +401,13 @@ const char* commandErrorName(DjCommandError error){
 		case DJ_COMMAND_ERROR_ASSIST_REJECTED: return "assist_rejected";
 		case DJ_COMMAND_ERROR_ASSIST_OVERRIDE_PENDING: return "assist_override_pending";
 		case DJ_COMMAND_ERROR_AUTODJ_REJECTED: return "autodj_rejected";
+		case DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED: return "library_identity_unresolved";
+		// Browser guidance: arm/resume needs an actual on-device physical
+		// hold gesture - authenticated/leased alone is never sufficient
+		// (see DjSession::apply()'s AUTODJ_ARM/AUTODJ_RESUME cases). Retry
+		// after a physical confirm, or use pause/stop/reset instead, which
+		// remain available remotely.
+		case DJ_COMMAND_ERROR_AUTODJ_PHYSICAL_CONFIRM_REQUIRED: return "autodj_physical_confirm_required";
 		default: return "invalid_value";
 	}
 }

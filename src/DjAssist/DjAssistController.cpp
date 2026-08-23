@@ -312,6 +312,29 @@ bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
 	return ready;
 }
 
+// Public, RAM-only candidate accessors (see DjAssistController.h's doc
+// comment). entryTotal_ is only ever set once - to the full, capped count -
+// at the moment fillWorkerStep() finishes a complete pass for a generation
+// (see that function); it stays 0 for the entire duration a fill is still
+// in progress for a newer generation, so returning it directly here is
+// already the exact "fully filled or nothing" gate a caller needs, with no
+// separate readiness check required.
+uint32_t DjAssistController::candidateCount(){
+	candidateMutex_.lock();
+	const uint32_t count = entryTotal_;
+	candidateMutex_.unlock();
+	return count;
+}
+
+bool DjAssistController::candidateEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision){
+	candidateMutex_.lock();
+	outRevision = loadedGeneration_;
+	const bool ok = entries_ != nullptr && index < entryTotal_;
+	if(ok) outEntry = entries_[index];
+	candidateMutex_.unlock();
+	return ok;
+}
+
 void DjAssistController::updateRecentTracks(const DjSnapshot& snapshot){
 	for(uint8_t d = 0; d < DJ_DECK_COUNT; ++d){
 		const bool loadedNow = snapshot.decks[d].loaded && snapshot.decks[d].metadata.state == DJ_METADATA_VALID;

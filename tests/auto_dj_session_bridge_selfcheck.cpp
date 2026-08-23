@@ -63,8 +63,22 @@ public:
 	bool lastLoadCalled = false;
 	uint8_t lastLoadDeck = 255;
 	DjTrackIdentity lastLoadIdentity;
+	uint32_t lastLoadGeneration = 0;
+	uint32_t lastLoadRevision = 0;
 	uint32_t trackedCommandId = 0;
 	DjCommandStatus trackedCommandStatus = DJ_COMMAND_PENDING;
+
+	// Composite-workflow (Coach arm) bookkeeping.
+	DjSubmitResult nextArmSubmitResult = { 0, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
+	bool lastArmCalled = false;
+	uint8_t lastArmFromDeck = 255;
+	uint8_t lastArmToDeck = 255;
+	DjTrackIdentity lastArmIdentity;
+	uint8_t lastArmCrossfadeBeats = 0;
+	bool lastArmStartAtBoundary = false;
+	bool lastArmTempoLock = false;
+	bool cancelCalled = false;
+	DjAssistMode coachMode = DJ_ASSIST_MODE_COACH;
 
 	uint32_t autoDjCandidateCount() override{
 		return entryCount;
@@ -90,23 +104,53 @@ public:
 	DjAssistDeckContext autoDjActiveDeckContext() override{ return deckContext; }
 	uint8_t autoDjTargetDeck() override{ return targetDeck; }
 
-	DjSubmitResult autoDjLoadDeckByIdentity(uint8_t deck, const DjTrackIdentity& identity) override{
+	DjSubmitResult autoDjLoadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t libraryGenerationAtSelection, uint32_t metadataRevisionAtSelection
+	) override{
 		lastLoadCalled = true;
 		lastLoadDeck = deck;
 		lastLoadIdentity = identity;
+		lastLoadGeneration = libraryGenerationAtSelection;
+		lastLoadRevision = metadataRevisionAtSelection;
 		DjSubmitResult result = nextSubmitResult;
 		if(result.id == 0 && result.status == DJ_COMMAND_ACCEPTED) result.id = nextCommandId++;
 		return result;
 	}
 
-	void autoDjTrackLoadCommand(uint32_t commandId) override{
+	void autoDjTrackCommand(uint32_t commandId) override{
 		trackedCommandId = commandId;
 		trackedCommandStatus = DJ_COMMAND_ACCEPTED;
 	}
 
-	DjCommandStatus autoDjLoadCommandStatus(uint32_t commandId) override{
+	DjCommandStatus autoDjCommandStatus(uint32_t commandId) override{
 		if(commandId != trackedCommandId) return DJ_COMMAND_PENDING;
 		return trackedCommandStatus;
+	}
+
+	DjSubmitResult autoDjArmCoachTransition(
+		uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+	) override{
+		lastArmCalled = true;
+		lastArmFromDeck = fromDeck;
+		lastArmToDeck = toDeck;
+		lastArmIdentity = targetIdentity;
+		lastArmCrossfadeBeats = crossfadeBeats;
+		lastArmStartAtBoundary = startAtBoundary;
+		lastArmTempoLock = tempoLock;
+		DjSubmitResult result = nextArmSubmitResult;
+		if(result.id == 0 && result.status == DJ_COMMAND_ACCEPTED) result.id = nextCommandId++;
+		return result;
+	}
+
+	DjSubmitResult autoDjCancelCoachTransition() override{
+		cancelCalled = true;
+		return { 0, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
+	}
+
+	DjAssistMode autoDjCoachTransitionMode() override{
+		return coachMode;
 	}
 
 	bool copySnapshot(DjSnapshot& outSnapshot) override{
@@ -160,6 +204,35 @@ void pinAnyTrack(AutoDjSessionActuator& actuator, uint8_t fingerprintByte = 0xF0
 	actuator.pinTrack(identity, 0, 0);
 }
 
+// Drives an in-flight load through the rest of the composite workflow
+// (fix #5): call this once the load command has been submitted and the
+// caller has set port.trackedCommandStatus = DJ_COMMAND_APPLIED to resolve
+// it, but BEFORE ticking again - this helper performs that resolving tick
+// itself, then submits/applies the Coach arm and drives Coach's transition
+// mode through RUNNING to COMPLETE, asserting the arm was submitted with
+// the exact identity/deck/defaults Auto DJ just loaded. Each hidden
+// sub-phase (arm-in-flight, arm-applied/transition-in-flight, transition-
+// complete) is its own one-shot poll, mirroring exactly how the real
+// planner/pollLoad() one-shot contract works - four tick()s total.
+void completeCoachArmAndTransition(FakeSessionPort& port, AutoDjSessionActuator& actuator, uint8_t expectedToDeck){
+	actuator.tick(); // observes load APPLIED, submits the Coach arm.
+	assert(port.lastArmCalled);
+	assert(port.lastArmToDeck == expectedToDeck);
+	assert(port.lastArmFromDeck == uint8_t((DJ_DECK_COUNT - 1) - expectedToDeck));
+	assert(port.lastArmCrossfadeBeats == AUTO_DJ_TRANSITION_CROSSFADE_BEATS);
+	assert(port.lastArmStartAtBoundary == AUTO_DJ_TRANSITION_START_AT_BOUNDARY);
+	assert(port.lastArmTempoLock == AUTO_DJ_TRANSITION_TEMPO_LOCK);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED; // arm applies.
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_RUNNING;
+	actuator.tick(); // observes arm APPLIED, moves to polling Coach's own transition mode.
+
+	actuator.tick(); // still running - not yet terminal.
+
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_COMPLETE;
+	actuator.tick(); // Coach finished - only now does the entry resolve/record.
+}
+
 // -- Test 1: bounded scan finds the sole eligible candidate and plans it,
 // then submits/tracks/applies it through the real DjAutoDjPlanner exactly
 // as a real DjSession round-trip would. --
@@ -189,9 +262,15 @@ void testScanPlanSubmitApply(){
 	assert(port.lastLoadCalled);
 	assert(port.lastLoadDeck == port.targetDeck);
 	assert(memcmp(port.lastLoadIdentity.fingerprint, port.entries[0].entry.identity.fingerprint, 16) == 0);
+	// The candidate's captured generation+revision (from the scan pass)
+	// must reach the port unchanged - never re-read live at submit time,
+	// otherwise the whole "reject a since-superseded candidate" contract
+	// (see AutoDjIdentity::metadataRevision's doc comment) is tautological.
+	assert(port.lastLoadGeneration == port.libraryGeneration);
+	assert(port.lastLoadRevision == port.metadataRevision);
 
 	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
-	actuator.tick();
+	completeCoachArmAndTransition(port, actuator, port.targetDeck);
 	assert(actuator.state() == AutoDjState::Running);
 
 	AutoDjSnapshot snapshot;
@@ -230,7 +309,7 @@ void testAlreadyQueuedExcluded(){
 	// assertion is queue depth staying at 1 (never 2) - checked via
 	// snapshot below once the in-flight load resolves.
 	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
-	actuator.tick();
+	completeCoachArmAndTransition(port, actuator, port.targetDeck);
 	AutoDjSnapshot snapshot;
 	actuator.copySnapshot(snapshot);
 	assert(snapshot.queueDepth == 0); // resolved, nothing duplicated behind it.
@@ -255,6 +334,113 @@ void testManualTakeoverPauses(){
 	port.manualGenerations.deck[0]++; // simulates DjSession::submit() bumping it.
 	actuator.tick();
 	assert(actuator.state() == AutoDjState::Paused);
+}
+
+// -- Test 3b (fix #5 review): a manual takeover detected while Auto's own
+// Coach arm/transition may still be physically live (ArmInFlight or
+// TransitionInFlight) must proactively cancel it, not merely rely on
+// Coach's own separately-keyed guard to eventually notice - see
+// manualTakeoverActive()'s doc comment in AutoDjSessionActuator.h. --
+void testManualTakeoverDuringTransitionCancelsCoach(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xDD);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits load.
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits Coach arm -> ArmInFlight.
+	assert(port.lastArmCalled);
+	assert(!port.cancelCalled);
+
+	// Manual takeover lands while the arm is still in flight (not yet
+	// applied): the very next tick must observe it, cancel the live Coach
+	// arm, and pause - before the arm has even resolved.
+	port.manualGenerations.deck[0]++;
+	actuator.tick();
+	assert(port.cancelCalled);
+	assert(actuator.state() == AutoDjState::Paused);
+}
+
+// -- Test 3c (fix #5 review): same as above, but the takeover lands once
+// the arm has already applied and Coach's own transition is actively
+// running (TransitionInFlight) - proves the cancel-on-takeover check
+// covers both composite sub-phases, not only ArmInFlight. --
+void testManualTakeoverDuringRunningTransitionCancelsCoach(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xD1);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits load.
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits Coach arm.
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED; // arm applies too.
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_RUNNING;
+	actuator.tick(); // arm APPLIED -> TransitionInFlight, Coach now running.
+	assert(!port.cancelCalled);
+
+	port.manualGenerations.deck[0]++;
+	actuator.tick();
+	assert(port.cancelCalled);
+	assert(actuator.state() == AutoDjState::Paused);
+}
+
+// -- Test 3d (fix #5 review): reset() (a hard, immediate abandon) must
+// proactively cancel a live Coach arm/transition too, not only rely on the
+// planner's own bookkeeping being forgotten - see reset()'s doc comment. --
+void testResetDuringTransitionCancelsCoach(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xD2);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits load.
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits Coach arm -> ArmInFlight.
+	assert(port.lastArmCalled);
+	assert(!port.cancelCalled);
+
+	actuator.reset();
+	assert(port.cancelCalled);
+
+	// The sub-phase must actually be forgotten (not just the cancel call
+	// made), so a stale command id can never be mistaken for a still-live
+	// phase: the planner's own pendingPhase is still WaitingOutcome here
+	// (reset() only applies the state-machine transition from Failed/
+	// Complete, and this actuator is still Running), so the very next
+	// tick's progressPending() calls pollLoad() again - it must now see
+	// AutoDjLoadSubPhase::Idle (uniformly Failed) rather than resuming the
+	// abandoned arm/transition, proving the phase reset actually stuck.
+	port.cancelCalled = false;
+	port.lastArmCalled = false;
+	actuator.tick();
+	assert(!port.cancelCalled); // nothing stale left to cancel a second time.
 }
 
 // -- Test 4: generation1 X submitted -> load fails (attempt kept, within
@@ -331,9 +517,197 @@ void testLibraryGenerationInvalidationWhileStopping(){
 	assert(!port.lastLoadCalled);
 
 	// Bounded: Stopping must still terminate within a fixed number of ticks.
-	for(int i = 0; i < 60 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
+	// port.trackedCommandStatus never resolves in this test (stays
+	// ACCEPTED), so the only way out is resolvePendingWhileStopping()'s own
+	// AUTO_DJ_LOAD_TIMEOUT_TICKS timeout - bound the loop against that
+	// constant (now sized for the composite load+arm+transition workflow,
+	// not just a load) rather than an arbitrary small number.
+	for(int i = 0; i < int(AUTO_DJ_LOAD_TIMEOUT_TICKS) + 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
 	assert(actuator.state() != AutoDjState::Stopping);
 	assert(!port.lastLoadCalled); // never resubmitted the stale entry on the way out either.
+}
+
+// -- Test 4c: same regression as testLibraryGenerationInvalidation(), but
+// triggered by a same-generation metadataRevision bump instead - a sidecar
+// metadata replacement that leaves the external libraryGeneration
+// unchanged. X is submitted under revision 1; before the retry, the
+// revision bumps to 2 (generation stays 1) and X must be dropped from the
+// queue and never resubmitted - this is the exact issue #3 regression
+// (submitLoad() discarding identity generation/revision, and stepScan()'s
+// invalidation only keying on libraryGeneration). --
+void testMetadataRevisionInvalidation(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xC1);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200); // near end so beginNextLoad() fires promptly.
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick(); // top up the queue while Armed so start()'s hasSafeWindow() check passes.
+	actuator.start();
+	actuator.tick(); // plans + submits X under revision 1 on the first attempt.
+	assert(port.lastLoadCalled);
+	assert(port.lastLoadRevision == 1);
+
+	AutoDjSnapshot before;
+	actuator.copySnapshot(before);
+	assert(before.queueDepth == 1);
+
+	// The in-flight load fails (still within the retry budget), so X stays
+	// captured for a retry rather than being skipped as a terminal failure.
+	port.trackedCommandStatus = DJ_COMMAND_FAILED;
+	actuator.tick();
+
+	// Metadata is replaced before the retry happens: same libraryGeneration
+	// (1), but metadataRevision advances to 2. X (captured under revision
+	// 1) must be dropped and never resubmitted.
+	port.metadataRevision = 2;
+	port.lastLoadCalled = false;
+	actuator.tick();
+	assert(!port.lastLoadCalled); // stale X must never be resubmitted.
+
+	AutoDjSnapshot after;
+	actuator.copySnapshot(after);
+	assert(after.historySize == 0); // abandoned, not applied.
+}
+
+// -- Test 4d: same revision-invalidation regression, but while Stopping. --
+void testMetadataRevisionInvalidationWhileStopping(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xC2);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits X under revision 1.
+	assert(port.lastLoadCalled);
+
+	assert(actuator.stop());
+	assert(actuator.state() == AutoDjState::Stopping);
+
+	// Same-generation metadata replacement while Stopping and the attempt
+	// is still outstanding: X (revision 1) is dropped from the queue.
+	port.metadataRevision = 2;
+	port.lastLoadCalled = false;
+	actuator.tick();
+	assert(!port.lastLoadCalled);
+
+	// Bounded: Stopping must still terminate within a fixed number of ticks.
+	// port.trackedCommandStatus never resolves in this test (stays
+	// ACCEPTED), so the only way out is resolvePendingWhileStopping()'s own
+	// AUTO_DJ_LOAD_TIMEOUT_TICKS timeout - bound the loop against that
+	// constant (now sized for the composite load+arm+transition workflow,
+	// not just a load) rather than an arbitrary small number.
+	for(int i = 0; i < int(AUTO_DJ_LOAD_TIMEOUT_TICKS) + 10 && actuator.state() == AutoDjState::Stopping; i++) actuator.tick();
+	assert(actuator.state() != AutoDjState::Stopping);
+	assert(!port.lastLoadCalled); // never resubmitted the stale entry on the way out either.
+}
+
+// -- Test 4e (fix #5 review, "failures at every stage"): the Coach arm
+// submit itself is rejected (e.g. the target/from-deck state no longer
+// satisfies armTransition()'s own guard). Within the retry budget the
+// attempt must retry from the load step again (never resubmit a bare arm
+// against a stale load); once retried successfully the entry still
+// resolves normally. --
+void testCoachArmRejectionRetriesFromLoadThenResolves(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xCC);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits the load.
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	port.nextArmSubmitResult = { 0, DJ_COMMAND_REJECTED, DJ_COMMAND_ERROR_AUTODJ_REJECTED };
+	actuator.tick(); // load APPLIED -> beginArm() submits the arm, port rejects it synchronously.
+	assert(port.lastArmCalled);
+
+	AutoDjSnapshot mid;
+	actuator.copySnapshot(mid);
+	assert(mid.historySize == 0); // not resolved terminally yet.
+	assert(mid.queueDepth == 1); // within AUTO_DJ_RETRY_BUDGET: entry stays queued for a retry.
+
+	// The retry re-enters at the load step (never a bare arm retry against
+	// a load that may no longer be current) - let it succeed this time.
+	port.lastLoadCalled = false;
+	port.nextArmSubmitResult = { 0, DJ_COMMAND_ACCEPTED, DJ_COMMAND_ERROR_NONE };
+	actuator.tick();
+	assert(port.lastLoadCalled);
+	assert(memcmp(port.lastLoadIdentity.fingerprint, port.entries[0].entry.identity.fingerprint, 16) == 0);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	completeCoachArmAndTransition(port, actuator, port.targetDeck);
+	AutoDjSnapshot after;
+	actuator.copySnapshot(after);
+	assert(after.historySize == 1); // eventually resolved once the retry succeeds.
+}
+
+// -- Test 4f (fix #5 review, "failures at every stage"): Coach's own
+// transition fails after a successful arm (e.g. its guard trips on a
+// divergence at start/crossfade time) - pollTransitionPhase() must map this
+// uniformly to Failed and defer to the planner's existing bounded retry/
+// terminal-skip policy exactly like a load or arm failure, never invent a
+// separate crossfade-recovery path of its own. --
+void testCoachTransitionFailureFailsAttemptWithinBudget(){
+	FakeSessionPort port;
+	port.entryCount = 1;
+	port.entries[0].entry = makeEntry(0xCE);
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	setPlayingDeck(port, 0, 190, 200);
+	port.physicalConfirmationPending = true;
+
+	AutoDjSessionActuator actuator(port);
+	actuator.arm();
+	actuator.tick();
+	actuator.start();
+	actuator.tick(); // submits the load.
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	actuator.tick(); // load APPLIED -> submits the Coach arm.
+	assert(port.lastArmCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED; // arm applies.
+	actuator.tick(); // arm APPLIED -> TransitionInFlight.
+
+	port.coachMode = DJ_ASSIST_MODE_TRANSITION_FAILED;
+	actuator.tick(); // Coach's own transition failed - must resolve to Failed, not hang.
+
+	AutoDjSnapshot mid;
+	actuator.copySnapshot(mid);
+	assert(mid.historySize == 0);
+	assert(mid.queueDepth == 1); // within budget: retried, not skipped yet.
+
+	// Retry re-enters at the load step and this time Coach's transition
+	// actually completes.
+	port.lastLoadCalled = false;
+	port.coachMode = DJ_ASSIST_MODE_COACH; // idle baseline for the next arm.
+	actuator.tick();
+	assert(port.lastLoadCalled);
+
+	port.trackedCommandStatus = DJ_COMMAND_APPLIED;
+	completeCoachArmAndTransition(port, actuator, port.targetDeck);
+	AutoDjSnapshot after;
+	actuator.copySnapshot(after);
+	assert(after.historySize == 1);
 }
 
 // -- Test 5: currentTrackAtEnd()/currentDurationTrustworthy() are false
@@ -430,8 +804,15 @@ int main(){
 	testScanPlanSubmitApply();
 	testAlreadyQueuedExcluded();
 	testManualTakeoverPauses();
+	testManualTakeoverDuringTransitionCancelsCoach();
+	testManualTakeoverDuringRunningTransitionCancelsCoach();
+	testResetDuringTransitionCancelsCoach();
 	testLibraryGenerationInvalidation();
 	testLibraryGenerationInvalidationWhileStopping();
+	testMetadataRevisionInvalidation();
+	testMetadataRevisionInvalidationWhileStopping();
+	testCoachArmRejectionRetriesFromLoadThenResolves();
+	testCoachTransitionFailureFailsAttemptWithinBudget();
 	testNoSafeWindowWithoutTrustworthyDuration();
 	testRecordingFailureFailsRun();
 	testPinTrackTranslatesIdentity();

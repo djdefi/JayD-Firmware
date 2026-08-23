@@ -24,6 +24,15 @@ static const uint8_t AUTO_DJ_QUEUE_TOPUP_WATERMARK = 2;
 // crossfade plan) to complete before playback actually runs out.
 static const uint32_t AUTO_DJ_END_MARGIN_SECONDS = 10;
 
+// Auto DJ's own Coach-arm defaults: matches MixScreen.cpp's physical Assist
+// bank call site exactly (its own default crossfadeBeats/startAtBoundary/
+// tempoLock), so an automated transition looks/behaves identically to a
+// manually-armed one - Auto DJ reuses Coach as the sole transition engine,
+// not a second implementation of the same choice.
+static const uint8_t AUTO_DJ_TRANSITION_CROSSFADE_BEATS = 16;
+static const bool AUTO_DJ_TRANSITION_START_AT_BOUNDARY = true;
+static const bool AUTO_DJ_TRANSITION_TEMPO_LOCK = true;
+
 // Bounded, POD snapshot of Auto DJ's current state - safe to copy into a
 // browser/API payload or physical-bank UI cache, mirroring DjAssistSnapshot's
 // role for Coach.
@@ -51,6 +60,28 @@ struct AutoDjSnapshot {
 // fully-materialized entries[] array, neither of which fits this class's
 // one-entry-at-a-time, DjAssistLibraryEntry-plus-artist/title-hash read
 // path - see mergeCandidate()/stepScan() below for the bounded equivalent.
+//
+// submitLoad()/pollLoad() implement a composite, multi-command workflow
+// behind the planner's single one-shot "submit then poll until Applied/
+// Failed" contract: RAM stable-ID load -> (once applied) internal
+// Auto-owned Coach arm -> poll Coach's own transition through boundary/
+// start/sync/crossfade/stop/rollback -> only then Applied. The planner
+// (frozen/approved core) is never touched or made aware of this - from its
+// perspective this is still exactly one pending attempt with Accepted/
+// Pending/Applied/Failed outcomes; see AutoDjLoadSubPhase below for how
+// those map onto the underlying load/arm/transition commands. This is
+// deliberate: Auto DJ never implements its own crossfade/mix logic, it
+// only ever drives the already-approved Coach engine, which is what
+// inherits Coach's existing manual-override/media-loss/recording-conflict
+// handling for free (see manualTakeoverActive() and pollTransitionPhase()
+// below).
+enum class AutoDjLoadSubPhase : uint8_t {
+	Idle,
+	LoadInFlight,       // stable-ID deck load submitted, not yet applied.
+	ArmInFlight,         // load applied; Coach arm submitted, not yet applied.
+	TransitionInFlight   // arm applied; polling Coach's own transition mode.
+};
+
 class AutoDjSessionActuator : public AutoDjLoadPort {
 public:
 	explicit AutoDjSessionActuator(AutoDjSessionPort& sessionPort) : sessionPort(sessionPort), planner(*this){}
@@ -63,7 +94,24 @@ public:
 	bool pause(){ return planner.pause(); }
 	bool resume(){ return planner.resume(); }
 	bool stop(){ return planner.stop(); }
-	bool reset(){ return planner.reset(); }
+	// Hard, immediate abandon (unlike stop(), which deliberately waits for
+	// an in-flight attempt to resolve via Stopping - see
+	// DjAutoDjPlanner::stop()'s doc comment): if Auto's own Coach-armed
+	// transition may still be live (ArmInFlight/TransitionInFlight),
+	// proactively cancel it before the planner forgets about the attempt
+	// entirely, rather than leaving it running unsupervised. Never
+	// required for correctness (Coach's own guard independently detects
+	// and fails/rolls back on a genuine manual takeover regardless of
+	// whether anything here still asks it to), but reset() is an explicit
+	// deliberate abandon and should not leave a transition it no longer
+	// intends to observe running.
+	bool reset(){
+		if(loadSubPhase == AutoDjLoadSubPhase::ArmInFlight || loadSubPhase == AutoDjLoadSubPhase::TransitionInFlight){
+			sessionPort.autoDjCancelCoachTransition();
+		}
+		loadSubPhase = AutoDjLoadSubPhase::Idle;
+		return planner.reset();
+	}
 	bool pinTrack(const AutoDjIdentity& identity, uint32_t artistHash, uint32_t titleHash){
 		return planner.pinTrack(identity, artistHash, titleHash);
 	}
@@ -77,11 +125,12 @@ public:
 
 	// One-shot runtime step, safe to call on any fixed cadence (mirrors
 	// DjAutoDjPlanner::tick()'s own one-shot contract): refreshes the
-	// library-generation baseline, advances at most one bounded scan
-	// chunk toward topping up the queue, then ticks the planner exactly
-	// once.
+	// library-generation and metadata-revision baselines, advances at most
+	// one bounded scan chunk toward topping up the queue, then ticks the
+	// planner exactly once.
 	void tick(){
 		refreshLibraryGeneration();
+		refreshMetadataRevision();
 		sessionPort.copySnapshot(cachedSnapshot);
 		stepScan();
 		planner.tick();
@@ -97,33 +146,45 @@ public:
 		trackIdentity.flags = identity.flags & (DJ_TRACK_IDENTITY_FINGERPRINT | DJ_TRACK_IDENTITY_SOURCE);
 		memcpy(trackIdentity.fingerprint, identity.fingerprint, sizeof(trackIdentity.fingerprint));
 		const uint8_t deck = sessionPort.autoDjTargetDeck();
-		const DjSubmitResult result = sessionPort.autoDjLoadDeckByIdentity(deck, trackIdentity);
+		// Thread the exact epoch this candidate was captured/selected
+		// under straight through to the session, rather than letting the
+		// session re-read live values (which would make the whole "reject
+		// a since-superseded candidate" contract tautological) - see
+		// AutoDjIdentity::metadataRevision's doc comment.
+		const DjSubmitResult result = sessionPort.autoDjLoadDeckByIdentity(
+			deck, trackIdentity, identity.libraryGeneration, identity.metadataRevision
+		);
 		if(result.status != DJ_COMMAND_ACCEPTED){
-			hasInFlightLoad = false;
+			loadSubPhase = AutoDjLoadSubPhase::Idle;
 			return false;
 		}
-		sessionPort.autoDjTrackLoadCommand(result.id);
-		lastLoadCommandId = result.id;
-		hasInFlightLoad = true;
+		sessionPort.autoDjTrackCommand(result.id);
+		trackedCommandId = result.id;
+		inFlightToDeck = deck;
+		inFlightIdentity = trackIdentity;
+		loadSubPhase = AutoDjLoadSubPhase::LoadInFlight;
 		return true;
 	}
 
 	AutoDjLoadOutcome pollLoad() override{
-		if(!hasInFlightLoad) return AutoDjLoadOutcome::Failed;
-		switch(sessionPort.autoDjLoadCommandStatus(lastLoadCommandId)){
-			case DJ_COMMAND_ACCEPTED:
-				return AutoDjLoadOutcome::Accepted;
-			case DJ_COMMAND_PENDING:
-				return AutoDjLoadOutcome::Pending;
-			case DJ_COMMAND_APPLIED:
-				hasInFlightLoad = false;
-				return AutoDjLoadOutcome::Applied;
-			default: // FAILED / REJECTED / SUPERSEDED
-				hasInFlightLoad = false;
-				return AutoDjLoadOutcome::Failed;
+		switch(loadSubPhase){
+			case AutoDjLoadSubPhase::LoadInFlight: return pollLoadPhase();
+			case AutoDjLoadSubPhase::ArmInFlight: return pollArmPhase();
+			case AutoDjLoadSubPhase::TransitionInFlight: return pollTransitionPhase();
+			case AutoDjLoadSubPhase::Idle: default: return AutoDjLoadOutcome::Failed;
 		}
 	}
 
+	// A manual takeover pauses/cancels Auto DJ deterministically (see
+	// DjAutoDjPlanner::tick()'s manualTakeoverActive() branch, which drops
+	// the pending attempt and pauses on the very next detection). If Auto's
+	// own Coach-armed transition may still be physically live at that
+	// moment (ArmInFlight/TransitionInFlight), proactively cancel it here
+	// rather than only relying on Coach's own, separately-keyed guard to
+	// eventually notice - closing the gap deterministically instead of by
+	// coincidence of the two generation-tracking mechanisms happening to
+	// agree on every command type. Idempotent either way: cancelling an
+	// already-finished/-failed transition is a harmless no-op.
 	bool manualTakeoverActive() const override{
 		const AutoDjManualIntentGenerations current = sessionPort.autoDjManualIntentGenerationsSnapshot();
 		bool changed = current.mix != lastObserved.mix;
@@ -134,6 +195,11 @@ public:
 		// tick's takeover pauses immediately, so comparing against "what we
 		// last observed" (rather than a stale arm-time snapshot spanning many
 		// ticks) is both sufficient and simpler - see class comment.
+		if(changed && (loadSubPhase == AutoDjLoadSubPhase::ArmInFlight ||
+				loadSubPhase == AutoDjLoadSubPhase::TransitionInFlight)){
+			sessionPort.autoDjCancelCoachTransition();
+			loadSubPhase = AutoDjLoadSubPhase::Idle;
+		}
 		return changed;
 	}
 
@@ -161,6 +227,87 @@ public:
 	}
 
 private:
+	// pollLoad()'s three composite sub-phases (see AutoDjLoadSubPhase's
+	// class-comment). Each mirrors the same
+	// submit-then-track/ACCEPTED-PENDING-APPLIED-else-Failed shape the
+	// original single-phase load poll used, just against a different
+	// tracked command / status source per phase.
+
+	AutoDjLoadOutcome pollLoadPhase(){
+		switch(sessionPort.autoDjCommandStatus(trackedCommandId)){
+			case DJ_COMMAND_ACCEPTED:
+				return AutoDjLoadOutcome::Accepted;
+			case DJ_COMMAND_PENDING:
+				return AutoDjLoadOutcome::Pending;
+			case DJ_COMMAND_APPLIED:
+				return beginArm();
+			default: // FAILED / REJECTED / SUPERSEDED
+				loadSubPhase = AutoDjLoadSubPhase::Idle;
+				return AutoDjLoadOutcome::Failed;
+		}
+	}
+
+	// The load just applied: inFlightToDeck is now loaded with
+	// inFlightIdentity, stopped and sync-off by construction (a fresh
+	// stable-ID load never starts/syncs the deck), which is exactly what
+	// DjAssistEngine::armTransition()'s own guard requires of toDeck - no
+	// separate "confirm identity" step is needed here, Coach's own guard
+	// (re-validated live at arm time) is the confirmation. fromDeck is the
+	// other deck (DJ_DECK_COUNT == 2), expected to still be playing
+	// whatever Auto DJ is currently crossfading away from.
+	AutoDjLoadOutcome beginArm(){
+		const uint8_t fromDeck = uint8_t((DJ_DECK_COUNT - 1) - inFlightToDeck);
+		const DjSubmitResult result = sessionPort.autoDjArmCoachTransition(
+			fromDeck, inFlightToDeck, inFlightIdentity,
+			AUTO_DJ_TRANSITION_CROSSFADE_BEATS, AUTO_DJ_TRANSITION_START_AT_BOUNDARY, AUTO_DJ_TRANSITION_TEMPO_LOCK
+		);
+		if(result.status != DJ_COMMAND_ACCEPTED){
+			loadSubPhase = AutoDjLoadSubPhase::Idle;
+			return AutoDjLoadOutcome::Failed;
+		}
+		sessionPort.autoDjTrackCommand(result.id);
+		trackedCommandId = result.id;
+		loadSubPhase = AutoDjLoadSubPhase::ArmInFlight;
+		return AutoDjLoadOutcome::Accepted; // one attempt still in flight, not terminal yet.
+	}
+
+	AutoDjLoadOutcome pollArmPhase(){
+		switch(sessionPort.autoDjCommandStatus(trackedCommandId)){
+			case DJ_COMMAND_ACCEPTED:
+				return AutoDjLoadOutcome::Accepted;
+			case DJ_COMMAND_PENDING:
+				return AutoDjLoadOutcome::Pending;
+			case DJ_COMMAND_APPLIED:
+				loadSubPhase = AutoDjLoadSubPhase::TransitionInFlight;
+				return AutoDjLoadOutcome::Accepted; // armed; still not terminal.
+			default: // FAILED / REJECTED / SUPERSEDED (e.g. purged by a takeover)
+				loadSubPhase = AutoDjLoadSubPhase::Idle;
+				return AutoDjLoadOutcome::Failed;
+		}
+	}
+
+	// No separate crossfade logic lives here: this only ever reads Coach's
+	// own mode, which Coach's own tick() (called unconditionally every
+	// DjSession::loop(), independent of Auto DJ) advances through
+	// boundary-wait/start/sync/crossfade/stop/rollback on its own. Coach
+	// failing, rolling back, or being overridden/cancelled all surface
+	// identically here (uniformly Failed) and defer entirely to the
+	// planner's existing bounded retry/terminal-skip policy - see
+	// DjAutoDjPlanner::handleLoadFailure().
+	AutoDjLoadOutcome pollTransitionPhase(){
+		switch(sessionPort.autoDjCoachTransitionMode()){
+			case DJ_ASSIST_MODE_TRANSITION_ARMED:
+			case DJ_ASSIST_MODE_TRANSITION_RUNNING:
+				return AutoDjLoadOutcome::Pending;
+			case DJ_ASSIST_MODE_TRANSITION_COMPLETE:
+				loadSubPhase = AutoDjLoadSubPhase::Idle;
+				return AutoDjLoadOutcome::Applied;
+			default: // DJ_ASSIST_MODE_OFF / DJ_ASSIST_MODE_COACH / DJ_ASSIST_MODE_TRANSITION_FAILED
+				loadSubPhase = AutoDjLoadSubPhase::Idle;
+				return AutoDjLoadOutcome::Failed;
+		}
+	}
+
 	// The deck currently playing is "active" (the one about to run out);
 	// the other is the load target. If neither deck is playing there is
 	// no trustworthy reference yet - callers must treat that as "not
@@ -183,16 +330,30 @@ private:
 		resetScan(); // any in-progress scan pass predates the new generation.
 	}
 
+	// Sibling of refreshLibraryGeneration() above, keyed on the independent
+	// metadataRevision epoch (see AutoDjIdentity::metadataRevision's doc
+	// comment): a same-generation metadata replacement bumps this without
+	// bumping libraryGeneration, and must still drop every queued/pending
+	// candidate captured under the old revision.
+	void refreshMetadataRevision(){
+		const uint32_t revision = sessionPort.autoDjMetadataRevision();
+		if(revision == lastKnownRevision) return;
+		lastKnownRevision = revision;
+		planner.invalidateMetadataRevision(revision);
+		resetScan(); // any in-progress scan pass predates the new revision.
+	}
+
 	void resetScan(){
 		scanInProgress = false;
 		scanCursor = 0;
 		scanTopNCount = 0;
 	}
 
-	static AutoDjIdentity toAutoDjIdentity(const DjTrackIdentity& identity, uint32_t generation){
+	static AutoDjIdentity toAutoDjIdentity(const DjTrackIdentity& identity, uint32_t generation, uint32_t revision){
 		AutoDjIdentity out;
 		out.flags = identity.flags & (AUTO_DJ_IDENTITY_FINGERPRINT | AUTO_DJ_IDENTITY_SOURCE);
 		out.libraryGeneration = generation;
+		out.metadataRevision = revision;
 		memcpy(out.fingerprint, identity.fingerprint, sizeof(out.fingerprint));
 		return out;
 	}
@@ -242,6 +403,20 @@ private:
 			scanInProgress = true;
 			scanCursor = 0;
 			scanTopNCount = 0;
+			// Both autoDjMetadataRevision() (live atomic) and
+			// autoDjCandidateEntry()'s outRevision (the candidate table's
+			// own fill-pass revision, DjAssistController::loadedGeneration_)
+			// are keyed to the SAME metadataRevision epoch - the fill
+			// worker deliberately re-fills whenever assistMetadataRevision()
+			// changes (see DjAssistController::fillWorkerStep()'s doc
+			// comment), so this remains a valid same-epoch comparison even
+			// though the per-entry read below no longer touches
+			// metadataReader directly (see autoDjCandidateEntry()'s doc
+			// comment). Every AutoDjIdentity produced by this scan pass
+			// also captures this same revision (see toAutoDjIdentity()
+			// below), so a queued/pending candidate can later be
+			// invalidated against a fresher live revision - see
+			// AutoDjIdentity::metadataRevision's doc comment.
 			scanRevisionAtStart = sessionPort.autoDjMetadataRevision();
 		}
 
@@ -268,7 +443,7 @@ private:
 				continue;
 			}
 
-			const AutoDjIdentity identity = toAutoDjIdentity(entry.identity, lastKnownGeneration);
+			const AutoDjIdentity identity = toAutoDjIdentity(entry.identity, lastKnownGeneration, revision);
 			const bool alreadyQueued = planner.isQueued(identity);
 			const DjAssistSuggestion suggestion =
 				DjAssistScoring::scoreEntry(entry, deckContext, false /* isLoaded */, alreadyQueued /* isRecent */);
@@ -304,9 +479,16 @@ private:
 	DjSnapshot cachedSnapshot = {};
 	mutable AutoDjManualIntentGenerations lastObserved;
 	uint32_t lastKnownGeneration = 0;
+	uint32_t lastKnownRevision = 0;
 
-	bool hasInFlightLoad = false;
-	uint32_t lastLoadCommandId = 0;
+	// mutable: manualTakeoverActive() is const (see AutoDjLoadPort) but
+	// must be able to proactively abandon/cancel an in-flight composite
+	// attempt the instant a takeover is detected - see that method's doc
+	// comment.
+	mutable AutoDjLoadSubPhase loadSubPhase = AutoDjLoadSubPhase::Idle;
+	uint32_t trackedCommandId = 0; // single tracked slot, reused sequentially for load then arm.
+	uint8_t inFlightToDeck = 0;
+	DjTrackIdentity inFlightIdentity = {};
 
 	bool scanInProgress = false;
 	uint32_t scanCursor = 0;

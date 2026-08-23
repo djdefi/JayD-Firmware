@@ -20,10 +20,11 @@
 
 namespace {
 
-AutoDjIdentity makeIdentity(uint8_t fingerprintByte, uint32_t generation = 1){
+AutoDjIdentity makeIdentity(uint8_t fingerprintByte, uint32_t generation = 1, uint32_t revision = 1){
 	AutoDjIdentity identity;
 	identity.flags = AUTO_DJ_IDENTITY_FINGERPRINT;
 	identity.libraryGeneration = generation;
+	identity.metadataRevision = revision;
 	memset(identity.fingerprint, fingerprintByte, sizeof(identity.fingerprint));
 	return identity;
 }
@@ -136,6 +137,27 @@ void testQueueInvalidation(){
 	assert(queue.pushPlanned(makeIdentity(3, 1), 0, 0, AUTO_DJ_REASON_NONE));
 
 	const uint8_t removed = queue.invalidateGeneration(2);
+	assert(removed == 2);
+	assert(queue.depth() == 1);
+
+	AutoDjQueueEntry entry;
+	assert(queue.popNext(entry));
+	assert(entry.identity.fingerprint[0] == 2);
+	assert(queue.empty());
+}
+
+// Sibling of testQueueInvalidation() above, keyed on metadataRevision
+// instead of libraryGeneration: a same-generation metadata replacement
+// (see AutoDjIdentity::metadataRevision's doc comment) must invalidate a
+// queued entry exactly like a generation change does, entirely
+// independently of libraryGeneration.
+void testQueueRevisionInvalidation(){
+	DjAutoDjQueue queue;
+	assert(queue.pushPlanned(makeIdentity(1, 1, 1), 0, 0, AUTO_DJ_REASON_NONE));
+	assert(queue.pushPlanned(makeIdentity(2, 1, 2), 0, 0, AUTO_DJ_REASON_NONE));
+	assert(queue.pushPlanned(makeIdentity(3, 1, 1), 0, 0, AUTO_DJ_REASON_NONE));
+
+	const uint8_t removed = queue.invalidateRevision(2);
 	assert(removed == 2);
 	assert(queue.depth() == 1);
 
@@ -697,12 +719,85 @@ void testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry(){
 	assert(planner.state() == AutoDjState::Off);
 }
 
+// Sibling of testInvalidatedGenerationDuringRetryNeverResubmitsStaleEntry()
+// above, keyed on metadataRevision instead of libraryGeneration: a
+// same-generation metadata replacement (sidecar re-tag) mid-retry must
+// abandon the stale attempt exactly like a generation change already does
+// - this is the exact issue #3 regression (submitLoad() discarding
+// identity generation/revision).
+void testInvalidatedRevisionDuringRetryNeverResubmitsStaleEntry(){
+	AutoDjCandidate candidateX = makeCandidate(52); // generation 1, revision 1 via makeIdentity()'s defaults
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1)); // X queued, revision 1
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.submitShouldSucceed = false; // first attempt fails immediately, retry scheduled
+
+	planner.tick(); // attempt 1: submitLoad(X) fails -> pendingAttempts == 1, retry pending
+	assert(port.submitCount == 1);
+	assert(port.lastSubmitted.sameTrack(candidateX.identity));
+
+	// Metadata is replaced (same generation, revision advances to 2) while
+	// X is still the planner's captured retry target - this drops X out of
+	// the queue outright.
+	planner.invalidateMetadataRevision(2);
+	assert(!planner.isQueued(candidateX.identity));
+
+	const int maxTicksAllowed = 8; // generous bound; must converge well before this
+	for(int i = 0; i < maxTicksAllowed; i++){
+		planner.tick();
+	}
+	// The stale entry must never be resubmitted - the one failed attempt
+	// above is the only submission that ever happens.
+	assert(port.submitCount == 1);
+	assert(planner.historySize() == 0);
+	assert(planner.queueDepth() == 0);
+	assert(planner.state() == AutoDjState::Complete);
+}
+
+// Same revision-invalidation-during-flight scenario, but for the Stopping
+// path - mirrors testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry().
+void testInvalidatedRevisionDuringStoppingNeverRecordsStaleEntry(){
+	AutoDjCandidate candidateX = makeCandidate(53);
+	MockLoadPort port;
+	DjAutoDjPlanner planner(port);
+	assert(planner.planNext(&candidateX, 1));
+	assert(planner.arm());
+	assert(planner.start());
+
+	port.trackAtEnd = true;
+	port.durationTrustworthy = true;
+	port.nextOutcome = AutoDjLoadOutcome::Pending; // stays in flight
+	planner.tick(); // submits X successfully, now WaitingOutcome
+	assert(port.submitCount == 1);
+
+	assert(planner.stop());
+	assert(planner.state() == AutoDjState::Stopping);
+
+	// Same-generation metadata replacement while X's load is still in
+	// flight during shutdown; invalidation drops the now-stale queue entry.
+	planner.invalidateMetadataRevision(2);
+	assert(!planner.isQueued(candidateX.identity));
+
+	port.nextOutcome = AutoDjLoadOutcome::Applied; // hardware reports success for the invalidated load
+	planner.tick(); // resolvePendingWhileStopping(): must not record a stale entry
+	assert(planner.historySize() == 0);
+
+	planner.tick(); // no pending left: finish stopping
+	assert(planner.state() == AutoDjState::Off);
+}
+
 } // namespace
 
 int main(){
 	testQueuePinnedOrder();
 	testQueueFullEmpty();
 	testQueueInvalidation();
+	testQueueRevisionInvalidation();
 	testHistoryExclusion();
 	testPlannerSelectionExcludesRecentArtistTitle();
 	testPlannerTieBreakIsOrderIndependent();
@@ -725,5 +820,7 @@ int main(){
 	testPlanNextNeverQueuesSameIdentityTwice();
 	testInvalidatedGenerationDuringRetryNeverResubmitsStaleEntry();
 	testInvalidatedGenerationDuringStoppingNeverRecordsStaleEntry();
+	testInvalidatedRevisionDuringRetryNeverResubmitsStaleEntry();
+	testInvalidatedRevisionDuringStoppingNeverRecordsStaleEntry();
 	return 0;
 }

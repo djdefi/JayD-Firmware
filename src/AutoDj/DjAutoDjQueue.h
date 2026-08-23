@@ -119,6 +119,30 @@ public:
 		return removed;
 	}
 
+	// Sibling of invalidateGeneration() above, keyed on metadataRevision
+	// instead of libraryGeneration: a same-generation metadata replacement
+	// (re-tag/re-scan of a file whose external library identity doesn't
+	// change) still invalidates every queued/pending candidate captured
+	// under the old revision, exactly like a generation change does - see
+	// AutoDjIdentity::metadataRevision's doc comment. Deliberately a
+	// separate pass rather than folded into invalidateGeneration(): the two
+	// epochs are independent (see DjSession::assistMetadataRevision()'s doc
+	// comment) and a caller may need to invalidate on either without
+	// conflating them in one bounded scan's removal accounting.
+	uint8_t invalidateRevision(uint32_t currentRevision){
+		uint8_t removed = 0;
+		uint8_t index = 0;
+		while(index < count){
+			if(entries[index].identity.metadataRevision != currentRevision){
+				removeAt(index);
+				removed++;
+			} else {
+				index++;
+			}
+		}
+		return removed;
+	}
+
 	void clear(){
 		count = 0;
 	}

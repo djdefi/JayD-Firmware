@@ -82,6 +82,23 @@ public:
 
 	void copySnapshot(DjAssistSnapshot& snapshot) const;
 
+	// Bounded, RAM-only read of the background-filled candidate table
+	// (see fillWorkerStep()) - NEVER touches the metadata reader/SD card
+	// itself, unlike assistTrackEntry()/DjSession's old direct-reader
+	// candidate path. This is the shared, already-safe candidate
+	// authority both Coach's own tickSuggestions() and Auto DJ's
+	// stepScan() read from; Auto DJ must use these two accessors (via
+	// AutoDjSessionPort) instead of ever calling into the reader itself.
+	// candidateCount() returns the currently fully-filled entry total (0
+	// while a fill for the live generation is still in progress - see
+	// entryTotal_'s own doc comment) and candidateEntry() rejects any
+	// index at or beyond that bound. outRevision reports the exact fill
+	// generation (loadedGeneration_) the returned entry was filled under,
+	// captured under the same lock as the entry read - mirrors
+	// assistTrackEntry()'s single-critical-section discipline.
+	uint32_t candidateCount();
+	bool candidateEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision);
+
 private:
 	// Host integration harness only - grants access to the private
 	// stepping methods below (fillWorkerStep(), tickSuggestions(), etc.)

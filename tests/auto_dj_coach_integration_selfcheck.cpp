@@ -1,0 +1,671 @@
+// Full "real Auto DJ + Coach + DjSession-shaped ports" integration test
+// (fix #5 independent review requirement: "Test full two-entry run through
+// real Auto+Coach+DjSession ports and failures at every stage").
+//
+// Unlike tests/auto_dj_session_bridge_selfcheck.cpp (a real
+// AutoDjSessionActuator against a FAKE AutoDjSessionPort that simply
+// returns a controllable DjAssistMode string), this file drives BOTH the
+// real DjAssistController (Coach) AND the real AutoDjSessionActuator (Auto
+// DJ) against ONE shared hand-written port that implements both
+// DjAssistSessionPort and AutoDjSessionPort - exactly mirroring how the
+// real DjSession implements both interfaces on a single object (see
+// DjSession.h/.cpp) - with a loopOnce() driver that reproduces
+// DjSession::loop()'s own pop-one-command / apply / tick-Assist / tick-
+// AutoDj sequence, reusing the real admitAssistCommand()/
+// djIsAutoDjTakeoverSignal()/removeAutoDjOwned()/djBumpAutoDjManualIntent()
+// free functions DjSession::submit() itself calls. This means Auto DJ's
+// internal Coach-arm command is applied by actually calling
+// DjAssistController::armTransition(), and Auto DJ's composite pollLoad()
+// observes Coach's transition genuinely progressing (or failing) through
+// its own real WAIT_BOUNDARY/START_DECK/LOCK_TEMPO/ENABLE_SYNC/CROSSFADE/
+// STOP_DECK/RELEASE_SYNC plan - not a fake mode string set directly by the
+// test.
+//
+// Build/run directly, e.g.:
+//
+//   g++ -std=c++11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
+//       -DJAYD_ASSIST_HOST_TASK_SEAM -pthread \
+//       -I tests/host_stubs \
+//       tests/auto_dj_coach_integration_selfcheck.cpp \
+//       tests/host_stubs/host_arduino_shim.cpp \
+//       src/DjAssist/DjAssistController.cpp src/DjAssist/DjAssistFillWorker.cpp \
+//       src/DjAssist/DjAssistScoring.cpp src/DjAssist/DjAssistSessionBridge.cpp \
+//       src/DjAssist/DjAssistEngine.cpp src/AutoDj/DjAutoDjPlanner.cpp \
+//       -o auto_dj_coach_integration_selfcheck && ./auto_dj_coach_integration_selfcheck
+
+#include <assert.h>
+#include <string.h>
+
+#include "../src/AutoDj/AutoDjSessionActuator.h"
+#include "../src/DjAssist/DjAssistController.h"
+#include "Arduino.h" // hostStubSetMicros()/hostStubAdvanceMicros() - real CROSSFADE ramp timing.
+
+namespace {
+
+DjTrackIdentity fingerprintIdentity(uint8_t seed){
+	DjTrackIdentity identity = {};
+	identity.flags = DJ_TRACK_IDENTITY_FINGERPRINT;
+	memset(identity.fingerprint, seed, sizeof(identity.fingerprint));
+	return identity;
+}
+
+// Shared test double standing in for DjSession itself: implements BOTH
+// DjAssistSessionPort and AutoDjSessionPort on one object (identical
+// inheritance shape to the real DjSession - see DjSession.h), backed by one
+// real DjCommandQueue/DjCommandResults and the SAME two tracked-command
+// slots (assistTracked/autoDjTracked) DjSession itself owns, so submit()
+// below is a faithful copy of DjSession::submit()'s own body (manual-
+// takeover purge, admitAssistCommand(), manual-intent-generation bump).
+class FakePort : public DjAssistSessionPort, public AutoDjSessionPort {
+public:
+	struct Entry {
+		DjAssistLibraryEntry entry;
+		uint32_t artistHash = 0;
+		uint32_t titleHash = 0;
+	};
+
+	// -- Shared command plumbing (mirrors DjSession's own members). --
+	DjCommandQueue queue;
+	DjCommandResults results;
+	DjAssistTrackedCommand assistTracked;
+	DjAssistTrackedCommand autoDjTracked;
+	DjAssistIntentGenerations assistGenerations;
+	AutoDjManualIntentGenerations autoDjManualGenerations;
+	uint32_t nextCommandId = 1;
+	// Set once, right after construction, once the controller this port
+	// backs exists - mirrors DjSession owning both assistController and
+	// this port on the same object; autoDjCoachTransitionMode() needs it to
+	// read Coach's live mode, exactly like DjSession::autoDjCoachTransitionMode().
+	DjAssistController* controller = nullptr;
+
+	// -- Library/candidate state. --
+	Entry entries[4];
+	uint32_t entryCount = 0;
+	uint32_t metadataRevision = 1;
+	uint32_t libraryGeneration = 1;
+	DjAssistDeckContext deckContext;
+	uint8_t targetDeckOverride = 1;
+	bool media = true;
+	bool physicalConfirmationPending = false;
+	// Deliberate fault injection for the "load resolves to nothing" stage
+	// (mirrors resolveIdentityPath() rejecting an unknown/ambiguous
+	// fingerprint) - never fabricates a path, just fails the load cleanly.
+	bool forceLoadUnresolved = false;
+
+	// -- DjSnapshot backing store (decks, mix, recording, sessionActive). --
+	DjSnapshot snapshot;
+
+	// -- DjAssistController boundary/timing plumbing (mirrors
+	// FakeAssistSessionPort in tests/dj_assist_integration_selfcheck.cpp). --
+	uint64_t deckFrames[DJ_DECK_COUNT] = {};
+	bool downbeatAvailable[DJ_DECK_COUNT] = {};
+	uint64_t downbeatFrame[DJ_DECK_COUNT] = {};
+
+	int purgeCallCount = 0;
+	int armAttemptCount = 0; // every time an ASSIST_ARM_TRANSITION command is actually applied (accepted or rejected).
+
+	// -- DjAssistSessionPort --
+
+	DjSubmitResult setPlaying(uint8_t deck, bool playing, DjCommandOrigin origin) override{
+		DjCommand command = {};
+		command.origin = origin;
+		command.type = DJ_COMMAND_SET_PLAYING;
+		command.deck = deck;
+		command.value = playing ? 1 : 0;
+		return submit(command);
+	}
+
+	DjSubmitResult setSync(uint8_t deck, bool armed, int8_t masterDeck, DjCommandOrigin origin) override{
+		DjCommand command = {};
+		command.origin = origin;
+		command.type = DJ_COMMAND_SET_SYNC;
+		command.deck = deck;
+		command.value = armed ? 1 : 0;
+		command.slot = masterDeck < 0 ? 0 : uint8_t(masterDeck) + 1;
+		return submit(command);
+	}
+
+	DjSubmitResult setMix(uint8_t mix, DjCommandOrigin origin) override{
+		DjCommand command = {};
+		command.origin = origin;
+		command.type = DJ_COMMAND_SET_MIX;
+		command.value = mix;
+		return submit(command);
+	}
+
+	void assistTrackCommand(uint32_t commandId) override{
+		assistTracked.id = commandId;
+		assistTracked.tracked = true;
+		assistTracked.status = DJ_COMMAND_ACCEPTED;
+	}
+
+	DjCommandStatus assistTrackedStatus(uint32_t commandId) override{
+		if(assistTracked.tracked && assistTracked.id == commandId) return assistTracked.status;
+		return DJ_COMMAND_PENDING;
+	}
+
+	bool copySnapshot(DjSnapshot& out) override{
+		snapshot.queueDepth = queue.depth();
+		results.copyTo(snapshot.recentResults);
+		out = snapshot;
+		return true;
+	}
+
+	uint32_t assistMetadataRevision() override{ return metadataRevision; }
+
+	uint32_t assistTrackCount() override{ return entryCount; }
+
+	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override{
+		outRevision = metadataRevision;
+		if(index >= entryCount) return false;
+		outEntry = entries[index].entry;
+		return true;
+	}
+
+	bool mediaPresent() const override{ return media; }
+
+	uint64_t deckElapsedFrames(uint8_t deck) const override{
+		return deck < DJ_DECK_COUNT ? deckFrames[deck] : 0;
+	}
+
+	bool nextDownbeatFrame(uint8_t deck, uint64_t /*currentFrame*/, uint64_t& outFrame) const override{
+		if(deck >= DJ_DECK_COUNT || !downbeatAvailable[deck]) return false;
+		outFrame = downbeatFrame[deck];
+		return true;
+	}
+
+	bool nextPhraseFrame(uint8_t /*deck*/, uint64_t /*currentFrame*/, uint64_t& /*outFrame*/) override{
+		return false; // not exercised by this test (startAtBoundary uses the downbeat only).
+	}
+
+	DjAssistIntentGenerations assistIntentGenerationsSnapshot() override{ return assistGenerations; }
+
+	// Mirrors DjSession::assistPurgePendingSystemCommands() exactly.
+	void assistPurgePendingSystemCommands(uint8_t deck) override{
+		purgeCallCount++;
+		DjCommand probe = {};
+		probe.origin = DJ_ORIGIN_LOCAL_UI;
+		probe.deck = deck;
+		const DjCommandType purgedTypes[3] = { DJ_COMMAND_SET_PLAYING, DJ_COMMAND_SET_SYNC, DJ_COMMAND_SET_MIX };
+		for(uint8_t typeIndex = 0; typeIndex < 3; ++typeIndex){
+			probe.type = purgedTypes[typeIndex];
+			uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+			const uint8_t removedCount = queue.removeSystemTargeting(probe, removedIds, DJ_COMMAND_CAPACITY);
+			for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
+				results.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+				if(assistTracked.tracked && assistTracked.id == removedIds[i]) assistTracked.status = DJ_COMMAND_SUPERSEDED;
+			}
+		}
+	}
+
+	// -- AutoDjSessionPort --
+
+	uint32_t autoDjCandidateCount() override{ return entryCount; }
+
+	bool autoDjCandidateEntry(
+		uint32_t index, DjAssistLibraryEntry& outEntry,
+		uint32_t& outArtistHash, uint32_t& outTitleHash, uint32_t& outRevision
+	) override{
+		outRevision = metadataRevision;
+		if(index >= entryCount) return false;
+		outEntry = entries[index].entry;
+		outArtistHash = entries[index].artistHash;
+		outTitleHash = entries[index].titleHash;
+		return true;
+	}
+
+	uint32_t autoDjMetadataRevision() override{ return metadataRevision; }
+	uint32_t autoDjLibraryGeneration() override{ return libraryGeneration; }
+	DjAssistDeckContext autoDjActiveDeckContext() override{ return deckContext; }
+	uint8_t autoDjTargetDeck() override{ return targetDeckOverride; }
+
+	DjSubmitResult autoDjLoadDeckByIdentity(
+		uint8_t deck, const DjTrackIdentity& identity,
+		uint32_t identityLibraryGeneration, uint32_t identityMetadataRevision
+	) override{
+		DjCommand command = {};
+		command.origin = DJ_ORIGIN_SYSTEM;
+		command.type = DJ_COMMAND_LOAD_DECK;
+		command.deck = deck;
+		command.libraryGeneration = identityLibraryGeneration;
+		command.metadataRevision = identityMetadataRevision;
+		command.trackIdentity = identity;
+		command.autoDjOwned = true;
+		return submit(command);
+	}
+
+	void autoDjTrackCommand(uint32_t commandId) override{
+		autoDjTracked.id = commandId;
+		autoDjTracked.tracked = true;
+		autoDjTracked.status = DJ_COMMAND_ACCEPTED;
+	}
+
+	DjCommandStatus autoDjCommandStatus(uint32_t commandId) override{
+		if(autoDjTracked.tracked && autoDjTracked.id == commandId) return autoDjTracked.status;
+		return DJ_COMMAND_PENDING;
+	}
+
+	DjSubmitResult autoDjArmCoachTransition(
+		uint8_t fromDeck, uint8_t toDeck, const DjTrackIdentity& targetIdentity,
+		uint8_t crossfadeBeats, bool startAtBoundary, bool tempoLock
+	) override{
+		DjCommand command = {};
+		command.origin = DJ_ORIGIN_SYSTEM;
+		command.type = DJ_COMMAND_ASSIST_ARM_TRANSITION;
+		command.deck = fromDeck;
+		command.slot = toDeck;
+		command.libraryIndex = 0;
+		command.trackIdentity = targetIdentity;
+		command.value = uint16_t(
+			crossfadeBeats | (startAtBoundary ? (1 << 8) : 0) | (tempoLock ? (1 << 9) : 0)
+		);
+		command.autoDjOwned = true;
+		return submit(command);
+	}
+
+	DjSubmitResult autoDjCancelCoachTransition() override{
+		DjCommand command = {};
+		command.origin = DJ_ORIGIN_SYSTEM;
+		command.type = DJ_COMMAND_ASSIST_CANCEL_TRANSITION;
+		command.autoDjOwned = true;
+		return submit(command);
+	}
+
+	DjAssistMode autoDjCoachTransitionMode() override{
+		if(!controller) return DJ_ASSIST_MODE_OFF;
+		DjAssistSnapshot snap;
+		controller->copySnapshot(snap);
+		return snap.mode;
+	}
+
+	AutoDjManualIntentGenerations autoDjManualIntentGenerationsSnapshot() override{
+		return autoDjManualGenerations;
+	}
+
+	bool autoDjConsumePhysicalConfirmation() override{
+		const bool value = physicalConfirmationPending;
+		physicalConfirmationPending = false;
+		return value;
+	}
+
+	// -- Shared submission path: a faithful copy of DjSession::submit()'s
+	// own body (manual-takeover purge before admission, admitAssistCommand()
+	// for the real FIFO/supersede/priority bookkeeping, then the manual-
+	// intent-generation bump) - every command in this test (Coach's own
+	// SET_PLAYING/SET_SYNC/SET_MIX plan steps, Auto DJ's stable-ID load, and
+	// Auto DJ's internal Coach-arm/cancel) goes through this ONE path,
+	// exactly as it would through the real DjSession. --
+	DjSubmitResult submit(DjCommand command){
+		command.id = nextCommandId++;
+		if(command.origin != DJ_ORIGIN_SYSTEM && djIsAutoDjTakeoverSignal(command)){
+			uint32_t removedIds[DJ_COMMAND_CAPACITY] = {};
+			const uint8_t removedCount = queue.removeAutoDjOwned(removedIds, DJ_COMMAND_CAPACITY);
+			for(uint8_t i = 0; i < removedCount && i < DJ_COMMAND_CAPACITY; i++){
+				results.finish(removedIds[i], DJ_COMMAND_SUPERSEDED, DJ_COMMAND_ERROR_NONE);
+				if(autoDjTracked.tracked && autoDjTracked.id == removedIds[i]) autoDjTracked.status = DJ_COMMAND_SUPERSEDED;
+			}
+		}
+		const DjSubmitResult result = admitAssistCommand(command, queue, results, assistTracked, assistGenerations);
+		if(result.status == DJ_COMMAND_ACCEPTED) djBumpAutoDjManualIntent(autoDjManualGenerations, command);
+		return result;
+	}
+};
+
+DjAssistLibraryEntry makeEntry(uint8_t fingerprintByte, uint32_t bpmMilli = 128000, uint16_t key = 0x801){
+	DjAssistLibraryEntry entry;
+	entry.identity = fingerprintIdentity(fingerprintByte);
+	entry.state = DJ_METADATA_VALID;
+	entry.capabilities = DJ_METADATA_HAS_BPM | DJ_METADATA_HAS_KEY;
+	entry.bpmMilli = bpmMilli;
+	entry.key = key;
+	entry.rating = 3;
+	entry.durationFrames = 44100ULL * 200;
+	entry.sampleRate = 44100;
+	return entry;
+}
+
+void setDeckPlaying(FakePort& port, uint8_t deck, uint16_t elapsed, uint16_t duration, uint8_t identitySeed, uint32_t bpmMilli){
+	port.snapshot.sessionActive = true;
+	DjDeckSnapshot& d = port.snapshot.decks[deck];
+	d.loaded = true;
+	d.playing = true;
+	d.elapsed = elapsed;
+	d.duration = duration;
+	d.timingQuality = DJ_TIMING_COARSE;
+	d.metadata.state = DJ_METADATA_VALID;
+	d.metadata.bpmMilli = bpmMilli;
+	d.metadata.sourceSampleRate = 44100;
+	d.metadata.sourceDurationFrames = 44100ULL * 300ULL;
+	d.identity = fingerprintIdentity(identitySeed);
+}
+
+// -- One production-shaped iteration: pop+apply exactly one queued
+// command (mirroring DjSession::loop()'s own single-pop-per-tick contract
+// and its apply()/finish()/tracked-slot-update sequence), then Coach's
+// tick() (real engine), then Auto DJ's tick() (real actuator) - in that
+// exact order, matching DjSession::loop()'s documented ordering
+// requirement (tickAssist() before tickAutoDj()). --
+void loopOnce(FakePort& port, DjAssistController& controller, AutoDjSessionActuator& actuator){
+	DjCommand command;
+	if(port.queue.pop(command)){
+		DjCommandError error = DJ_COMMAND_ERROR_NONE;
+		bool applied = true;
+		switch(command.type){
+			case DJ_COMMAND_SET_PLAYING:
+				port.snapshot.decks[command.deck].playing = command.value != 0;
+				break;
+			case DJ_COMMAND_SET_SYNC:
+				port.snapshot.decks[command.deck].sync.state = command.value != 0 ? DJ_SYNC_LOCKED : DJ_SYNC_OFF;
+				break;
+			case DJ_COMMAND_SET_MIX:
+				port.snapshot.mix = uint8_t(command.value);
+				break;
+			case DJ_COMMAND_LOAD_DECK: {
+				// Stable-ID resolve against the fake in-memory candidate
+				// table (RAM-only, mirrors DjSession::loadDeckByIdentity()/
+				// resolveIdentityPath()'s contract - fix #1 - at the
+				// granularity this test needs): reject a stale epoch or an
+				// unknown fingerprint, never fabricate a path.
+				bool matches = false;
+				if(!port.forceLoadUnresolved &&
+						command.libraryGeneration == port.libraryGeneration &&
+						command.metadataRevision == port.metadataRevision){
+					for(uint32_t i = 0; i < port.entryCount; i++){
+						if(memcmp(port.entries[i].entry.identity.fingerprint,
+								command.trackIdentity.fingerprint, sizeof(command.trackIdentity.fingerprint)) == 0){
+							matches = true;
+							break;
+						}
+					}
+				}
+				if(!matches){
+					error = DJ_COMMAND_ERROR_LIBRARY_IDENTITY_UNRESOLVED;
+					applied = false;
+					break;
+				}
+				DjDeckSnapshot& d = port.snapshot.decks[command.deck];
+				d.loaded = true;
+				d.playing = false;
+				d.sync.state = DJ_SYNC_OFF;
+				d.identity = command.trackIdentity;
+				d.metadata.state = DJ_METADATA_VALID;
+				d.metadata.bpmMilli = 128000;
+				d.metadata.sourceSampleRate = 44100;
+				d.metadata.sourceDurationFrames = 44100ULL * 300ULL;
+				break;
+			}
+			case DJ_COMMAND_ASSIST_ARM_TRANSITION: {
+				port.armAttemptCount++;
+				const uint8_t crossfadeBeats = uint8_t(command.value & 0xFF);
+				const bool startAtBoundary = (command.value & (1 << 8)) != 0;
+				const bool tempoLock = (command.value & (1 << 9)) != 0;
+				if(!controller.armTransition(
+					command.deck, command.slot, command.libraryIndex, command.trackIdentity,
+					crossfadeBeats, startAtBoundary, tempoLock
+				)){
+					error = DJ_COMMAND_ERROR_ASSIST_REJECTED;
+					applied = false;
+				}
+				break;
+			}
+			case DJ_COMMAND_ASSIST_CANCEL_TRANSITION:
+				controller.cancelTransition();
+				break;
+			default:
+				break;
+		}
+		const DjCommandStatus status = applied ? DJ_COMMAND_APPLIED : DJ_COMMAND_FAILED;
+		port.results.finish(command.id, status, error);
+		if(port.assistTracked.tracked && port.assistTracked.id == command.id) port.assistTracked.status = status;
+		if(port.autoDjTracked.tracked && port.autoDjTracked.id == command.id) port.autoDjTracked.status = status;
+	}
+	controller.tick(); // Coach first (matches DjSession::loop()'s real ordering).
+	actuator.tick();   // Auto DJ second.
+	// The CROSSFADE step is a genuine wall-clock ramp (DjAssistBridge::
+	// computeCrossfadeMix() reads micros(), see DjAssistController.cpp) -
+	// advance the host clock a fixed amount per iteration so it converges
+	// within loopUntil()'s bounded iteration count instead of depending on
+	// how fast this process happens to execute.
+	hostStubAdvanceMicros(500000);
+}
+
+// Bounded convergence helper: keeps calling loopOnce() until `predicate`
+// is true or the bound is exhausted, failing loudly rather than hanging -
+// same "no infinite loop" discipline every other self-check in this
+// codebase uses.
+template <typename Predicate>
+void loopUntil(FakePort& port, DjAssistController& controller, AutoDjSessionActuator& actuator, Predicate predicate, int maxIterations = 64){
+	for(int i = 0; i < maxIterations; i++){
+		if(predicate()) return;
+		loopOnce(port, controller, actuator);
+	}
+	assert(predicate() && "loopUntil() bound exhausted without reaching the expected condition");
+}
+
+void pinTrack(AutoDjSessionActuator& actuator, uint8_t fingerprintByte, uint32_t libraryGeneration = 1){
+	AutoDjIdentity identity;
+	identity.flags = AUTO_DJ_IDENTITY_FINGERPRINT;
+	identity.libraryGeneration = libraryGeneration;
+	memset(identity.fingerprint, fingerprintByte, sizeof(identity.fingerprint));
+	assert(actuator.pinTrack(identity, 0, 0));
+}
+
+// -- Test 1: full two-entry run through the REAL DjAssistController and
+// REAL AutoDjSessionActuator, both wired to one shared port exactly as
+// DjSession wires them in production. Two Auto DJ entries resolve in turn -
+// each one a genuine RAM stable-ID load, a genuine Coach arm, and a
+// genuine Coach transition (WAIT_BOUNDARY -> START_DECK -> LOCK_TEMPO ->
+// ENABLE_SYNC -> CROSSFADE -> STOP_DECK -> RELEASE_SYNC) driven entirely by
+// the unmodified engine - proving Auto DJ's composite pollLoad() correctly
+// observes a REAL transition complete, not a fake mode string. --
+void testFullTwoEntryRunThroughRealPorts(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x11);
+	port.entries[1].entry = makeEntry(0x22);
+	port.entryCount = 2;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	// Deck 0 already playing (about to run out - 10s remaining hits the
+	// end margin immediately so the first entry submits promptly); deck 1
+	// is the load target.
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000; // boundary already reached - crosses immediately.
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	assert(actuator.state() == AutoDjState::Armed);
+	loopOnce(port, controller, actuator); // top up the queue while Armed.
+	assert(actuator.start());
+	assert(actuator.state() == AutoDjState::Running);
+
+	// -- Entry 1: 0x11 loads onto deck 1, Coach transitions deck 0 -> 1. --
+	AutoDjSnapshot snap;
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(snap);
+		return snap.historySize == 1;
+	});
+	assert(port.snapshot.decks[1].loaded);
+	assert(memcmp(port.snapshot.decks[1].identity.fingerprint, port.entries[0].entry.identity.fingerprint, 16) == 0);
+	assert(port.snapshot.decks[1].playing); // Coach's own START_DECK step actually ran.
+	assert(!port.snapshot.decks[0].playing); // and its own STOP_DECK step actually ran.
+	DjAssistSnapshot coachSnap;
+	controller.copySnapshot(coachSnap);
+	assert(coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_COMPLETE); // transition fully
+	// resolved - DjAssistEngine has no automatic "revert to idle" step;
+	// TRANSITION_COMPLETE simply behaves as an idle mode too (armTransition()'s
+	// own mode guard only blocks ARMED/RUNNING, not COMPLETE), which is
+	// exactly what lets the very next arm below re-enter cleanly.
+
+	// -- Entry 2: pin 0x22 explicitly (deck 0 is now the load target,
+	// currently stopped/loaded-nothing) and let it run to completion too -
+	// proves the composite workflow repeats cleanly for a second entry,
+	// not just once. --
+	port.targetDeckOverride = 0;
+	// Deck 1 is now the active/playing deck (per the just-completed
+	// transition); give it a trustworthy near-end duration so
+	// currentTrackAtEnd() fires promptly for entry 2 as well.
+	port.snapshot.decks[1].elapsed = 190;
+	port.snapshot.decks[1].duration = 200;
+	port.snapshot.decks[1].timingQuality = DJ_TIMING_COARSE;
+	port.deckFrames[1] = 1000;
+	port.downbeatAvailable[1] = true;
+	port.downbeatFrame[1] = 1000;
+	port.downbeatAvailable[0] = false;
+	pinTrack(actuator, 0x22);
+
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(snap);
+		return snap.historySize == 2;
+	});
+	assert(port.snapshot.decks[0].loaded);
+	assert(memcmp(port.snapshot.decks[0].identity.fingerprint, port.entries[1].entry.identity.fingerprint, 16) == 0);
+	assert(port.snapshot.decks[0].playing);
+	assert(!port.snapshot.decks[1].playing);
+	assert(actuator.state() == AutoDjState::Running);
+
+	controller.end();
+}
+
+// -- Test 2 (fix #5 review, "failures at every stage"): a genuine manual
+// play re-assertion on the target deck, submitted through the SAME real
+// submit()/admitAssistCommand() path DjSession itself uses, while Coach's
+// transition is actively RUNNING. This must (a) trip Coach's own guard
+// (a real engine-level manual-override failure, not a fake mode string)
+// and (b) independently trip Auto DJ's manualTakeoverActive() (the manual
+// signal bumps autoDjManualIntentGenerations too - djIsAutoDjManualSignal()
+// covers SET_PLAYING), which proactively cancels Auto's own Coach-arm
+// tracking and pauses - proving the two independently-keyed mechanisms
+// resolve consistently together against real production logic, not just
+// a fake port double. --
+void testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x33);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator);
+	assert(actuator.start());
+
+	// Drive to TransitionInFlight (arm applied, Coach past ARMED into
+	// RUNNING - the boundary step already applied since downbeatFrame ==
+	// deckFrames[0] from tick 1).
+	loopUntil(port, controller, actuator, [&]{
+		DjAssistSnapshot snap;
+		controller.copySnapshot(snap);
+		return snap.mode == DJ_ASSIST_MODE_TRANSITION_RUNNING;
+	});
+
+	// The user re-asserts play on the target deck (1) themselves, mid-
+	// transition - a real, non-system submit() through the shared port,
+	// exactly as DjSession::setPlaying(..., DJ_ORIGIN_LOCAL_UI) would.
+	port.setPlaying(1, true, DJ_ORIGIN_LOCAL_UI);
+
+	loopUntil(port, controller, actuator, [&]{
+		return actuator.state() == AutoDjState::Paused;
+	});
+
+	DjAssistSnapshot coachSnap;
+	controller.copySnapshot(coachSnap);
+	assert(coachSnap.mode == DJ_ASSIST_MODE_TRANSITION_FAILED);
+	assert(coachSnap.plan.failure == DJ_ASSIST_FAIL_MANUAL_OVERRIDE);
+
+	AutoDjSnapshot autoSnap;
+	actuator.copySnapshot(autoSnap);
+	assert(autoSnap.state == AutoDjState::Paused);
+	assert(autoSnap.historySize == 0); // never resolved as Applied - the takeover pre-empted it.
+
+	controller.end();
+}
+
+// -- Test 3 (fix #5 review, "failures at every stage"): the Coach arm
+// submit itself is rejected by the REAL engine's own guard (not a fake
+// return value) - the target deck is not stopped/sync-off at arm time
+// (armTransition()'s own precondition, see DjAssistEngine.cpp) - because a
+// stray manual play was left on it from a previous session. Auto DJ must
+// fail that attempt (uniformly, via beginArm()'s Failed path) and retry
+// from the load step; once the stray state clears, the retry succeeds. --
+void testRealCoachGuardRejectionAtArmRetriesThenSucceeds(){
+	hostStubSetMicros(0);
+	FakePort port;
+	port.entries[0].entry = makeEntry(0x44);
+	port.entryCount = 1;
+	port.deckContext.valid = true;
+	port.deckContext.bpmMilli = 128000;
+	port.physicalConfirmationPending = true;
+
+	setDeckPlaying(port, 0, 190, 200, 0x99, 128000);
+	port.targetDeckOverride = 1;
+	port.deckFrames[0] = 1000;
+	port.downbeatAvailable[0] = true;
+	port.downbeatFrame[0] = 1000;
+
+	DjAssistController controller;
+	controller.begin(&port);
+	port.controller = &controller;
+
+	AutoDjSessionActuator actuator(port);
+	assert(actuator.arm());
+	loopOnce(port, controller, actuator);
+	assert(actuator.start());
+
+	// Wait for the load to apply (deck 1 now loaded/stopped by the load
+	// step), then - before the arm submit is processed - inject the stray
+	// manual-play violation the real guard rejects on.
+	loopUntil(port, controller, actuator, [&]{
+		return port.snapshot.decks[1].loaded;
+	});
+	port.snapshot.decks[1].playing = true; // stray state; violates armTransition()'s own guard.
+
+	// Let the planner run to completion unattended: the first arm attempt
+	// is genuinely rejected by the real engine's guard (armAttemptCount's
+	// first increment, rejected because deck 1 is unexpectedly playing),
+	// the bounded retry policy resubmits from the load step (which, by
+	// itself just being a fresh stable-ID load, naturally clears the deck
+	// back to loaded/stopped - the same "load never starts/syncs the deck"
+	// invariant beginArm() relies on in the happy path), and the second arm
+	// attempt then succeeds against the now-clean guard state.
+	AutoDjSnapshot after;
+	loopUntil(port, controller, actuator, [&]{
+		actuator.copySnapshot(after);
+		return after.historySize == 1;
+	}, 256);
+	assert(port.armAttemptCount >= 2); // proves a genuine reject-then-retry cycle happened.
+	assert(port.snapshot.decks[1].loaded);
+	assert(port.snapshot.decks[1].playing); // this time Coach's own START_DECK actually ran.
+
+	controller.end();
+}
+
+} // namespace
+
+int main(){
+	testFullTwoEntryRunThroughRealPorts();
+	testManualPlayDivergenceMidTransitionStopsBothCoachAndAutoDj();
+	testRealCoachGuardRejectionAtArmRetriesThenSucceeds();
+	return 0;
+}

@@ -91,6 +91,15 @@ struct DjAssistLibraryEntry {
 	uint8_t rating = 255; // 0-5, 255 = unknown.
 	uint64_t durationFrames = 0;
 	uint32_t sampleRate = 0;
+	// Additive fields for Auto DJ's repeat/artist/title cooldown exclusion
+	// (see AutoDjSessionActuator). Populated by DjSession::assistTrackEntry()
+	// - the same background-fill-worker call that populates every other
+	// field above - so reading them costs zero extra locks/threads over
+	// what Coach's own fill pass already does; Coach itself simply never
+	// reads these two fields. 0 == unknown, never treated as a match (see
+	// DjAutoDjHistory).
+	uint32_t artistHash = 0;
+	uint32_t titleHash = 0;
 };
 
 // Compact, bounded, POD suggestion - safe to copy into a snapshot/API/browser
