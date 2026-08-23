@@ -78,7 +78,10 @@ private:
 
 	void buildSteps(DjAssistTransitionPlan& plan) const;
 	bool stepSubmitted(DjAssistTransitionAction action) const;
-	bool guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransitionFailure& failure) const;
+	// Non-const: a detected per-property manual-override divergence
+	// (toDeck play/sync) immediately relinquishes that property's
+	// rollback-ownership flag on plan_ - see the definition for why.
+	bool guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransitionFailure& failure);
 	void fail(DjAssistTransitionFailure reason);
 };
 

@@ -455,12 +455,18 @@ DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t 
 		deckMetadata[0].attached(),
 		deckMetadata[1].attached()
 	};
-	metadataReader.close();
-	metadataReaderStatus = metadataReader.open(file);
+	// Bump the (atomic, lock-free-readable) generation BEFORE swapping the
+	// reader below - any concurrent assistLibraryGeneration() caller sees
+	// the new value the instant it's visible, ahead of the reader mutation
+	// it describes, closing the review's check-then-lock gap for callers
+	// that re-check generation immediately adjacent to their own lock
+	// (see DjAssistController::fillWorkerStep()/candidateTableReady()).
 	libraryGeneration = generation;
 	libraryKey = key;
 	metadataFileKey = fileKey;
 	metadataInitialized = true;
+	metadataReader.close();
+	metadataReaderStatus = metadataReader.open(file);
 
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		DjMetadataState state = DJ_METADATA_ABSENT;
@@ -479,12 +485,13 @@ DjMetadataState DjSession::refreshLibraryMetadata(uint32_t generation, uint64_t 
 
 void DjSession::invalidateLibraryMetadata(){
 	metadataMutex.lock();
-	metadataReader.close();
-	metadataReaderStatus = JaydMetadata::Status::Missing;
+	// Same bump-before-mutation ordering as refreshLibraryMetadata() above.
 	libraryGeneration = 0;
 	libraryKey = 0;
 	metadataFileKey = 0;
 	metadataInitialized = false;
+	metadataReader.close();
+	metadataReaderStatus = JaydMetadata::Status::Missing;
 	for(uint8_t deck = 0; deck < DJ_DECK_COUNT; ++deck){
 		deckMetadata[deck].invalidate(
 			deckMetadata[deck].attached() ? DJ_METADATA_STALE : DJ_METADATA_ABSENT,
@@ -661,11 +668,16 @@ bool DjSession::nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& o
 	return found;
 }
 
+// Lock-free: libraryGeneration is std::atomic, and refreshLibraryMetadata()/
+// invalidateLibraryMetadata() bump it BEFORE mutating metadataReader (see
+// DjSession.h's doc comment on the member). No metadataMutex acquisition
+// needed for this specific accessor, which is what lets a caller safely
+// call it a SECOND time from inside an unrelated lock (e.g.
+// DjAssistController's candidateMutex_ critical section, right before a
+// commit/readiness decision) with zero lock-ordering/deadlock risk between
+// the two independently locked classes.
 uint32_t DjSession::assistLibraryGeneration(){
-	metadataMutex.lock();
-	const uint32_t generation = libraryGeneration;
-	metadataMutex.unlock();
-	return generation;
+	return libraryGeneration;
 }
 
 uint32_t DjSession::assistTrackCount(){

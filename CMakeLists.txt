@@ -131,8 +131,8 @@ add_test(NAME DjAssistSelfCheck COMMAND DjAssistSelfCheck)
 # Pure DjSession<->DjAssist glue (candidate-entry construction, crossfade
 # ramp math). Free of FS/Arduino dependencies by design; the ESP32-coupled
 # DjAssistController/DjAssistSessionActuator that call into these functions
-# are validated only by the real firmware build, matching how DjSession.cpp
-# itself is never host-unit-tested.
+# are exercised end-to-end by DjAssistIntegrationSelfCheck below (via an
+# Arduino-free DjAssistSessionPort seam + host stubs), not reimplemented here.
 add_executable(DjAssistBridgeSelfCheck
         tests/dj_assist_bridge_selfcheck.cpp
         src/DjAssist/DjAssistScoring.cpp
@@ -145,6 +145,36 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_link_options(DjAssistBridgeSelfCheck PRIVATE -fsanitize=address,undefined)
 endif ()
 add_test(NAME DjAssistBridgeSelfCheck COMMAND DjAssistBridgeSelfCheck)
+
+# Real DjAssistController runtime (submit/poll actuator, arm/tick/cancel
+# state machine, background candidate-fill worker) driven end-to-end against
+# a fake DjAssistSessionPort whose command-admission methods reuse the exact
+# same real, shared admitAssistCommand()/DjCommandQueue/DjCommandResults/
+# DjAssistTrackedCommand/DjAssistIntentGenerations primitives DjSession
+# itself uses (see DjSessionState.h) - not a parallel reimplementation of
+# queue/origin-priority semantics. DjSession.cpp itself still isn't host-
+# compiled here (AudioLib/SD/esp_system dependencies are out of scope for a
+# host build), but every line of DjAssistController.cpp/DjAssistEngine.cpp
+# that used to be reachable only from the real firmware build is now
+# exercised on the host, including rollback ownership, boundary/tempo-lock/
+# crossfade sequencing, manual-override guards, and the candidate-generation
+# race fix.
+add_executable(DjAssistIntegrationSelfCheck
+        tests/dj_assist_integration_selfcheck.cpp
+        tests/host_stubs/host_arduino_shim.cpp
+        src/DjAssist/DjAssistController.cpp
+        src/DjAssist/DjAssistScoring.cpp
+        src/DjAssist/DjAssistSessionBridge.cpp
+        src/DjAssist/DjAssistEngine.cpp)
+target_include_directories(DjAssistIntegrationSelfCheck BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/tests/host_stubs)
+set_target_properties(DjAssistIntegrationSelfCheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_compile_options(DjAssistIntegrationSelfCheck PRIVATE -Wall -Wextra -Werror)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(DjAssistIntegrationSelfCheck PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(DjAssistIntegrationSelfCheck PRIVATE -fsanitize=address,undefined)
+endif ()
+add_test(NAME DjAssistIntegrationSelfCheck COMMAND DjAssistIntegrationSelfCheck)
 
 # Recording-workflow logic (naming/collision/exhaustion, WAV header repair,
 # DjRecordingSnapshot/State shape). Pure logic compiled directly against the

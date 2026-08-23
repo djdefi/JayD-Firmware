@@ -162,7 +162,7 @@ bool DjAssistEngine::stepSubmitted(DjAssistTransitionAction action) const{
 	return false;
 }
 
-bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransitionFailure& failure) const{
+bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransitionFailure& failure){
 	if(!guard.mediaPresent){
 		failure = DJ_ASSIST_FAIL_MEDIA_REMOVED;
 		return false;
@@ -204,11 +204,29 @@ bool DjAssistEngine::guardOk(const DjAssistGuardSnapshot& guard, DjAssistTransit
 	// the plan's own idempotent steps can never trigger a false positive
 	// either, which is what previously made LOCK_TEMPO's redundant sync
 	// step read as a manual override.
+	// A diverged property immediately relinquishes this plan's rollback
+	// ownership of that exact property (DjAssistTransitionPlan::
+	// toDeckStartOwnedByPlan/toDeckSyncOwnedByPlan) before failing. Without
+	// this, a user re-asserting play/sync on the target deck AFTER this
+	// plan's own step already applied would fail the transition (correctly)
+	// but leave ownership true, so tickRollback() would then stop/release
+	// the user's own newer intent instead of leaving it alone - rollback
+	// must only ever undo a mutation this plan is still the sole author of.
 	if(guard.playIntentGeneration[plan_.toDeck] != plan_.armedPlayGeneration[plan_.toDeck]){
+		plan_.toDeckStartOwnedByPlan = false;
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}
 	if(guard.syncIntentGeneration[plan_.toDeck] != plan_.armedSyncGeneration[plan_.toDeck]){
+		plan_.toDeckSyncOwnedByPlan = false;
+		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
+		return false;
+	}
+	// Source-deck sync has no plan-owned rollback phase (the plan never
+	// touches fromDeck sync), but a non-system sync command on the
+	// outgoing deck is still a genuine manual override that must abort
+	// the transition rather than silently continue past it.
+	if(guard.syncIntentGeneration[plan_.fromDeck] != plan_.armedSyncGeneration[plan_.fromDeck]){
 		failure = DJ_ASSIST_FAIL_MANUAL_OVERRIDE;
 		return false;
 	}

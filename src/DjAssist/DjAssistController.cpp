@@ -2,7 +2,6 @@
 
 #include "DjAssistScoring.h"
 #include "DjAssistSessionBridge.h"
-#include "../DjSession/DjSession.h"
 
 #include <Arduino.h>
 
@@ -26,7 +25,7 @@ namespace {
 // e.g. if unrelated traffic raced it out of the queue).
 class DjAssistSessionActuator : public DjAssistActuator {
 public:
-	explicit DjAssistSessionActuator(DjSession* session) : session_(session){
+	explicit DjAssistSessionActuator(DjAssistSessionPort* session) : session_(session){
 	}
 
 	bool submit(const DjAssistTransitionStep& step, uint32_t& outCommandId) override{
@@ -64,7 +63,7 @@ public:
 private:
 	static const uint32_t CrossfadeIdBase = 0x80000000UL;
 
-	DjSession* session_;
+	DjAssistSessionPort* session_;
 	uint32_t crossfadeId_ = CrossfadeIdBase;
 	uint8_t crossfadeToDeck_ = 0;
 	uint8_t crossfadeBeats_ = 16;
@@ -156,7 +155,7 @@ DjAssistController::~DjAssistController(){
 	end();
 }
 
-void DjAssistController::begin(DjSession* session){
+void DjAssistController::begin(DjAssistSessionPort* session){
 	session_ = session;
 	entryCapacity_ = DJ_ASSIST_MAX_INDEX_ENTRIES;
 	entries_ = static_cast<DjAssistLibraryEntry*>(ps_malloc(sizeof(DjAssistLibraryEntry) * entryCapacity_));
@@ -204,6 +203,15 @@ void DjAssistController::fillTaskTrampoline(Task* task){
 // I/O never happens while candidateMutex_ is held), then takes the lock
 // only for the brief array write + bookkeeping update - so the main thread
 // is never blocked waiting on a card read, only on a few field writes.
+//
+// assistLibraryGeneration() is a lock-free atomic read (see DjSession.h),
+// so every commit point below re-loads the LIVE generation a second time
+// immediately adjacent to (inside) the candidateMutex_ critical section it
+// commits under, rather than trusting a value captured before the lock was
+// acquired - there is no way for a refresh landing in that gap to go
+// unnoticed, because the very last thing checked before every mutation is
+// a fresh, in-lock read of the same lock-free accessor a concurrent
+// refreshLibraryMetadata() bumps before it swaps the reader.
 void DjAssistController::fillWorkerStep(){
 	if(!session_ || allocationFailed_) return;
 
@@ -227,12 +235,13 @@ void DjAssistController::fillWorkerStep(){
 	const uint16_t cappedTotal = rawTotal > entryCapacity_ ? entryCapacity_ : uint16_t(rawTotal);
 	if(cappedTotal == 0) return; // reader not ready yet, or an empty library.
 	if(cursor >= cappedTotal){
-		// Fresh, immediate re-read of the live generation right before the
-		// lock - not a reuse of currentGeneration captured at the top of
-		// this call - closes the window between counting cappedTotal and
-		// marking the fill complete.
-		const uint32_t liveGeneration = session_->assistLibraryGeneration();
 		candidateMutex_.lock();
+		// Live generation re-loaded HERE, inside the lock, immediately
+		// before the commit - not the currentGeneration captured at the
+		// top of this call, and not a pre-lock probe either - so a
+		// refresh landing in the gap between counting cappedTotal and
+		// this exact instant is still caught.
+		const uint32_t liveGeneration = session_->assistLibraryGeneration();
 		if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, liveGeneration)){
 			entryTotal_ = cappedTotal;
 			fillComplete_ = true;
@@ -260,7 +269,17 @@ void DjAssistController::fillWorkerStep(){
 	}
 
 	candidateMutex_.lock();
-	if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, entryRevision) && fillCursor_ == cursor){
+	// Two independent re-checks immediately before the write: entryRevision
+	// (captured together with the read itself, inside DjSession's own
+	// lock) AND a fresh in-lock live-generation reload right here (in case
+	// a refresh completed after the read but before this lock was
+	// acquired). Either mismatch discards the record rather than commits
+	// it; fillCursor_ stays put so the same slot is retried on the next
+	// (now-current-generation) pass.
+	const uint32_t liveGeneration = session_->assistLibraryGeneration();
+	if(DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, entryRevision) &&
+	   DjAssistBridge::candidateGenerationCurrent(loadedGeneration_, liveGeneration) &&
+	   fillCursor_ == cursor){
 		entries_[cursor] = entry;
 		++fillCursor_;
 		if(fillCursor_ >= cappedTotal){
@@ -273,13 +292,17 @@ void DjAssistController::fillWorkerStep(){
 
 // Bounded, lock-protected readiness check for the main thread - never
 // blocks on I/O (the fill task never holds candidateMutex_ across a read).
-// The live generation is re-read fresh (outside the lock, then compared
-// inside it) so a refresh that completes between fillWorkerStep() finishing
-// and this call still atomically invalidates readiness, rather than
-// reporting a table that is stale by the time the caller acts on it.
+// The live generation is re-loaded INSIDE candidateMutex_, immediately
+// before the readiness decision - not a pre-lock probe - so a refresh that
+// completes between fillWorkerStep() finishing and this call still
+// atomically invalidates readiness, rather than reporting a table that is
+// stale by the time the caller acts on it. Safe only because
+// assistLibraryGeneration() is lock-free (see DjSession.h): calling a
+// metadataMutex-guarded accessor from inside candidateMutex_ would require
+// reasoning about lock ordering across two independently-locked classes.
 bool DjAssistController::candidateTableReady(uint32_t& outGeneration){
-	const uint32_t liveGeneration = session_ ? session_->assistLibraryGeneration() : 0;
 	candidateMutex_.lock();
+	const uint32_t liveGeneration = session_ ? session_->assistLibraryGeneration() : 0;
 	const bool ready = fillComplete_ && loadedGeneration_ == liveGeneration;
 	outGeneration = loadedGeneration_;
 	candidateMutex_.unlock();

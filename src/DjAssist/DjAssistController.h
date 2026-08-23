@@ -3,11 +3,10 @@
 
 #include "DjAssistEngine.h"
 #include "DjAssistSessionBridge.h"
+#include "DjAssistSessionPort.h"
 
 #include <Sync/Mutex.h>
 #include <Util/Task.h>
-
-class DjSession;
 
 // Bounded, POD, browser/API/physical-bank-ready snapshot of Coach/transition
 // state. Copied out of the live engine + suggestion table on request; safe
@@ -33,8 +32,12 @@ struct DjAssistSnapshot {
 // DjAssistBridge::DjAssistPhraseCacheState), and drives the real
 // Sync/quantize/mix primitives through a concrete DjAssistActuator.
 //
-// Deliberately validated only by the real firmware build, matching
-// DjSession.cpp's own precedent (never host-compiled) - the pure arithmetic
+// The controller only ever depends on DjSession through DjAssistSessionPort
+// (see that header) - never included/forward-declared here - so this exact,
+// unmodified class can be driven by DjAssistIntegrationSelfCheck (a host
+// test) against a fake port and stub Sync/Mutex.h + Util/Task.h + the
+// handful of Arduino.h free functions it calls (micros()/delay()/
+// ps_malloc()), in addition to the real firmware build. The pure arithmetic
 // it calls into (DjAssistSessionBridge, DjAssistScoring, DjAssistEngine) is
 // separately host-tested with ASan/UBSan.
 class DjAssistController {
@@ -50,7 +53,7 @@ public:
 	// DjSession's constructor. A failed PSRAM allocation disables the
 	// candidate table (suggestions/advice simply stay empty, and the fill
 	// task is never started) without affecting the rest of the session.
-	void begin(DjSession* session);
+	void begin(DjAssistSessionPort* session);
 	void end();
 
 	// Bounded per-loop-iteration work: advances the candidate-table fill
@@ -79,7 +82,13 @@ public:
 	void copySnapshot(DjAssistSnapshot& snapshot) const;
 
 private:
-	DjSession* session_ = nullptr;
+	// Host integration harness only - grants access to the private
+	// stepping methods below (fillWorkerStep(), tickSuggestions(), etc.)
+	// so it can drive the exact real controller logic deterministically;
+	// it adds no production API surface and changes no behavior.
+	friend class DjAssistIntegrationSelfCheck;
+
+	DjAssistSessionPort* session_ = nullptr;
 	DjAssistEngine engine_;
 	DjAssistActuator* actuator_ = nullptr;
 

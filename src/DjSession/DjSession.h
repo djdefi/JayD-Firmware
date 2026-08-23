@@ -6,11 +6,13 @@
 #include <FS.h>
 #include <Loop/LoopListener.h>
 #include <Sync/Mutex.h>
+#include <atomic>
 #include "../Metadata/JaydMetadata.h"
 #include "../DjAssist/DjAssistController.h"
+#include "../DjAssist/DjAssistSessionPort.h"
 #include "DjSessionState.h"
 
-class DjSession : public LoopListener {
+class DjSession : public LoopListener, public DjAssistSessionPort {
 public:
 	static DjSession* begin(uint8_t leftGain, uint8_t rightGain, uint8_t mix);
 	static DjSession* get();
@@ -65,8 +67,15 @@ public:
 	// Bounded candidate-table data source for DjAssistController, backed by
 	// the same already-indexed metadata reader used by resolveMetadata() -
 	// never a fresh file read outside these bounded, mutex-guarded calls.
-	uint32_t assistLibraryGeneration();
-	uint32_t assistTrackCount();
+	// assistLibraryGeneration() is a lock-free atomic load (see
+	// libraryGeneration below): refreshLibraryMetadata() bumps it BEFORE
+	// mutating the reader, so a caller can safely re-read it a second time
+	// immediately adjacent to its own unrelated lock/commit (e.g.
+	// DjAssistController::fillWorkerStep()'s candidateMutex_ critical
+	// section) with zero risk of lock-ordering/deadlock against
+	// metadataMutex, closing the review's "check-then-lock gap" for good.
+	uint32_t assistLibraryGeneration() override;
+	uint32_t assistTrackCount() override;
 	// outRevision reports the exact metadata generation this read was
 	// performed under, captured atomically (single metadataMutex
 	// acquisition) with the entry read itself - not a separate before/
@@ -76,14 +85,14 @@ public:
 	// review's "check-then-lock gap"). Set regardless of whether the read
 	// itself succeeds, so callers can still detect a stale pass on a
 	// failed/corrupt record.
-	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision);
+	bool assistTrackEntry(uint32_t index, DjAssistLibraryEntry& outEntry, uint32_t& outRevision) override;
 	// Cheap, in-memory downbeat hint from the already-built beat grid,
 	// vs. the bounded but real SD read behind nextPhraseFrame() - callers
 	// are expected to throttle the latter (see DjAssistController).
-	bool mediaPresent() const;
-	uint64_t deckElapsedFrames(uint8_t deck) const;
-	bool nextDownbeatFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) const;
-	bool nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame);
+	bool mediaPresent() const override;
+	uint64_t deckElapsedFrames(uint8_t deck) const override;
+	bool nextDownbeatFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) const override;
+	bool nextPhraseFrame(uint8_t deck, uint64_t currentFrame, uint64_t& outFrame) override;
 
 	// Durable (never evictable, unlike the bounded recentResults ring)
 	// single-slot outcome tracker for the one in-flight command the Coach
@@ -95,8 +104,8 @@ public:
 	// the normal loop()/finishWithDiagnostics() path, regardless of how
 	// many other commands are processed (and evicted from recentResults)
 	// in between.
-	void assistTrackCommand(uint32_t commandId);
-	DjCommandStatus assistTrackedStatus(uint32_t commandId);
+	void assistTrackCommand(uint32_t commandId) override;
+	DjCommandStatus assistTrackedStatus(uint32_t commandId) override;
 	// Monotonic non-system ("user") intent generations for the global mix
 	// and per-deck play/sync channels, bumped by admitAssistCommand()
 	// (called from submit()) the instant such a command is admitted -
@@ -106,7 +115,7 @@ public:
 	// means the user has touched that control since arming, durably and
 	// without regard to recentResults ring eviction. See
 	// DjAssistIntentGenerations (DjSessionState.h).
-	DjAssistIntentGenerations assistIntentGenerationsSnapshot();
+	DjAssistIntentGenerations assistIntentGenerationsSnapshot() override;
 	// Removes every currently-queued SYSTEM-origin SET_PLAYING/SET_SYNC
 	// for `deck` plus every queued SYSTEM-origin SET_MIX (mix is deck-
 	// agnostic, always purged), finishing each through the normal
@@ -116,9 +125,9 @@ public:
 	// cancelled/failed transition can never be followed by a stale queued
 	// Assist write landing after rollback has already restored safe
 	// state.
-	void assistPurgePendingSystemCommands(uint8_t deck);
+	void assistPurgePendingSystemCommands(uint8_t deck) override;
 
-	bool copySnapshot(DjSnapshot& snapshot);
+	bool copySnapshot(DjSnapshot& snapshot) override;
 	bool hasPendingLoad();
 	bool libraryWorkAllowed();
 	DjMetadataState refreshLibraryMetadata(uint32_t generation, uint64_t libraryKey);
@@ -167,7 +176,15 @@ private:
 	uint32_t sessionId = 0;
 	JaydMetadata::Reader metadataReader;
 	JaydMetadata::Status metadataReaderStatus = JaydMetadata::Status::Missing;
-	uint32_t libraryGeneration = 0;
+	// Lock-free: refreshLibraryMetadata() stores a fresh value BEFORE
+	// mutating metadataReader (still inside one metadataMutex critical
+	// section, as a sequencing guarantee - not a required inter-lock
+	// barrier, since this load takes no lock of its own). This lets
+	// assistLibraryGeneration() be called safely a second time from
+	// inside an unrelated lock (e.g. DjAssistController's candidateMutex_)
+	// with zero lock-ordering/deadlock risk between the two independently
+	// locked classes - see assistLibraryGeneration()'s doc comment.
+	std::atomic<uint32_t> libraryGeneration { 0 };
 	uint64_t libraryKey = 0;
 	uint64_t metadataFileKey = 0;
 	bool metadataInitialized = false;
