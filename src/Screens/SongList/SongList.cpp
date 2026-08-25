@@ -2,6 +2,7 @@
 #include "SongList.h"
 #include "../MainMenu/MainMenu.h"
 #include <JayD.h>
+#include <Loop/LoopManager.h>
 #include <SPIFFS.h>
 #include <FS/CompressedFile.h>
 #include "../../Fonts.h"
@@ -371,18 +372,20 @@ bool SongList::SongList::loadBestIndex(){
 		);
 	}
 
-	const char* chosen = nullptr;
-	if(a.matchesCard && b.matchesCard){
-		chosen = a.validation.header.generation >= b.validation.header.generation ?
-			indexPathA : indexPathB;
-	}else if(a.matchesCard){
-		chosen = indexPathA;
-	}else if(b.matchesCard){
-		chosen = indexPathB;
-	}else if(a.valid || b.valid){
+	const LibraryIndex::GenerationCandidate candidates[] = {
+		{ a.valid, a.matchesCard, a.validation.header.generation },
+		{ b.valid, b.matchesCard, b.validation.header.generation }
+	};
+	const int8_t selected = LibraryIndex::selectNewestGeneration(
+		candidates,
+		sizeof(candidates) / sizeof(candidates[0]),
+		false
+	);
+	if(selected < 0 && (a.valid || b.valid)){
 		indexState = IndexState::Stale;
 	}
-	return chosen != nullptr && loadIndex(chosen);
+	if(selected < 0) return false;
+	return loadIndex(selected == 0 ? indexPathA : indexPathB);
 }
 
 bool SongList::SongList::writeGeneration(const char* path, uint32_t generation){
@@ -647,11 +650,37 @@ SongList::SongList::IndexInfo SongList::SongList::getIndexInfo() const{
 		songCount,
 		identityStrength,
 		indexProgress,
-		indexProgressTotal
+		indexProgressTotal,
+		refreshState
 	};
 }
 
-void SongList::SongList::loop(uint t){}
+SongList::SongList::IndexInfo SongList::SongList::currentIndexInfo(){
+	if(instance == nullptr){
+		return {
+			IndexState::Absent,
+			0,
+			0,
+			LibraryIndex::IdentityStrength::Unknown,
+			0,
+			0,
+			LibraryIndex::RefreshState::Idle
+		};
+	}
+	return instance->getIndexInfo();
+}
+
+LibraryIndex::RefreshRequestResult SongList::SongList::requestManualRefresh(){
+	if(instance == nullptr) return LibraryIndex::RefreshRequestResult::Unavailable;
+	return LibraryIndex::requestRefresh(instance->refreshState, instance->active);
+}
+
+void SongList::SongList::loop(uint t){
+	(void) t;
+	if(!LibraryIndex::beginRefresh(refreshState)) return;
+	checkSD(true);
+	LibraryIndex::finishRefresh(refreshState);
+}
 
 void SongList::SongList::start(){
 
@@ -723,15 +752,19 @@ void SongList::SongList::start(){
 	Input.addListener(this);
 	waiting = false;
 	checkSD();
+	LoopManager::addListener(this);
+	active = true;
 
 	draw();
 	screen.commit();
 }
 
 void SongList::SongList::stop(){
+	active = false;
 	InputJayD::getInstance()->removeEncoderMovedCallback(ENC_MID);
 	InputJayD::getInstance()->removeBtnPressCallback(BTN_MID);
 	Input.removeListener(this);
+	LoopManager::removeListener(this);
 }
 
 void SongList::SongList::draw(){
@@ -848,7 +881,7 @@ void SongList::SongList::encTwoTop(){
 }
 
 void SongList::SongList::encTwoBot(){
-	checkSD(true);
+	requestManualRefresh();
 }
 
 const char* SongList::SongList::stateLabel() const{

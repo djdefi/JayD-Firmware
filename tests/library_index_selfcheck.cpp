@@ -127,6 +127,19 @@ ValidationResult validate(std::vector<uint8_t>& bytes, const Limits& customLimit
 	);
 }
 
+LibraryIndex::GenerationCandidate candidate(
+	std::vector<uint8_t>& bytes,
+	const CardIdentity& identity
+){
+	const ValidationResult result = validate(bytes);
+	const bool valid = result.error == ValidationError::None;
+	return {
+		valid,
+		valid && LibraryIndex::matchesCard(result.header, identity),
+		result.header.generation
+	};
+}
+
 bool pathsMatch(const std::vector<Entry>& indexed, const std::vector<Entry>& scanned){
 	if(indexed.size() != scanned.size()) return false;
 	for(size_t i = 0; i < indexed.size(); i++){
@@ -149,16 +162,11 @@ int newestValid(
 	std::vector<uint8_t>& b,
 	const CardIdentity& identity
 ){
-	const ValidationResult left = validate(a);
-	const ValidationResult right = validate(b);
-	const bool leftValid = left.error == ValidationError::None &&
-		LibraryIndex::matchesCard(left.header, identity);
-	const bool rightValid = right.error == ValidationError::None &&
-		LibraryIndex::matchesCard(right.header, identity);
-	if(leftValid && rightValid) return left.header.generation >= right.header.generation ? 0 : 1;
-	if(leftValid) return 0;
-	if(rightValid) return 1;
-	return -1;
+	const LibraryIndex::GenerationCandidate candidates[] = {
+		candidate(a, identity),
+		candidate(b, identity)
+	};
+	return LibraryIndex::selectNewestGeneration(candidates, 2, false);
 }
 
 }
@@ -173,6 +181,59 @@ int main(){
 	std::vector<uint8_t> generationB = makeIndex(8, BuildState::Complete, card, original);
 	assert(validate(generationA).error == ValidationError::None);
 	assert(newestValid(generationA, generationB, card) == 1);
+
+	LibraryIndex::RefreshState refreshState = LibraryIndex::RefreshState::Idle;
+	assert(LibraryIndex::requestRefresh(
+		refreshState,
+		false
+	) == LibraryIndex::RefreshRequestResult::Unavailable);
+	assert(refreshState == LibraryIndex::RefreshState::Idle);
+	assert(LibraryIndex::requestRefresh(
+		refreshState,
+		true
+	) == LibraryIndex::RefreshRequestResult::Accepted);
+	assert(LibraryIndex::requestRefresh(
+		refreshState,
+		true
+	) == LibraryIndex::RefreshRequestResult::Busy);
+	assert(LibraryIndex::beginRefresh(refreshState));
+	assert(!LibraryIndex::beginRefresh(refreshState));
+	LibraryIndex::finishRefresh(refreshState);
+	assert(refreshState == LibraryIndex::RefreshState::Idle);
+
+	std::vector<uint8_t> current = makeIndex(12, BuildState::Complete, card, original);
+	std::vector<uint8_t> temp = makeIndex(11, BuildState::Complete, card, original);
+	std::vector<uint8_t> backup = makeIndex(10, BuildState::Complete, card, original);
+	firstRecord(current).firstCrc32 ^= 1;
+	LibraryIndex::GenerationCandidate recoveryCandidates[] = {
+		candidate(current, card),
+		candidate(temp, card),
+		candidate(backup, card)
+	};
+	assert(LibraryIndex::selectNewestGeneration(
+		recoveryCandidates,
+		3,
+		false
+	) == 1);
+	assert(LibraryIndex::selectNewestGeneration(
+		recoveryCandidates,
+		3,
+		true
+	) == -1);
+	firstRecord(temp).firstCrc32 ^= 1;
+	recoveryCandidates[1] = candidate(temp, card);
+	assert(LibraryIndex::selectNewestGeneration(
+		recoveryCandidates,
+		3,
+		false
+	) == 2);
+	firstRecord(backup).firstCrc32 ^= 1;
+	recoveryCandidates[2] = candidate(backup, card);
+	assert(LibraryIndex::selectNewestGeneration(
+		recoveryCandidates,
+		3,
+		false
+	) == -1);
 	assert(LibraryIndex::stateAfterRecovery(
 		LibraryIndex::State::Verifying,
 		true

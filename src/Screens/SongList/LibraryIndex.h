@@ -30,6 +30,18 @@ enum class State : uint8_t {
 	Error
 };
 
+enum class RefreshState : uint8_t {
+	Idle,
+	Queued,
+	Running
+};
+
+enum class RefreshRequestResult : uint8_t {
+	Accepted,
+	Busy,
+	Unavailable
+};
+
 enum HeaderFlags : uint16_t {
 	HeaderHasFatMtime = 1 << 0,
 	HeaderHasFingerprints = 1 << 1,
@@ -81,6 +93,12 @@ struct CardIdentity {
 	uint32_t cardType;
 	uint64_t cardSize;
 	uint64_t volumeSize;
+};
+
+struct GenerationCandidate {
+	bool valid;
+	bool matchesCard;
+	uint32_t generation;
 };
 
 struct Limits {
@@ -140,6 +158,14 @@ void initializeHeader(Header& header);
 bool matchesCard(const Header& header, const CardIdentity& identity);
 bool isSupportedPath(const char* path, size_t length);
 bool matchesFile(const Record& record, const FileEvidence& evidence);
+int8_t selectNewestGeneration(
+	const GenerationCandidate* candidates,
+	size_t count,
+	bool invalidMarker
+);
+RefreshRequestResult requestRefresh(RefreshState& state, bool available);
+bool beginRefresh(RefreshState& state);
+void finishRefresh(RefreshState& state);
 State stateAfterRecovery(State recoveredState, bool recovered);
 ValidationResult validate(ReadAt readAt, void* context, uint32_t fileSize, const Limits& limits);
 const char* validationErrorName(ValidationError error);

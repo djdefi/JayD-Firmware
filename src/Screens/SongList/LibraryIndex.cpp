@@ -120,6 +120,45 @@ bool matchesFile(const Record& record, const FileEvidence& evidence){
 	return true;
 }
 
+int8_t selectNewestGeneration(
+	const GenerationCandidate* candidates,
+	size_t count,
+	bool invalidMarker
+){
+	if(invalidMarker || candidates == nullptr || count == 0) return -1;
+
+	int8_t selected = -1;
+	uint32_t newest = 0;
+	for(size_t i = 0; i < count && i <= INT8_MAX; i++){
+		if(!candidates[i].valid || !candidates[i].matchesCard ||
+		   candidates[i].generation == 0){
+			continue;
+		}
+		if(selected < 0 || candidates[i].generation > newest){
+			selected = static_cast<int8_t>(i);
+			newest = candidates[i].generation;
+		}
+	}
+	return selected;
+}
+
+RefreshRequestResult requestRefresh(RefreshState& state, bool available){
+	if(!available) return RefreshRequestResult::Unavailable;
+	if(state != RefreshState::Idle) return RefreshRequestResult::Busy;
+	state = RefreshState::Queued;
+	return RefreshRequestResult::Accepted;
+}
+
+bool beginRefresh(RefreshState& state){
+	if(state != RefreshState::Queued) return false;
+	state = RefreshState::Running;
+	return true;
+}
+
+void finishRefresh(RefreshState& state){
+	if(state == RefreshState::Running) state = RefreshState::Idle;
+}
+
 State stateAfterRecovery(State recoveredState, bool recovered){
 	return recovered ? recoveredState : State::Error;
 }

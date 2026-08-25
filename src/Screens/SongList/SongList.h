@@ -20,6 +20,7 @@ namespace SongList {
 			LibraryIndex::IdentityStrength identityStrength;
 			uint32_t progress;
 			uint32_t progressTotal;
+			LibraryIndex::RefreshState refreshState;
 		};
 
 		explicit SongList(Display &display);
@@ -39,6 +40,8 @@ namespace SongList {
 		void unpack() override;
 
 		IndexInfo getIndexInfo() const;
+		static IndexInfo currentIndexInfo();
+		static LibraryIndex::RefreshRequestResult requestManualRefresh();
 	private:
 		static SongList *instance;
 
@@ -73,12 +76,14 @@ namespace SongList {
 		void encTwoTop() override;
 		void encTwoBot() override;
 		bool waiting = false;
+		bool active = false;
 		bool insertedSD = true;
 		bool empty = true;
 		bool scanLimited = false;
 		bool scanStoppedAtLimit = false;
 		bool allocationFailed = false;
 		IndexState indexState = IndexState::Absent;
+		LibraryIndex::RefreshState refreshState = LibraryIndex::RefreshState::Idle;
 		uint32_t indexGeneration = 0;
 		uint32_t indexProgress = 0;
 		uint32_t indexProgressTotal = 0;
