@@ -6,10 +6,22 @@
 #include <UI/Image.h>
 #include <Input/InputJayD.h>
 #include "../../InputKeys.h"
+#include "LibraryIndex.h"
 
 namespace SongList {
 	class SongList : public Context, public LoopListener, public InputListener {
 	public:
+		using IndexState = LibraryIndex::State;
+
+		struct IndexInfo {
+			IndexState state;
+			uint32_t generation;
+			size_t count;
+			LibraryIndex::IdentityStrength identityStrength;
+			uint32_t progress;
+			uint32_t progressTotal;
+			LibraryIndex::RefreshState refreshState;
+		};
 
 		explicit SongList(Display &display);
 
@@ -27,6 +39,9 @@ namespace SongList {
 
 		void unpack() override;
 
+		IndexInfo getIndexInfo() const;
+		static IndexInfo currentIndexInfo();
+		static LibraryIndex::RefreshRequestResult requestManualRefresh();
 	private:
 		static SongList *instance;
 
@@ -36,29 +51,51 @@ namespace SongList {
 		Color *backgroundBuffer = nullptr;
 		char* pathBuffer = nullptr;
 		uint32_t* songOffsets = nullptr;
+		LibraryIndex::FileEvidence* songMetadata = nullptr;
 		size_t pathBytes = 0;
 		size_t pathCapacity = 0;
 		size_t songCount = 0;
 		size_t songCapacity = 0;
 
 		void clearSongs();
-		void checkSD();
-		bool searchDirectories(File dir);
-		bool addSong(const char* path);
+		void checkSD(bool forceRebuild = false);
+		bool loadBestIndex();
+		bool loadIndex(const char* path);
+		bool buildIndex();
+		bool writeGeneration(const char* path, uint32_t generation);
+		bool searchDirectories(File dir, uint8_t depth);
+		bool addSong(const char* path, File& file);
+		bool fingerprintFile(File& file, LibraryIndex::FileEvidence& evidence);
+		bool trackMatches(size_t index, File& file);
 		bool reservePaths(size_t required);
 		bool reserveSongs(size_t required);
 		const char* songPath(size_t index) const;
+		LibraryIndex::CardIdentity currentCardIdentity() const;
+		const char* stateLabel() const;
 
 		void encTwoTop() override;
+		void encTwoBot() override;
 		bool waiting = false;
+		bool active = false;
 		bool insertedSD = true;
 		bool empty = true;
 		bool scanLimited = false;
+		bool scanStoppedAtLimit = false;
 		bool allocationFailed = false;
+		IndexState indexState = IndexState::Absent;
+		LibraryIndex::RefreshState refreshState = LibraryIndex::RefreshState::Idle;
+		uint32_t indexGeneration = 0;
+		uint32_t indexProgress = 0;
+		uint32_t indexProgressTotal = 0;
+		LibraryIndex::IdentityStrength identityStrength =
+			LibraryIndex::IdentityStrength::Unknown;
 
 		static const size_t maxTrackCount = 4096;
 		static const size_t maxPathLength = 255;
 		static const size_t maxPathPayload = 128 * 1024;
+		static const size_t maxIndexPayload =
+			maxTrackCount * sizeof(LibraryIndex::Record) + maxPathPayload;
+		static const uint8_t maxDirectoryDepth = 12;
 		static const uint8_t visibleRows = 5;
 		static const uint8_t rowHeight = 20;
 	};
